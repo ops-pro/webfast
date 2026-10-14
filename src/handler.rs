@@ -339,6 +339,21 @@ pub fn encode_path(decoded: &str) -> String {
     utf8_percent_encode(decoded, PATH).to_string()
 }
 
+/// A redirect target built from the request may not point off the site: a path that starts with
+/// `//` or `/\` (browsers read `\` as `/`) would be taken as scheme-relative, `//evil.example/x`,
+/// so the run of slashes and backslashes it starts with becomes one `/`. Anything else — an
+/// absolute URL, a plain path — is kept as it is.
+pub fn same_site_location(location: String) -> String {
+    if !location.starts_with('/') {
+        return location;
+    }
+    let rest = location.trim_start_matches(['/', '\\']);
+    if location.len() - rest.len() > 1 {
+        return format!("/{rest}");
+    }
+    location
+}
+
 /// A header value: built once when it has no placeholders (cloning it is a reference count),
 /// otherwise filled in per request.
 #[derive(Debug, Clone)]
@@ -658,7 +673,12 @@ fn rewrite(ctx: &mut Ctx, to: &Template) {
 
 fn strip_prefix(ctx: &mut Ctx, prefix: &str) {
     let path = ctx.path().to_string();
-    if path.to_lowercase().starts_with(prefix) {
+    // Compared byte by byte, ASCII case-insensitively: `to_lowercase` may change the byte length of
+    // a path with non-ASCII letters, and slicing by the prefix's length would then cut a character.
+    let has_prefix = path.len() >= prefix.len()
+        && path.is_char_boundary(prefix.len())
+        && path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
+    if has_prefix {
         let rest = &path[prefix.len()..];
         let stripped = if rest.starts_with('/') {
             rest.to_string()
@@ -724,7 +744,7 @@ impl Handler {
                 response
             }
             Handler::Redir { to, status, html } => {
-                let location = to.render(&ctx);
+                let location = same_site_location(to.render(&ctx));
                 if *html {
                     let escaped = crate::static_files::html_escape(&location);
                     let body = format!(
@@ -795,6 +815,55 @@ impl Handler {
                 self.step(&mut ctx);
                 next.run(ctx).await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(path: &str) -> Ctx {
+        let conn = Arc::new(ConnInfo {
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            tls: false,
+            trusted: false,
+        });
+        let (parts, body) = http::Request::get(path).body(empty()).unwrap().into_parts();
+        Ctx::new(conn, parts, body, "127.0.0.1".parse().unwrap())
+    }
+
+    #[test]
+    fn redirect_targets_stay_on_the_site() {
+        let same = |s: &str| same_site_location(s.to_string());
+        assert_eq!(same("/en/contact"), "/en/contact");
+        assert_eq!(same("/"), "/");
+        assert_eq!(same("//evil.example/x"), "/evil.example/x");
+        assert_eq!(same(r"/\evil.example/x"), "/evil.example/x");
+        assert_eq!(same(r"///\/evil.example"), "/evil.example");
+        assert_eq!(same(r"/x/\y"), r"/x/\y", "only the start matters");
+        assert_eq!(
+            same("https://example.com/"),
+            "https://example.com/",
+            "absolute URLs are kept"
+        );
+        assert_eq!(same(""), "");
+    }
+
+    #[test]
+    fn prefixes_are_stripped_by_bytes_and_case_insensitively() {
+        for (path, expected) in [
+            ("/api/x", "/x"),
+            ("/API/x", "/x"),
+            ("/api", "/"),
+            ("/apix", "/x"),
+            ("/apİ/x", "/apİ/x"),
+            ("/ap", "/ap"),
+            ("/other/api", "/other/api"),
+        ] {
+            let mut c = ctx(&encode_path(path));
+            strip_prefix(&mut c, "/api");
+            assert_eq!(c.path(), expected, "{path}");
         }
     }
 }

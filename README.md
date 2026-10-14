@@ -8,13 +8,14 @@ Caddy, and the two can be compared request by request ([`compat/`](compat)).
 What it adds over Caddy, with no extra directives:
 
 - **Files from memory.** Every site root is read once at startup; requests never touch the disk.
-  `WEB_MAX_MEMORY` (default `512MiB`) caps it. A file is kept as an LZ4 block when that saves at
-  least `WEB_LZ4_MIN_SAVING` percent (25; `off`: never) — text, in practice: images, fonts and the
-  precompressed siblings do not shrink and stay as they are. Only a response that sends such a
-  file's bytes as they are (a client without Accept-Encoding, a range of them) decompresses it:
-  about 10 µs for a 30–80 KB file; browsers get the `.br` / `.zst` siblings, and 304s and HEAD need
-  no bytes. The reference site: 30 MiB of files (with their siblings) take 19 MiB, 250 of them in
-  LZ4. What is kept lies in one buffer.
+  `WEB_MAX_MEMORY` (default `512MiB`) caps it. A file of up to 1 MiB is kept as an LZ4 block when
+  that saves at least `WEB_LZ4_MIN_SAVING` percent (25; `off`: never) — text, in practice: images,
+  fonts and the precompressed siblings do not shrink and stay as they are. Only a response that
+  sends such a file's bytes as they are (a client without Accept-Encoding, a range of them)
+  decompresses it: about 10 µs for a 30–80 KB file (the 1 MiB cap bounds what one request can make
+  the server do: `Range: bytes=0-0` decompresses the whole block); browsers get the `.br` / `.zst`
+  siblings, and 304s and HEAD need no bytes. The reference site: 30 MiB of files (with their
+  siblings) take 19 MiB, 250 of them in LZ4. What is kept lies in one buffer.
 - **ETag = hash of the content** (BLAKE3, 80 bits) instead of modification time + size: unchanged
   files keep their ETag across deploys (304 instead of a full response) and every replica sends the
   same one. There is no `Last-Modified`.
@@ -87,6 +88,11 @@ What keeps one client from holding the server ([`src/guard.rs`](src/guard.rs),
 | Connections opened and left silent                    | HTTP/2 and HTTP/3 must send their first request within `read_header` (HTTP/1.1 already must)                                                                      |
 | Idle keep-alive connections                           | `timeouts { idle }` (5 min, Caddy's default) with no request in progress: graceful close (GOAWAY); one that has not finished 10 s later is cut                    |
 | Slow reader: a response the client stops taking       | `WEB_STALL_TIMEOUT` (30 s) with the socket accepting nothing (HTTP/3: the stream) cuts the connection; a slow but moving download is fine                         |
+| Slow sender: a request body the client stops sending  | `WEB_STALL_TIMEOUT` with no body data arriving ends the body; the proxy answers 408 and the upstream connection is freed                                           |
+| Hung upstream (headers never come)                    | `reverse_proxy` `response_header_timeout`, 60 s by default here (Caddy: none; `0` restores that): 504                                                             |
+| Range header asking for thousands of parts            | more than 64 ranges, or overlapping ones, are ignored and the whole file is sent (200), as Go does for ranges adding up to more than the file                     |
+| Redirect targets built from the path                  | `redir` and the canonical trailing-slash redirect turn a leading `//host` or `/\host` into `/host`, so no path can send a browser off the site                   |
+| Headers an upstream trusts for the client's identity  | `X-Real-IP`, `CF-Connecting-IP`, `CF-IPCountry`, `Forwarded`, … are dropped unless the peer is a trusted proxy (src/proxy.rs `CLIENT_IDENTITY_HEADERS`)           |
 | HTTP/3 headers of any size (h3 buffers a frame whole) | frames other than DATA over 64 KiB end the stream (`H3_EXCESSIVE_LOAD`), also on the control and QPACK streams; `SETTINGS_MAX_FIELD_SECTION_SIZE` 64 KiB          |
 | QUIC handshake floods from spoofed addresses          | with 64 handshakes under way, unproven addresses get a Retry first; at most 4096 handshakes queued, 32 MB of their packets                                        |
 | HTTP/2 Rapid Reset, CONTINUATION flood, MadeYouReset  | h2 0.4.20; 250 streams per connection, 16 KiB of headers                                                                                                          |
@@ -113,8 +119,10 @@ slashes, the empty 200 at the end of a chain.
 **Known differences from Caddy** (all checked by `compat/`): no `Last-Modified` and content-hash ETag
 values; no `Via` on proxied responses; the upstream gets the client's `Accept-Encoding` as is (Caddy's
 transport asks for gzip when the client sent none); handler errors such as file_server's 405 keep the
-site's deferred headers (Caddy drops them); `text/event-stream` is never compressed. Caddy needs the
-`caddy-brotli` plugin to read `encode … br`.
+site's deferred headers (Caddy drops them); `text/event-stream` is never compressed; the limits in the
+table above that Caddy does not have — `response_header_timeout` 60 s by default, 408 for a stalled
+request body, at most 64 non-overlapping ranges, redirect targets kept on the site, client identity
+headers dropped from untrusted peers. Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 
 ## Commands
 

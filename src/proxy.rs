@@ -3,8 +3,15 @@
 //! -Proto / -Host are set (kept and extended only for trusted proxies), hop-by-hop headers are
 //! dropped, a failed connection answers 502 and a response-header timeout 504. Upstream response
 //! headers are added to those an earlier (not deferred) `header` set, as Caddy does.
+//!
+//! Unlike Caddy: the other headers that name a client — `X-Real-IP`, `CF-Connecting-IP`,
+//! `CF-IPCountry`, `Forwarded`, … (`CLIENT_IDENTITY_HEADERS`) — are dropped unless the peer is a
+//! trusted proxy, so an upstream that reads them cannot be fed a made-up address or country; a
+//! request body the client stops sending (src/guard.rs `StalledBody`) answers 408; and
+//! `response_header_timeout` has a default (src/config.rs).
 
 use crate::body::{Body, boxed};
+use crate::guard::BodyStalled;
 use crate::handler::{Ctx, HeaderOp, apply_ops};
 use http::header::{CONNECTION, HOST};
 use http::uri::{Authority, Scheme};
@@ -63,6 +70,25 @@ const HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+/// Headers that name the client or where it comes from, which proxies and CDNs set and upstreams
+/// trust; from a peer that is not a trusted proxy they are the client's own invention.
+/// (X-Forwarded-For / -Proto / -Host are handled in `forwarded_headers`.)
+pub const CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "cf-connecting-ip",
+    "cf-connecting-ipv6",
+    "cf-ipcountry",
+    "cf-ray",
+    "cf-visitor",
+    "fastly-client-ip",
+    "forwarded",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-forwarded-port",
+    "x-original-forwarded-for",
+    "x-real-ip",
+];
+
 fn remove_hop_headers(headers: &mut HeaderMap) {
     let listed: Vec<HeaderName> = headers
         .get_all(CONNECTION)
@@ -117,6 +143,7 @@ impl ReverseProxy {
         let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
         let path_and_query = ctx.req.uri.path_and_query().cloned();
         let method = ctx.req.method.clone();
+        let body_stalled = ctx.req.extensions.get::<BodyStalled>().cloned();
         let mut body = ctx.body.take();
         // Without a body the request can be retried on another upstream (lb_try_duration).
         let replayable = body.as_ref().is_none_or(http_body::Body::is_end_stream);
@@ -153,6 +180,11 @@ impl ReverseProxy {
             match result {
                 Ok(response) => break Ok(response),
                 Err((connect, timed_out)) => {
+                    // The client stopped sending its body: its fault, not the upstream's.
+                    if body_stalled.as_ref().is_some_and(BodyStalled::happened) {
+                        tracing::debug!(upstream = %upstream, "the client stopped sending the request body");
+                        break Err(StatusCode::REQUEST_TIMEOUT);
+                    }
                     tracing::warn!(upstream = %upstream, connect, timed_out, "upstream request failed");
                     if timed_out {
                         break Err(StatusCode::GATEWAY_TIMEOUT);
@@ -183,6 +215,11 @@ impl ReverseProxy {
 fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
     let peer = ctx.conn.remote.ip().to_string();
     let trusted = ctx.conn.trusted;
+    if !trusted {
+        for name in CLIENT_IDENTITY_HEADERS {
+            headers.remove(*name);
+        }
+    }
     let prior: Vec<&str> = ctx
         .req
         .headers
@@ -237,5 +274,50 @@ mod tests {
         remove_hop_headers(&mut h);
         assert_eq!(h.len(), 1);
         assert!(h.contains_key("x-kept"));
+    }
+
+    fn ctx_from(peer: &str, trusted: bool, headers: &[(&'static str, &str)]) -> Ctx {
+        let conn = std::sync::Arc::new(crate::handler::ConnInfo {
+            remote: peer.parse().unwrap(),
+            tls: false,
+            trusted,
+        });
+        let mut builder = Request::get("/api/x").header("host", "example.test");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (parts, body) = builder.body(crate::body::empty()).unwrap().into_parts();
+        let ip = conn.remote.ip();
+        Ctx::new(conn, parts, body, ip)
+    }
+
+    #[test]
+    fn client_identity_headers_come_only_from_trusted_proxies() {
+        let sent = [
+            ("cf-ipcountry", "NL"),
+            ("x-real-ip", "6.6.6.6"),
+            ("forwarded", "for=6.6.6.6"),
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-proto", "https"),
+            ("x-custom", "kept"),
+        ];
+        let ctx = ctx_from("203.0.113.9:4000", false, &sent);
+        let mut headers = ctx.req.headers.clone();
+        forwarded_headers(&ctx, &mut headers);
+        assert!(headers.get("cf-ipcountry").is_none());
+        assert!(headers.get("x-real-ip").is_none());
+        assert!(headers.get("forwarded").is_none());
+        assert_eq!(headers["x-forwarded-for"], "203.0.113.9");
+        assert_eq!(headers["x-forwarded-proto"], "http");
+        assert_eq!(headers["x-forwarded-host"], "example.test");
+        assert_eq!(headers["x-custom"], "kept");
+
+        let ctx = ctx_from("10.0.0.5:4000", true, &sent);
+        let mut headers = ctx.req.headers.clone();
+        forwarded_headers(&ctx, &mut headers);
+        assert_eq!(headers["cf-ipcountry"], "NL");
+        assert_eq!(headers["x-real-ip"], "6.6.6.6");
+        assert_eq!(headers["x-forwarded-for"], "6.6.6.6, 10.0.0.5");
+        assert_eq!(headers["x-forwarded-proto"], "https");
     }
 }

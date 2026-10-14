@@ -98,11 +98,9 @@ impl FileServer {
                 } else {
                     None
                 };
-                if let Some(mut to) = to {
-                    // No path-based open redirects ("//evil.example").
-                    while to.starts_with("//") {
-                        to.remove(0);
-                    }
+                if let Some(to) = to {
+                    // No path-based open redirects ("//evil.example", "/\evil.example").
+                    let to = crate::handler::same_site_location(to);
                     let mut location = crate::handler::encode_path(&to);
                     if let Some(query) = ctx.req.uri.query() {
                         location.push('?');
@@ -217,7 +215,10 @@ impl FileServer {
             }
             Some(Err(RangeError::Invalid)) => return serve_error(&mut ctx, response, "invalid range"),
         };
-        if ranges.iter().map(|(_, len)| len).sum::<u64>() > total {
+        // As Go: ranges that add up to more than the file are ignored. Also ignored (the whole file
+        // is sent instead): more than MAX_RANGES, or ranges that overlap — a multipart answer is
+        // built in memory, and one Range header could otherwise ask for 100 000 one-byte parts.
+        if ranges.iter().map(|(_, len)| len).sum::<u64>() > total || !ranges_are_bounded(&ranges) {
             ranges.clear();
         }
         // The bytes, only when they are sent or cut into ranges (a file kept in LZ4 is decompressed
@@ -399,6 +400,20 @@ fn parse_ranges(header: &str, size: u64) -> Result<Vec<(u64, u64)>, RangeError> 
     Ok(ranges)
 }
 
+/// The most ranges one request is answered with as multipart/byteranges (Apache allows 200; a
+/// browser or a PDF reader asks for a handful).
+const MAX_RANGES: usize = 64;
+
+/// At most MAX_RANGES, none of them overlapping (empty ranges are fine).
+fn ranges_are_bounded(ranges: &[(u64, u64)]) -> bool {
+    if ranges.len() > MAX_RANGES {
+        return false;
+    }
+    let mut sorted: Vec<(u64, u64)> = ranges.iter().copied().filter(|(_, len)| *len > 0).collect();
+    sorted.sort_unstable();
+    sorted.windows(2).all(|pair| pair[0].0 + pair[0].1 <= pair[1].0)
+}
+
 fn content_range(start: u64, length: u64, total: u64) -> String {
     format!("bytes {start}-{}/{total}", (start + length).saturating_sub(1))
 }
@@ -457,6 +472,21 @@ mod tests {
         assert!(matches!(parse_ranges("bytes=5-1", 100), Err(RangeError::Invalid)));
         assert!(matches!(parse_ranges("bytes=x-1", 100), Err(RangeError::Invalid)));
         assert_eq!(content_range(0, 10, 100), "bytes 0-9/100");
+    }
+
+    #[test]
+    fn too_many_or_overlapping_ranges_are_not_bounded() {
+        assert!(ranges_are_bounded(&[(0, 2), (5, 2), (2, 3)]), "adjacent is fine");
+        assert!(!ranges_are_bounded(&[(0, 10), (5, 10)]), "overlapping");
+        assert!(!ranges_are_bounded(&[(0, 1), (0, 1)]), "the same byte twice");
+        assert!(
+            ranges_are_bounded(&[(0, 0), (0, 0), (0, 5)]),
+            "empty ranges never overlap"
+        );
+        let many: Vec<(u64, u64)> = (0..MAX_RANGES as u64).map(|i| (i * 2, 1)).collect();
+        assert!(ranges_are_bounded(&many));
+        let too_many: Vec<(u64, u64)> = (0..=MAX_RANGES as u64).map(|i| (i * 2, 1)).collect();
+        assert!(!ranges_are_bounded(&too_many));
     }
 
     #[test]

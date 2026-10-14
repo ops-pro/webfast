@@ -75,6 +75,22 @@ async fn upstream() -> SocketAddr {
             };
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    // Reads the whole request body before answering (a stalled client is seen here).
+                    if req.uri().path() == "/api/slurp" {
+                        let size = match req.into_body().collect().await {
+                            Ok(collected) => collected.to_bytes().len().to_string(),
+                            Err(e) => format!("error: {e}"),
+                        };
+                        let response = http::Response::builder()
+                            .header("content-type", "text/plain")
+                            .body(
+                                Full::new(Bytes::from(size))
+                                    .map_err(|never| match never {})
+                                    .boxed_unsync(),
+                            )
+                            .unwrap();
+                        return Ok::<_, Infallible>(response);
+                    }
                     if req.uri().path() == "/api/stream/chat" {
                         let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, Infallible>>(4);
                         tokio::spawn(async move {
@@ -104,6 +120,8 @@ async fn upstream() -> SocketAddr {
                         "xff": header("x-forwarded-for"),
                         "xfp": header("x-forwarded-proto"),
                         "xfh": header("x-forwarded-host"),
+                        "country": header("cf-ipcountry"),
+                        "real_ip": header("x-real-ip"),
                         // /api/big: past the size compressed on the blocking pool (64 KiB).
                         "padding": "x".repeat(if req.uri().path() == "/api/big" { 300_000 } else { 600 }),
                     });
@@ -319,6 +337,20 @@ async fn static_site_behaves_like_the_caddy_config() {
     let contact = h.get("/en/contact", &[]).await;
     assert_eq!(contact.status, 200);
     assert_eq!(&contact.body[..], b"<!doctype html><title>Contact</title>");
+    // No open redirect through the path: `//host` and `/\host` (a browser reads `\` as `/`) in
+    // {re.html.1} and in the canonical trailing-slash redirect stay on the site.
+    for (path, location) in [
+        ("/%5Cevil.example/x.html", "/evil.example/x"),
+        ("//evil.example/x.html", "/evil.example/x"),
+        ("/%5C%5Cevil.example/x.html", "/evil.example/x"),
+    ] {
+        let got = h.get(path, &[]).await;
+        assert_eq!(
+            (got.status, header(&got, "location")),
+            (StatusCode::PERMANENT_REDIRECT, location),
+            "{path}"
+        );
+    }
 
     // Precompressed: the browser's usual header picks br (config order breaks the q=1 tie).
     let br = h
@@ -366,6 +398,25 @@ async fn static_site_behaves_like_the_caddy_config() {
     let head_lz4 = h.request(Method::HEAD, "/en/", &[]).await;
     assert_eq!(header(&head_lz4, "content-length"), (HOME.len() * 20).to_string());
 
+    // Several ranges: multipart/byteranges; overlapping or too many ranges: the whole file (200),
+    // as for ranges adding up to more than the file.
+    let two = h.get("/en/contact", &[("range", "bytes=0-1,4-5")]).await;
+    assert_eq!(two.status, 206);
+    assert!(header(&two, "content-type").starts_with("multipart/byteranges; boundary="));
+    assert!(two.body.windows(2).any(|w| w == b"<!"));
+    let too_many = format!("bytes={}", (0..65).map(|_| "0-0").collect::<Vec<_>>().join(","));
+    for range in ["bytes=0-1,1-2", "bytes=0-0,0-0", too_many.as_str()] {
+        let got = h.get("/en/contact", &[("range", range)]).await;
+        assert_eq!(got.status, 200, "{range}");
+        assert_eq!(&got.body[..], b"<!doctype html><title>Contact</title>");
+        assert!(got.headers.get("content-range").is_none());
+    }
+    let many_ok = format!(
+        "bytes={}",
+        (0..32).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(",")
+    );
+    assert_eq!(h.get("/en/contact", &[("range", &many_ok)]).await.status, 206);
+
     let head = h.request(Method::HEAD, "/en/contact", &[]).await;
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
@@ -391,7 +442,16 @@ async fn static_site_behaves_like_the_caddy_config() {
 async fn proxied_paths_stream_and_compress() {
     let h = start().await;
 
-    let echo = h.get("/api/echo?q=1", &[("x-forwarded-for", "203.0.113.9")]).await;
+    let echo = h
+        .get(
+            "/api/echo?q=1",
+            &[
+                ("x-forwarded-for", "203.0.113.9"),
+                ("cf-ipcountry", "NL"),
+                ("x-real-ip", "6.6.6.6"),
+            ],
+        )
+        .await;
     assert_eq!(echo.status, 200);
     assert_eq!(header(&echo, "x-upstream"), "1");
     let json: serde_json::Value = serde_json::from_slice(&echo.body).unwrap();
@@ -399,6 +459,13 @@ async fn proxied_paths_stream_and_compress() {
     assert_eq!(json["host"], h.base.trim_start_matches("http://"));
     assert_eq!(json["xff"], "203.0.113.9, 127.0.0.1", "127.0.0.1 is a trusted proxy");
     assert_eq!(json["xfp"], "http");
+    assert_eq!(json["country"], "NL", "a trusted proxy's client headers pass");
+    assert_eq!(json["real_ip"], "6.6.6.6");
+
+    // A request body is sent on as it arrives; one the client stops sending ends with 408 after
+    // the stall limit instead of holding this connection and the upstream's.
+    let whole = h.request(Method::POST, "/api/slurp", &[]).await;
+    assert_eq!((whole.status, &whole.body[..]), (StatusCode::OK, &b"0"[..]));
 
     for (encoding, accept) in [
         ("zstd", "gzip, deflate, br, zstd"),
@@ -788,6 +855,42 @@ async fn sites_that_look_beyond_the_path_get_no_ready_answers() {
     let (parts, _) = request_head(&Method::GET, "/sw.js", &[]);
     let ready = collected(answers.answer(&parts).unwrap()).await;
     assert_eq!(ready.1["x-path"], "/sw.js");
+}
+
+#[tokio::test]
+async fn a_client_that_stops_sending_its_body_gets_408() {
+    let site = site();
+    let app = upstream().await;
+    let ai = upstream().await;
+    let mut config = load(&caddyfile(site.path(), app, ai));
+    config.servers[0].limits.stall = Duration::from_millis(500);
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, Infallible>>(4);
+    tx.send(Ok(http_body::Frame::data(Bytes::from("first chunk"))))
+        .await
+        .unwrap();
+    let body = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
+    let client: Client<HttpConnector, http_body_util::combinators::BoxBody<Bytes, Infallible>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let request = Request::post(format!("http://127.0.0.1:{port}/api/slurp"))
+        .body(body)
+        .unwrap();
+    let started = Instant::now();
+    // `tx` stays open and silent: the body never ends.
+    let response = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+        .await
+        .expect("answered before the test's own timeout")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(tx);
+    running.shutdown(Duration::from_secs(1)).await;
 }
 
 #[tokio::test]

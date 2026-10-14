@@ -8,6 +8,9 @@
 //!   streams finish); a graceful close that does not end within `grace` is cut.
 //! - **Stall**: a response the client stops taking (the socket accepts nothing, a slow reader)
 //!   for `stall` cuts the connection. A slow but moving download resets the clock with every write.
+//! - **Stalled request body** (`StalledBody`): a request body the client stops sending for `stall`
+//!   (a slow POST to a proxied path would otherwise hold this connection and an upstream one for
+//!   as long as the client likes) fails, and the proxy answers 408.
 //!
 //! The connection's own future checks this after each time it runs, so the timer always follows
 //! the latest state; its streams' tasks (HTTP/2) wake it whenever they send.
@@ -247,6 +250,81 @@ impl http_body::Body for Tracked {
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Set when a request body timed out (`StalledBody`); kept in the request's extensions so the
+/// handler that was reading the body (the proxy) can tell a stalled client from a failed upstream.
+#[derive(Debug, Clone, Default)]
+pub struct BodyStalled(pub Arc<AtomicBool>);
+
+impl BodyStalled {
+    pub fn happened(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// The error a stalled request body ends with.
+#[derive(Debug)]
+pub struct StalledError;
+
+impl std::fmt::Display for StalledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client stopped sending the request body")
+    }
+}
+
+impl std::error::Error for StalledError {}
+
+/// A request body that must keep moving: with no frame for `stall` it ends with an error and
+/// marks `BodyStalled`. A body that is already complete (no body, or one hyper has buffered) never
+/// arms the timer.
+pub struct StalledBody {
+    inner: Body,
+    stall: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    stalled: BodyStalled,
+}
+
+impl StalledBody {
+    pub fn new(inner: Body, stall: Duration, stalled: BodyStalled) -> StalledBody {
+        StalledBody {
+            inner,
+            stall,
+            timer: None,
+            stalled,
+        }
+    }
+}
+
+impl http_body::Body for StalledBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                self.timer = None;
+                Poll::Ready(frame)
+            }
+            Poll::Pending => {
+                let stall = self.stall;
+                let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    self.stalled.0.store(true, Ordering::Release);
+                    return Poll::Ready(Some(Err(Box::new(StalledError))));
+                }
+                Poll::Pending
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {

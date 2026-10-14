@@ -227,7 +227,8 @@ async fn request(
         stream: recv,
         done: false,
     });
-    let response = handle(state, conn, Request::from_parts(parts, body)).await;
+    let request = crate::server::stall_limited(Request::from_parts(parts, body), limits.stall);
+    let response = handle(state, conn, request).await;
     let (mut head_parts, mut body) = response.into_parts();
     for name in [CONNECTION, TRANSFER_ENCODING, UPGRADE] {
         head_parts.headers.remove(name);

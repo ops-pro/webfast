@@ -153,6 +153,17 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
     }
 }
 
+/// The request with its body under the stall limit: a client that stops sending it for `stall`
+/// ends the body with an error, and the handler reading it (the proxy) answers 408
+/// (src/guard.rs `StalledBody`).
+pub fn stall_limited(request: Request<Body>, stall: Duration) -> Request<Body> {
+    let (mut parts, body) = request.into_parts();
+    let stalled = crate::guard::BodyStalled::default();
+    parts.extensions.insert(stalled.clone());
+    let body = boxed(crate::guard::StalledBody::new(body, stall, stalled));
+    Request::from_parts(parts, body)
+}
+
 /// What every response gets: `Date` from the shared clock (a proxied response keeps the upstream's,
 /// as in Caddy; hyper's own date is left for the error responses it writes itself) and, with
 /// HTTP/3 on, `Alt-Svc` over TCP.
@@ -483,7 +494,8 @@ async fn accept_loop(
                     let state = state.clone();
                     let conn = conn.clone();
                     async move {
-                        let response = handle(state, conn, request.map(boxed)).await;
+                        let request = stall_limited(request.map(boxed), limits.stall);
+                        let response = handle(state, conn, request).await;
                         Ok::<_, Infallible>(response.map(|body| boxed(Tracked::new(body, flight))))
                     }
                 })

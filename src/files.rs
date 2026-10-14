@@ -3,11 +3,11 @@
 //! Precompressed `.br` / `.zst` / `.gz` siblings are ordinary entries with their own ETags. The
 //! header values a response needs (ETag, Content-Length, Content-Type) are built at load time.
 //!
-//! To save memory a file is kept as an LZ4 block when that saves at least `WEB_LZ4_MIN_SAVING`
-//! percent (25 by default) — text, typically; images, fonts and the precompressed siblings do not
-//! shrink and stay as they are. A response that sends such a file's bytes as they are decompresses
-//! them (some GB/s: tens of microseconds for a page); 304s, HEAD and the precompressed siblings that
-//! browsers get cost nothing.
+//! To save memory a file of up to `LZ4_MAX_SIZE` (1 MiB) is kept as an LZ4 block when that saves
+//! at least `WEB_LZ4_MIN_SAVING` percent (25 by default) — text, typically; images, fonts and the
+//! precompressed siblings do not shrink and stay as they are. A response that sends such a file's
+//! bytes as they are decompresses them (some GB/s: tens of microseconds for a page); 304s, HEAD and
+//! the precompressed siblings that browsers get cost nothing.
 
 use bytes::Bytes;
 use http::HeaderValue;
@@ -18,6 +18,11 @@ use std::sync::Arc;
 
 /// Files smaller than this stay as they are: little to save, and a buffer per response.
 const LZ4_MIN_SIZE: usize = 1024;
+
+/// Files larger than this stay as they are too: a response that sends the file's own bytes — a
+/// client without Accept-Encoding, any `Range`, even `bytes=0-0` — decompresses the whole block,
+/// so this bounds what one request can make the server allocate and compute.
+pub const LZ4_MAX_SIZE: usize = 1 << 20;
 
 /// The default of `WEB_LZ4_MIN_SAVING`.
 pub const DEFAULT_LZ4_MIN_SAVING: u8 = 25;
@@ -136,7 +141,7 @@ impl Prepared {
         let etag = etag_of(&bytes);
         let len = bytes.len();
         if let Some(saving) = lz4_min_saving
-            && len >= LZ4_MIN_SIZE
+            && (LZ4_MIN_SIZE..=LZ4_MAX_SIZE).contains(&len)
         {
             let block = lz4_flex::block::compress(&bytes);
             let worth_it = block.len() * 100 <= len * (100 - usize::from(saving));
@@ -492,6 +497,14 @@ mod tests {
             "too small"
         );
         assert!(!FileEntry::new("/a.html", text, None).is_lz4(), "off");
+        let huge = "<p>the same paragraph, again and again</p>\n"
+            .repeat(LZ4_MAX_SIZE / 40 + 1)
+            .into_bytes();
+        assert!(huge.len() > LZ4_MAX_SIZE);
+        assert!(
+            !FileEntry::new("/huge.html", huge, Some(0)).is_lz4(),
+            "too large: one request would decompress it whole"
+        );
     }
 
     #[test]

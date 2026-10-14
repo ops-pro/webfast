@@ -169,6 +169,12 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "acme_server",
 ];
 
+/// `reverse_proxy`: how long an upstream may take to send its response headers before the client
+/// gets 504 (Caddy: no limit; `transport http { response_header_timeout 0 }` restores that). A
+/// request in progress has no other clock, so without this a hung upstream would hold the client's
+/// connection and its own for as long as the client waits.
+pub const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
 const PRIVATE_RANGES: &[&str] = &[
     "192.168.0.0/16",
     "172.16.0.0/12",
@@ -1432,7 +1438,7 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     let mut header_down = Vec::new();
     let mut dial_timeout = Duration::from_secs(3);
     let mut keepalive = Some(Duration::from_secs(120));
-    let mut response_header_timeout = None;
+    let mut response_header_timeout = Some(DEFAULT_RESPONSE_HEADER_TIMEOUT);
     let mut own_client = false;
     for sub in line.block.as_deref().unwrap_or(&[]) {
         let args = &sub.tokens[1..];
@@ -1472,7 +1478,9 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                             own_client = true;
                         }
                         "response_header_timeout" => {
-                            response_header_timeout = Some(parse_duration(&one_arg(t)?).map_err(|e| at_err(&t.at, e))?)
+                            let value = parse_duration(&one_arg(t)?).map_err(|e| at_err(&t.at, e))?;
+                            // `0` (Caddy's default) or `-1`: no limit.
+                            response_header_timeout = Some(value).filter(|d| !d.is_zero());
                         }
                         "keepalive" => {
                             let value = one_arg(t)?;
