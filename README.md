@@ -23,7 +23,10 @@ What it adds over Caddy, with no extra directives:
   to 1 MiB are compressed whole and sent with `Content-Length`; streams are compressed frame by frame,
   so they still flow.
 - **One `Date` for all threads**: a background thread formats it just after each second starts;
-  responses take it without reading the clock (a proxied response keeps the upstream's `Date`).
+  each thread copies it once a second and responses take that copy without reading the clock (a
+  proxied response keeps the upstream's `Date`). 26–28 ns per response on 1 or 8 threads; one value
+  cloned by all threads costs 35 ns alone but 830–880 ns on 8 (they fight over its reference
+  count); formatting it for each response 120–130 ns.
 - **Ready answers for files** ([`src/memo.rs`](src/memo.rs)): the files never change while the
   server runs, so when a site's routes decide by the request path alone (no host, method, header or
   address matchers, no `request_header`, only path-derived placeholders — true for
@@ -50,6 +53,15 @@ Connections:
 
 - **SO_REUSEPORT**: one listening socket per CPU, each with its own accept loop; the kernel spreads
   new connections over them, and a new process can bind the port while the old one drains.
+- **A runtime per core** (`WEB_RUNTIME=per-core`, the default on Unix): each listening socket gets a
+  thread with a single-threaded tokio runtime and its own epoll, and the connections it accepts stay
+  there — no handing of work between threads, as with nginx's worker processes. As fast as it goes
+  (a page of the built site, the same headers configured in nginx, 32 connections, on WSL2): 142–150 thousand requests/s at 21–22 µs of CPU each,
+  against 77–83 thousand at 27–28 µs on one shared multi-threaded runtime (`WEB_RUNTIME=shared`) and
+  119–123 thousand at 26–27 µs for nginx; at 1000 requests/s all three are within a few µs. It costs
+  about 7 MiB (8 more threads). A connection's work stays on its core, so one HTTP/2 connection
+  carrying many clients (a CDN in front) is served by one core. HTTP/3 stays on the shared runtime
+  (quinn drives one UDP socket).
 - **Socket options** ([`src/sockets.rs`](src/sockets.rs), Linux; set on the listening socket and
   inherited by every connection; one the system refuses stays at its default, with a warning at
   startup):
@@ -88,10 +100,10 @@ What keeps one client from holding the server ([`src/guard.rs`](src/guard.rs),
 | Connections opened and left silent                    | HTTP/2 and HTTP/3 must send their first request within `read_header` (HTTP/1.1 already must)                                                                      |
 | Idle keep-alive connections                           | `timeouts { idle }` (5 min, Caddy's default) with no request in progress: graceful close (GOAWAY); one that has not finished 10 s later is cut                    |
 | Slow reader: a response the client stops taking       | `WEB_STALL_TIMEOUT` (30 s) with the socket accepting nothing (HTTP/3: the stream) cuts the connection; a slow but moving download is fine                         |
-| Slow sender: a request body the client stops sending  | `WEB_STALL_TIMEOUT` with no body data arriving ends the body; the proxy answers 408 and the upstream connection is freed                                           |
+| Slow sender: a request body the client stops sending  | `WEB_STALL_TIMEOUT` with no body data arriving ends the body; the proxy answers 408 and the upstream connection is freed                                          |
 | Hung upstream (headers never come)                    | `reverse_proxy` `response_header_timeout`, 60 s by default here (Caddy: none; `0` restores that): 504                                                             |
 | Range header asking for thousands of parts            | more than 64 ranges, or overlapping ones, are ignored and the whole file is sent (200), as Go does for ranges adding up to more than the file                     |
-| Redirect targets built from the path                  | `redir` and the canonical trailing-slash redirect turn a leading `//host` or `/\host` into `/host`, so no path can send a browser off the site                   |
+| Redirect targets built from the path                  | `redir` and the canonical trailing-slash redirect turn a leading `//host` or `/\host` into `/host`, so no path can send a browser off the site                    |
 | Headers an upstream trusts for the client's identity  | `X-Real-IP`, `CF-Connecting-IP`, `CF-IPCountry`, `Forwarded`, … are dropped unless the peer is a trusted proxy (src/proxy.rs `CLIENT_IDENTITY_HEADERS`)           |
 | HTTP/3 headers of any size (h3 buffers a frame whole) | frames other than DATA over 64 KiB end the stream (`H3_EXCESSIVE_LOAD`), also on the control and QPACK streams; `SETTINGS_MAX_FIELD_SECTION_SIZE` 64 KiB          |
 | QUIC handshake floods from spoofed addresses          | with 64 handshakes under way, unproven addresses get a Retry first; at most 4096 handshakes queued, 32 MB of their packets                                        |
@@ -137,7 +149,7 @@ Environment: `LOG_LEVEL` (`info`; `debug` also via the `debug` global option), `
 queue drops lines instead of slowing requests, and they are counted), `WEB_LZ4_MIN_SAVING` (25),
 `WEB_MAX_CONNECTIONS`
 (16384), `WEB_MAX_CONNECTIONS_PER_IP` (256; 0 turns a limit off), `WEB_STALL_TIMEOUT` (30s),
-`WEB_TCP_CONGESTION` (`bbr`).
+`WEB_TCP_CONGESTION` (`bbr`), `WEB_RUNTIME` (`per-core`; `shared`).
 Logs are JSON on stderr; access logs go where the site's `log` block says.
 
 At startup the log says what was loaded and what it cost — per site root `site files loaded`

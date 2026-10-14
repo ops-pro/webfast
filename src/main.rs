@@ -8,7 +8,8 @@
 //! WEB_MAX_CONNECTIONS (16384) and WEB_MAX_CONNECTIONS_PER_IP (256) open connections (0: no
 //! limit), WEB_STALL_TIMEOUT (30s): a response the client stops taking for that long ends its
 //! connection (src/guard.rs); WEB_TCP_CONGESTION (bbr; `system`: the kernel's default) for the
-//! clients' TCP connections (src/sockets.rs).
+//! clients' TCP connections (src/sockets.rs); WEB_RUNTIME (`per-core`: a thread and runtime per
+//! listening socket, the default on Unix; `shared`: one runtime for all, src/server.rs).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -168,7 +169,16 @@ fn limits_from_env(config: &mut config::Config) -> Result<(), String> {
         }
         Err(_) => None,
     };
+    let per_core = match std::env::var("WEB_RUNTIME") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("per-core") => Some(true),
+        Ok(value) if value.trim().eq_ignore_ascii_case("shared") => Some(false),
+        Ok(value) => return Err(format!("WEB_RUNTIME: shared or per-core, not {value:?}")),
+        Err(_) => None,
+    };
     for server in &mut config.servers {
+        if let Some(per_core) = per_core {
+            server.per_core = per_core;
+        }
         if let Some(congestion) = congestion {
             server.limits.tcp_congestion = congestion;
         }

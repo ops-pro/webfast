@@ -309,6 +309,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         trusted_strict,
         client_ip_headers,
         limits,
+        per_core,
         mut sites,
     } = server;
     let admission = Admission::new(&limits);
@@ -415,19 +416,52 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         h2 = protocols.h2 && state_tls,
         h2c = protocols.h2c && !state_tls,
         h3 = quic_addr.is_some(),
+        runtime = if per_core { "per-core" } else { "shared" },
         "listening"
     );
     for listener in listeners {
-        let task = tokio::spawn(accept_loop(
-            listener,
+        let (state, acceptor, admission, stop) = (
             state.clone(),
             acceptor.clone(),
-            protocols,
-            limits,
             admission.clone(),
             running.stop.subscribe(),
-        ));
-        running.tasks.push(task);
+        );
+        if !per_core {
+            let task = tokio::spawn(accept_loop(
+                listener, state, acceptor, protocols, limits, admission, stop,
+            ));
+            running.tasks.push(task);
+            continue;
+        }
+        // A thread with a single-threaded runtime for this listener: the connections it accepts are
+        // polled by that thread alone, on its own epoll — no handing work between threads, as with
+        // nginx's worker processes. The kernel spreads new connections over the listeners.
+        let listener = listener.into_std()?;
+        std::thread::Builder::new()
+            .name(format!("web-{bound_port}"))
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        tracing::error!(error = %e, "cannot start a connection thread's runtime");
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let listener = match TcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(e) => {
+                            tracing::error!(error = %e, "cannot take over a listening socket");
+                            return;
+                        }
+                    };
+                    accept_loop(listener, state, acceptor, protocols, limits, admission.clone(), stop).await;
+                    // After the stop, this thread's connections run on until all are closed (the
+                    // shutdown bounds that wait; when the process ends, so does the thread).
+                    admission.all_closed().await;
+                });
+            })
+            .context("cannot start a connection thread")?;
     }
     running.bound.push((port, tcp_addr, quic_addr));
     Ok(())

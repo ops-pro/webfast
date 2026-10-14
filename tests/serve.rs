@@ -1056,3 +1056,47 @@ async fn http3_stops_a_stream_with_an_oversized_header_frame() {
     endpoint.close(0u32.into(), b"done");
     running.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test]
+async fn both_runtimes_serve_and_shut_down() {
+    for per_core in [true, false] {
+        let mut config = load(
+            ":0 {
+	respond \"ok {method}\"
+}
+",
+        );
+        config.servers[0].per_core = per_core;
+        let running = server::start(config).await.unwrap();
+        let port = running.bound[0].1.port();
+        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        // Many connections at once: per core, the kernel spreads them over the listeners' threads.
+        let requests: Vec<_> = (0..64)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let response = client
+                        .request(
+                            Request::get(format!("http://127.0.0.1:{port}/"))
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    response.into_body().collect().await.unwrap().to_bytes()
+                })
+            })
+            .collect();
+        for request in requests {
+            assert_eq!(&request.await.unwrap()[..], b"ok GET");
+        }
+        drop(client);
+        let started = Instant::now();
+        running.shutdown(Duration::from_secs(2)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "per_core={per_core}: the connections closed at the stop"
+        );
+    }
+}

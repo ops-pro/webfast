@@ -48,6 +48,10 @@ pub struct ServerConfig {
     pub trusted_strict: bool,
     pub client_ip_headers: Vec<HeaderName>,
     pub limits: Limits,
+    /// TCP connections on one thread per listening socket (one per CPU), each with a runtime of its
+    /// own, as nginx's workers (the default on Unix, where there is a socket per CPU); otherwise on
+    /// the process's shared runtime (src/server.rs).
+    pub per_core: bool,
     pub sites: Vec<Site>,
 }
 
@@ -365,6 +369,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                         idle: opts.idle.unwrap_or(Limits::default().idle),
                         ..Limits::default()
                     },
+                    per_core: cfg!(unix),
                     sites: Vec::new(),
                 });
                 servers.last_mut().expect("just pushed")
