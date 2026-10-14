@@ -107,6 +107,27 @@ impl Template {
         Some(out)
     }
 
+    /// Every placeholder comes from the request path (or what was matched from it, or the
+    /// environment): two requests for the same path fill the template in the same way.
+    pub fn depends_on_path_only(&self) -> bool {
+        self.parts.iter().all(|part| match part {
+            Part::Text(_) => true,
+            Part::Var(var) => matches!(
+                var,
+                Var::Path
+                    | Var::Dir
+                    | Var::File
+                    | Var::OrigPath
+                    | Var::Regexp { .. }
+                    | Var::FileRelative
+                    | Var::FileAbsolute
+                    | Var::FileType
+                    | Var::FileRemainder
+                    | Var::Env(_)
+            ),
+        })
+    }
+
     /// The text as written in the Caddyfile.
     pub fn source(&self) -> &str {
         &self.source

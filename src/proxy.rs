@@ -101,6 +101,10 @@ impl ReverseProxy {
     }
 
     pub async fn serve(&self, mut ctx: Ctx) -> Response<Body> {
+        // Preparing ready answers (src/memo.rs): never kept from a proxy, so no upstream is called.
+        if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+            return ctx.status(StatusCode::BAD_GATEWAY);
+        }
         let mut headers = ctx.req.headers.clone();
         remove_hop_headers(&mut headers);
         forwarded_headers(&ctx, &mut headers);

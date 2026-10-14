@@ -107,6 +107,30 @@ impl AcceptEncoding {
         out
     }
 
+    /// What decides every choice made from these preferences, in 9 bits: which of the three
+    /// encodings are acceptable, and for each pair which has the higher q-value or that they tie
+    /// (as `ranked` compares). Equal signatures rank any offer the same way (src/memo.rs).
+    pub fn signature(&self) -> u16 {
+        let mut signature = 0u16;
+        for (i, q) in self.q.iter().enumerate() {
+            if *q > 0.0 {
+                signature |= 1 << i;
+            }
+        }
+        for (shift, (a, b)) in [(3, (0, 1)), (5, (0, 2)), (7, (1, 2))] {
+            let (qa, qb) = (self.q[a], self.q[b]);
+            let relation = if qa > qb + 0.00001 {
+                1
+            } else if qb > qa + 0.00001 {
+                2
+            } else {
+                0
+            };
+            signature |= relation << shift;
+        }
+        signature
+    }
+
     /// The acceptable ones among `offered`, best first: q-value descending, ties in `offered` order.
     pub fn ranked(&self, offered: &[Encoding]) -> impl Iterator<Item = Encoding> + use<> {
         let mut items = [(Encoding::Zstd, 0.0f32); 3];
@@ -170,6 +194,10 @@ pub const DEFAULT_TYPES: &[&str] = &[
 /// Bodies up to this size (by Content-Length) are compressed whole.
 const BUFFER_LIMIT: u64 = 1 << 20;
 
+/// Bodies larger than this are compressed on the blocking pool, so the worker thread meanwhile
+/// serves other requests (Brotli on a megabyte takes milliseconds).
+const INLINE_LIMIT: usize = 64 << 10;
+
 #[derive(Debug, Clone)]
 pub struct Encode {
     pub formats: Vec<Encoding>,
@@ -199,15 +227,16 @@ impl Encode {
     /// The encoding for this request, and its If-None-Match with our ETag suffix taken off.
     pub fn choose(&self, accept: AcceptEncoding, headers: &mut HeaderMap) -> Option<Encoding> {
         let encoding = accept.ranked(&self.formats).next()?;
+        // `"<etag>-<encoding>"` → `"<etag>"`; nothing is built unless the suffix is there.
         if let Some(inm) = headers.get(http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
             && !inm.starts_with("W/")
+            && let Some(stripped) = inm
+                .strip_suffix('"')
+                .and_then(|t| t.strip_suffix(encoding.name()))
+                .and_then(|t| t.strip_suffix('-'))
+            && let Ok(value) = HeaderValue::from_str(&[stripped, "\""].concat())
         {
-            let suffix = format!("-{}\"", encoding.name());
-            if let Some(stripped) = inm.strip_suffix(&suffix)
-                && let Ok(value) = HeaderValue::from_str(&format!("{stripped}\""))
-            {
-                headers.insert(http::header::IF_NONE_MATCH, value);
-            }
+            headers.insert(http::header::IF_NONE_MATCH, value);
         }
         Some(encoding)
     }
@@ -218,6 +247,8 @@ impl Encode {
             return response;
         }
         let (mut parts, body) = response.into_parts();
+        // No longer the stored file's bytes (src/memo.rs keeps no answer for it).
+        parts.extensions.remove::<crate::memo::FromFile>();
         let headers = &mut parts.headers;
         let known_length = headers
             .get(CONTENT_LENGTH)
@@ -232,14 +263,23 @@ impl Encode {
         headers.remove(ACCEPT_RANGES);
         if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok())
             && !etag.starts_with("W/")
-            && let Ok(value) = HeaderValue::from_str(&format!("{}-{}\"", etag.trim_end_matches('"'), encoding.name()))
+            && let Ok(value) = HeaderValue::from_str(&[etag.trim_end_matches('"'), "-", encoding.name(), "\""].concat())
         {
             headers.insert(ETAG, value);
         }
         let mut encoder = Encoder::new(encoding, self);
         if known_length.is_some() {
             let compressed = match http_body_util::BodyExt::collect(body).await {
-                Ok(collected) => encoder.compress_all(&collected.to_bytes()),
+                Ok(collected) => {
+                    let data = collected.to_bytes();
+                    if data.len() > INLINE_LIMIT {
+                        tokio::task::spawn_blocking(move || encoder.compress_all(&data))
+                            .await
+                            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+                    } else {
+                        encoder.compress_all(&data)
+                    }
+                }
                 Err(e) => Err(std::io::Error::other(e.to_string())),
             };
             return match compressed {

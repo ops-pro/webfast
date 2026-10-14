@@ -9,6 +9,8 @@
 //! (RFC 8470).
 
 use crate::body::{Body, BoxError, boxed};
+use crate::config::Limits;
+use crate::guard::{Activity, Admission, Due, Permit};
 use crate::server::{ServerState, handle};
 use bytes::{Buf, Bytes};
 use h3::server::{RequestResolver, RequestStream};
@@ -17,14 +19,27 @@ use http::{HeaderName, StatusCode};
 use http::{HeaderValue, Method, Request, Response, Version};
 use http_body::Frame;
 use http_body_util::BodyExt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
+use std::time::Instant;
 use tokio::sync::watch;
 
-pub async fn serve(endpoint: quinn::Endpoint, state: Arc<ServerState>, mut stop: watch::Receiver<bool>) {
+/// With this many handshakes under way, clients whose address is not yet proven get a Retry first
+/// (one more round trip for them; spoofed addresses never complete it, so they cost no handshake).
+const RETRY_ABOVE: usize = 64;
+
+pub async fn serve(
+    endpoint: quinn::Endpoint,
+    state: Arc<ServerState>,
+    mut stop: watch::Receiver<bool>,
+    limits: Limits,
+    admission: Arc<Admission>,
+) {
+    let handshakes = Arc::new(AtomicUsize::new(0));
     loop {
         let incoming = tokio::select! {
             incoming = endpoint.accept() => match incoming {
@@ -37,21 +52,52 @@ pub async fn serve(endpoint: quinn::Endpoint, state: Arc<ServerState>, mut stop:
                 break;
             }
         };
+        if !incoming.remote_address_validated()
+            && incoming.may_retry()
+            && handshakes.load(Ordering::Acquire) >= RETRY_ABOVE
+        {
+            let _ = incoming.retry();
+            continue;
+        }
+        let remote = incoming.remote_address();
+        let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
+        let conn_info = state.conn_info(remote);
+        let Some(permit) = admission.admit(remote.ip(), conn_info.trusted) else {
+            tracing::debug!(%remote, "QUIC connection refused: too many open");
+            incoming.refuse();
+            continue;
+        };
         let state = state.clone();
         let stop = stop.clone();
+        let handshakes = handshakes.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection(incoming, state, stop).await {
+            let _permit: Permit = permit;
+            if let Err(e) = connection(incoming, state, conn_info, stop, limits, handshakes).await {
                 tracing::debug!(error = %e, "HTTP/3 connection ended with an error");
             }
         });
     }
 }
 
+/// Counts a handshake under way until dropped.
+struct Handshake(Arc<AtomicUsize>);
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 async fn connection(
     incoming: quinn::Incoming,
     state: Arc<ServerState>,
+    conn_info: Arc<crate::handler::ConnInfo>,
     mut stop: watch::Receiver<bool>,
+    limits: Limits,
+    handshakes: Arc<AtomicUsize>,
 ) -> Result<(), BoxError> {
+    handshakes.fetch_add(1, Ordering::AcqRel);
+    let handshake = Handshake(handshakes);
     // `confirmed`: the handshake has completed; until then requests are early data.
     let confirmed = Arc::new(AtomicBool::new(false));
     let conn = match incoming.accept()?.into_0rtt() {
@@ -64,28 +110,40 @@ async fn connection(
             conn
         }
         Err(connecting) => {
-            let conn = connecting.await?;
+            let conn = tokio::time::timeout(limits.read_header, connecting).await??;
             confirmed.store(true, Ordering::Release);
             conn
         }
     };
-    let remote = conn.remote_address();
-    let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
-    let conn_info = state.conn_info(remote);
-    let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await?;
+    drop(handshake);
+    let quic = conn.clone();
+    let activity = Activity::new();
+    let mut h3 = h3::server::builder()
+        .max_field_section_size(limits.h3_frame)
+        .build::<_, Bytes>(crate::h3limit::Connection::new(conn, limits.h3_frame))
+        .await?;
     let mut stopping = *stop.borrow();
     if stopping {
         h3.shutdown(0).await?;
     }
+    // Since when a graceful close of our own (idle) is under way.
+    let mut closing: Option<Instant> = None;
     loop {
+        let (when, due) = match closing {
+            Some(since) => (since + limits.grace, Due::Cut),
+            None if stopping => (Instant::now() + limits.idle, Due::Nothing),
+            None => activity.next(&limits),
+        };
         tokio::select! {
             accepted = h3.accept() => match accepted {
                 Ok(Some(resolver)) => {
                     let state = state.clone();
                     let conn_info = conn_info.clone();
                     let early = !confirmed.load(Ordering::Acquire);
+                    let flight = activity.begin();
                     tokio::spawn(async move {
-                        if let Err(e) = request(resolver, state, conn_info, early).await {
+                        let _flight = flight;
+                        if let Err(e) = request(resolver, state, conn_info, early, limits).await {
                             tracing::debug!(error = %e, "HTTP/3 request failed");
                         }
                     });
@@ -104,27 +162,51 @@ async fn connection(
                     h3.shutdown(0).await?;
                 }
             }
+            // The last request ended: the idle clock starts; look again.
+            () = activity.quiet() => {}
+            () = tokio::time::sleep_until(when.into()) => match due {
+                Due::Nothing => {}
+                Due::Close if closing.is_none() => {
+                    closing = Some(Instant::now());
+                    h3.shutdown(0).await?;
+                }
+                Due::Close => {}
+                Due::Cut => {
+                    quic.close(0u32.into(), b"idle");
+                    break;
+                }
+            },
         }
     }
     Ok(())
 }
 
+/// A send under the stall limit: a client that takes nothing for that long loses the stream.
+async fn within<T, E: Into<BoxError>>(
+    limits: &Limits,
+    sending: impl Future<Output = Result<T, E>>,
+) -> Result<T, BoxError> {
+    match tokio::time::timeout(limits.stall, sending).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err("the client stopped reading the response".into()),
+    }
+}
+
 async fn request(
-    resolver: RequestResolver<h3_quinn::Connection, Bytes>,
+    resolver: RequestResolver<crate::h3limit::Connection, Bytes>,
     state: Arc<ServerState>,
     conn: Arc<crate::handler::ConnInfo>,
     early: bool,
+    limits: Limits,
 ) -> Result<(), BoxError> {
-    let (request, stream) = resolver.resolve_request().await?;
+    let (request, stream) = tokio::time::timeout(limits.read_header, resolver.resolve_request()).await??;
     let (mut send, recv) = stream.split();
     if early && !safe_early(request.method()) {
         let mut response = Response::new(());
         *response.status_mut() = StatusCode::from_u16(425).expect("valid status");
-        if let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(std::time::SystemTime::now())) {
-            response.headers_mut().insert(DATE, value);
-        }
-        send.send_response(response).await?;
-        send.finish().await?;
+        response.headers_mut().insert(DATE, crate::date::now());
+        within(&limits, send.send_response(response)).await?;
+        within(&limits, send.finish()).await?;
         return Ok(());
     }
     let head = request.method() == Method::HEAD;
@@ -152,33 +234,35 @@ async fn request(
     }
     head_parts.headers.remove("keep-alive");
     head_parts.headers.remove("proxy-connection");
-    if !head_parts.headers.contains_key(DATE)
-        && let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(std::time::SystemTime::now()))
-    {
-        head_parts.headers.insert(DATE, value);
+    let result = async {
+        within(&limits, send.send_response(Response::from_parts(head_parts, ()))).await?;
+        if !head {
+            send_body(&mut send, &mut body, &limits).await?;
+        }
+        within(&limits, send.finish()).await
     }
-    send.send_response(Response::from_parts(head_parts, ())).await?;
-    if !head {
-        send_body(&mut send, &mut body).await?;
+    .await;
+    if result.is_err() {
+        send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
-    send.finish().await?;
-    Ok(())
+    result
 }
 
 async fn send_body(
     send: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     body: &mut Body,
+    limits: &Limits,
 ) -> Result<(), BoxError> {
     while let Some(frame) = body.frame().await {
         match frame?.into_data() {
             Ok(data) => {
                 if !data.is_empty() {
-                    send.send_data(data).await?;
+                    within(limits, send.send_data(data)).await?;
                 }
             }
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {
-                    send.send_trailers(trailers).await?;
+                    within(limits, send.send_trailers(trailers)).await?;
                 }
             }
         }
@@ -193,7 +277,7 @@ fn safe_early(method: &Method) -> bool {
 
 /// The request body as it arrives on the QUIC stream (trailers are not passed on).
 struct RecvBody {
-    stream: RequestStream<h3_quinn::RecvStream, Bytes>,
+    stream: RequestStream<crate::h3limit::RecvStream, Bytes>,
     done: bool,
 }
 

@@ -3,7 +3,7 @@
 //! Supported (anything else is a startup error naming the file and line):
 //!   global options  auto_https off|disable_redirects|disable_certs, admin off, http_port, https_port,
 //!                   grace_period, debug, order, servers { trusted_proxies static …,
-//!                   trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header } }
+//!                   trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }
 //!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>, log
 //!   directives      root, header, request_header, redir, rewrite, try_files, encode, route, handle,
 //!                   handle_path, respond, reverse_proxy, file_server
@@ -33,6 +33,8 @@ use std::time::Duration;
 
 pub struct Config {
     pub servers: Vec<ServerConfig>,
+    /// Site files in memory (precompressed siblings included): count, size, what they take.
+    pub files: crate::files::Totals,
     pub grace_period: Duration,
     pub debug: bool,
 }
@@ -45,8 +47,48 @@ pub struct ServerConfig {
     pub trusted_proxies: Vec<IpNet>,
     pub trusted_strict: bool,
     pub client_ip_headers: Vec<HeaderName>,
-    pub read_header_timeout: Option<Duration>,
+    pub limits: Limits,
     pub sites: Vec<Site>,
+}
+
+/// What a connection may take of the server (src/guard.rs); `timeouts` in the Caddyfile, the
+/// rest from the environment (src/main.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Open connections, TCP and QUIC together; 0: no limit.
+    pub max_connections: usize,
+    /// Open connections per client address (an IPv6 /64 is one); trusted proxies are exempt, many
+    /// clients come through them. 0: no limit.
+    pub max_per_ip: usize,
+    /// The request headers must arrive within this — on a new connection, the first request's.
+    pub read_header: Duration,
+    /// With no request in progress for this long, a connection is closed gracefully.
+    pub idle: Duration,
+    /// A response the client does not take (the socket accepts nothing) for this long: the
+    /// connection is cut.
+    pub stall: Duration,
+    /// A graceful close (GOAWAY) that has not finished after this: the connection is cut.
+    pub grace: Duration,
+    /// HTTP/3: the largest frame other than DATA, i.e. a request's encoded headers.
+    pub h3_frame: u64,
+    /// TCP congestion control for the clients' connections (`None`: the system's; src/sockets.rs).
+    pub tcp_congestion: Option<&'static str>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_connections: 16_384,
+            max_per_ip: 256,
+            read_header: Duration::from_secs(30),
+            // Caddy's default.
+            idle: Duration::from_secs(300),
+            stall: Duration::from_secs(30),
+            grace: Duration::from_secs(10),
+            h3_frame: 64 * 1024,
+            tcp_congestion: Some("bbr"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +123,8 @@ pub struct Site {
     pub hosts: Vec<String>,
     pub routes: Arc<[Route]>,
     pub log: Option<Arc<AccessLog>>,
+    /// Ready answers for its files, worked out when the server starts (src/memo.rs).
+    pub answers: Option<Arc<crate::memo::Answers>>,
 }
 
 /// Caddy's default directive order (httpcaddyfile).
@@ -149,6 +193,7 @@ struct ServerOpts {
     client_ip_headers: Option<Vec<HeaderName>>,
     protocols: Option<Protocols>,
     read_header: Option<Duration>,
+    idle: Option<Duration>,
 }
 
 struct Globals {
@@ -286,6 +331,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     hosts,
                     routes: routes.clone(),
                     log: log.clone(),
+                    answers: None,
                 },
                 at: block.at.clone(),
             });
@@ -308,7 +354,11 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                         .client_ip_headers
                         .clone()
                         .unwrap_or_else(|| vec![HeaderName::from_static("x-forwarded-for")]),
-                    read_header_timeout: opts.read_header,
+                    limits: Limits {
+                        read_header: opts.read_header.unwrap_or(Limits::default().read_header),
+                        idle: opts.idle.unwrap_or(Limits::default().idle),
+                        ..Limits::default()
+                    },
                     sites: Vec::new(),
                 });
                 servers.last_mut().expect("just pushed")
@@ -354,6 +404,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
     }
     Ok(Config {
         servers,
+        files: crate::files::Totals::default(),
         grace_period: globals.grace,
         debug: globals.debug,
     })
@@ -379,6 +430,9 @@ fn server_opts(globals: &Globals, port: u16) -> ServerOpts {
         }
         if opts.read_header.is_some() {
             out.read_header = opts.read_header;
+        }
+        if opts.idle.is_some() {
+            out.idle = opts.idle;
         }
     }
     out
@@ -555,12 +609,20 @@ fn parse_server_opts(line: &Line) -> Result<ServerOpts> {
             "timeouts" => {
                 for t in sub.block.as_deref().unwrap_or(&[]) {
                     match t.name() {
-                        "read_header" => {
-                            opts.read_header = Some(parse_duration(&one_arg(t)?).map_err(|e| at_err(&t.at, e))?)
+                        "read_header" | "idle" => {
+                            let value = parse_duration(&one_arg(t)?).map_err(|e| at_err(&t.at, e))?;
+                            if value.is_zero() {
+                                bail!(at_err(&t.at, format!("timeouts: {} must be more than 0", t.name())));
+                            }
+                            if t.name() == "idle" {
+                                opts.idle = Some(value);
+                            } else {
+                                opts.read_header = Some(value);
+                            }
                         }
                         other => bail!(at_err(
                             &t.at,
-                            format!("timeouts: unsupported option {other:?} (only read_header)")
+                            format!("timeouts: unsupported option {other:?} (only read_header and idle)")
                         )),
                     }
                 }

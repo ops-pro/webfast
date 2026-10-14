@@ -73,7 +73,8 @@ done
 
 if [ -n "$bench_bin" ]; then
   docker run --rm --network none "${site[@]}" -v "$bench_bin:/usr/local/bin/bench:ro" --entrypoint /usr/local/bin/bench \
-    "$run_image" /etc/caddy/Caddyfile 200000 10 /en/contact "/assets/$asset" /en/contact.html >"$out/inprocess.txt"
+    "$run_image" /etc/caddy/Caddyfile 200000 10 /en/contact 304:/en/contact "/assets/$asset" /en/contact.html \
+    >"$out/inprocess.txt"
 fi
 
 docker run --rm -v "$here:/bench:ro" -v "$out:/out:ro" --entrypoint node "$node_image" /bench/summarize.mjs /out | tee "$out/summary.txt"

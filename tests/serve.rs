@@ -104,7 +104,8 @@ async fn upstream() -> SocketAddr {
                         "xff": header("x-forwarded-for"),
                         "xfp": header("x-forwarded-proto"),
                         "xfh": header("x-forwarded-host"),
-                        "padding": "x".repeat(600),
+                        // /api/big: past the size compressed on the blocking pool (64 KiB).
+                        "padding": "x".repeat(if req.uri().path() == "/api/big" { 300_000 } else { 600 }),
                     });
                     let response = http::Response::builder()
                         .header("content-type", "application/json")
@@ -282,6 +283,9 @@ async fn static_site_behaves_like_the_caddy_config() {
         "deferred site headers apply"
     );
     assert!(health.headers.get("server").is_none());
+    let date = httpdate::parse_http_date(header(&health, "date")).expect("an HTTP date");
+    let age = std::time::SystemTime::now().duration_since(date).unwrap_or_default();
+    assert!(age < Duration::from_secs(3), "the shared Date is current: {age:?}");
 
     assert_eq!(h.get("/_headers", &[]).await.status, 404);
 
@@ -336,10 +340,31 @@ async fn static_site_behaves_like_the_caddy_config() {
     assert_eq!(not_modified.status, 304);
     assert!(not_modified.body.is_empty());
     assert_eq!(header(&not_modified, "etag"), etag);
+    assert!(not_modified.headers.get("content-type").is_none());
+    // The br sibling's ETag, weak and in a list: 304 without Content-Encoding.
+    let br_listed = format!("\"other\", W/{}", header(&br, "etag"));
+    let listed = h
+        .get("/en/", &[("accept-encoding", "br"), ("if-none-match", &br_listed)])
+        .await;
+    assert_eq!(listed.status, 304);
+    assert_eq!(header(&listed, "etag"), header(&br, "etag"));
+    assert!(listed.headers.get("content-encoding").is_none());
+    // If-Match first: 412, with the representation's headers.
+    let failed = h
+        .get("/en/", &[("if-match", "\"other\""), ("if-none-match", &etag)])
+        .await;
+    assert_eq!(failed.status, 412);
+    assert_eq!(header(&failed, "content-type"), "text/html; charset=utf-8");
     let partial = h.get("/en/contact", &[("range", "bytes=0-8")]).await;
     assert_eq!(partial.status, 206);
     assert_eq!(&partial.body[..], b"<!doctype");
     assert_eq!(header(&partial, "content-range"), "bytes 0-8/37");
+    // /en/index.html is kept in LZ4 (repeated text): whole, ranged and HEAD all as stored.
+    let tail = h.get("/en/", &[("range", "bytes=-10")]).await;
+    assert_eq!(tail.status, 206);
+    assert_eq!(&tail.body[..], &HOME.repeat(20).as_bytes()[HOME.len() * 20 - 10..]);
+    let head_lz4 = h.request(Method::HEAD, "/en/", &[]).await;
+    assert_eq!(header(&head_lz4, "content-length"), (HOME.len() * 20).to_string());
 
     let head = h.request(Method::HEAD, "/en/contact", &[]).await;
     assert_eq!(head.status, 200);
@@ -399,6 +424,16 @@ async fn proxied_paths_stream_and_compress() {
         }
         assert!(serde_json::from_slice::<serde_json::Value>(&plain).is_ok());
     }
+    // A large body is compressed off the worker thread, whole, with its length.
+    let big = h.get("/api/big", &[("accept-encoding", "br")]).await;
+    assert_eq!(header(&big, "content-encoding"), "br");
+    assert_eq!(header(&big, "content-length"), big.body.len().to_string());
+    let mut plain = Vec::new();
+    brotli::Decompressor::new(&big.body[..], 4096)
+        .read_to_end(&mut plain)
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+    assert_eq!(json["padding"].as_str().unwrap().len(), 300_000);
 
     // Unknown pages go to the app as well.
     let fallback = h.get("/robots.txt", &[]).await;
@@ -487,6 +522,7 @@ async fn https_over_http2_and_http3() {
         response.headers()["alt-svc"],
         format!("h3=\":{port}\"; ma=2592000").as_str()
     );
+    assert!(response.headers().contains_key("date"));
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"hello https");
 
@@ -510,6 +546,7 @@ async fn https_over_http2_and_http3() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.version(), http::Version::HTTP_3);
     assert!(response.headers().get("alt-svc").is_none());
+    assert!(response.headers().contains_key("date"));
     let mut body = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await.unwrap() {
         use bytes::Buf;
@@ -588,6 +625,331 @@ async fn http3_resumes_with_zero_rtt() {
     assert!(body == "GET early=1" || body == "GET early=", "{body}");
     eprintln!("0-RTT request answered as {body:?}");
     conn.close(0u32.into(), b"done");
+    endpoint.close(0u32.into(), b"done");
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+fn load(text: &str) -> web_server::config::Config {
+    let file = web_server::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
+    web_server::load_parsed(&file, 1 << 27).unwrap()
+}
+
+fn request_head(
+    method: &Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (http::request::Parts, web_server::body::Body) {
+    let mut builder = Request::builder().method(method.clone()).uri(path);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    builder.body(web_server::body::empty()).unwrap().into_parts()
+}
+
+async fn collected(response: http::Response<web_server::body::Body>) -> (StatusCode, HeaderMap, Bytes) {
+    let (parts, body) = response.into_parts();
+    (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
+}
+
+async fn through_chain(
+    routes: &Arc<[web_server::handler::Route]>,
+    method: &Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Bytes) {
+    let conn = Arc::new(web_server::handler::ConnInfo {
+        remote: "127.0.0.1:5000".parse().unwrap(),
+        tls: false,
+        trusted: false,
+    });
+    let (parts, body) = request_head(method, path, headers);
+    let ctx = web_server::handler::Ctx::new(conn.clone(), parts, body, conn.remote.ip());
+    collected(web_server::handler::Next::start(routes.clone()).run(ctx).await).await
+}
+
+#[tokio::test]
+async fn ready_answers_are_what_the_chain_answers() {
+    let site = site();
+    // Compressible, above encode's minimum and without precompressed siblings: compressed on the
+    // fly for clients that accept it, so only its plain answer can be prepared.
+    write(site.path(), "/notes.txt", &[b'a'; 2000]);
+    let app = upstream().await;
+    let ai = upstream().await;
+    let config = load(&caddyfile(site.path(), app, ai));
+    let routes = config.servers[0].sites[0].routes.clone();
+    let answers = web_server::memo::Answers::prepare(&routes, false).expect("this site decides by the path");
+    // /en/, contact, blog/, the asset, sw.js, the catalog — and /en/index, /en/blog/index,
+    // which the chain serves too ({path}.html), as Caddy does.
+    assert_eq!(answers.paths(), 8);
+
+    let accepts = [
+        "gzip, deflate, br, zstd",
+        "gzip, deflate, br",
+        "gzip, deflate",
+        "",
+        "br",
+        "zstd",
+        "br;q=0.5, gzip",
+        "zstd;q=0.1, br;q=0.9, gzip;q=0.9",
+        "*",
+    ];
+    let paths = [
+        "/en/",
+        "/en/contact",
+        "/en/contact?utm_source=x",
+        "/en/blog/",
+        "/assets/app-abc.js",
+        "/sw.js",
+        "/.well-known/catalog.json",
+    ];
+    for path in paths {
+        for accept in accepts {
+            let mut base: Vec<(&str, &str)> = Vec::new();
+            if !accept.is_empty() {
+                base.push(("accept-encoding", accept));
+            }
+            let first = through_chain(&routes, &Method::GET, path, &base).await;
+            assert_eq!(first.0, StatusCode::OK, "{path}");
+            let etag = first.1["etag"].to_str().unwrap().to_string();
+            for (method, if_none_match) in [
+                (Method::GET, None),
+                (Method::HEAD, None),
+                (Method::GET, Some(etag.as_str())),
+            ] {
+                let mut headers = base.clone();
+                if let Some(etag) = if_none_match {
+                    headers.push(("if-none-match", etag));
+                }
+                let (parts, _) = request_head(&method, path, &headers);
+                let ready = answers
+                    .answer(&parts)
+                    .unwrap_or_else(|| panic!("no ready answer for {method} {path} {accept:?} {if_none_match:?}"));
+                let ready = collected(ready).await;
+                let expected = through_chain(&routes, &method, path, &headers).await;
+                assert_eq!(
+                    ready, expected,
+                    "{method} {path} accept={accept:?} if-none-match={if_none_match:?}"
+                );
+            }
+        }
+    }
+
+    // The long way: no ready answer.
+    type Case<'a> = (Method, &'a str, &'a [(&'a str, &'a str)]);
+    let compressible = [("accept-encoding", "gzip")];
+    let cases: &[Case] = &[
+        (Method::GET, "/en", &[]),
+        (Method::GET, "/en/contact.html", &[]),
+        (Method::GET, "/healthz", &[]),
+        (Method::GET, "/api/forms", &[]),
+        (Method::GET, "/EN/contact", &[]),
+        (Method::GET, "/en//contact", &[]),
+        (Method::GET, "/en/contact", &[("range", "bytes=0-3")]),
+        (Method::GET, "/en/contact", &[("if-match", "\"x\"")]),
+        (Method::GET, "/en/contact", &[("if-none-match", "\"other\"")]),
+        (Method::POST, "/en/contact", &[]),
+        (Method::GET, "/notes.txt", &compressible),
+        (
+            Method::GET,
+            "/notes.txt",
+            &[("accept-encoding", "gzip, deflate, br, zstd")],
+        ),
+    ];
+    for (method, path, headers) in cases {
+        let (parts, _) = request_head(method, path, headers);
+        assert!(answers.answer(&parts).is_none(), "{method} {path} {headers:?}");
+    }
+    // Not compressed for a client that takes no encoding: that answer is ready.
+    let (parts, _) = request_head(&Method::GET, "/notes.txt", &[]);
+    let ready = collected(answers.answer(&parts).expect("plain notes.txt")).await;
+    assert_eq!(ready, through_chain(&routes, &Method::GET, "/notes.txt", &[]).await);
+}
+
+#[tokio::test]
+async fn sites_that_look_beyond_the_path_get_no_ready_answers() {
+    let site = site();
+    let root = site.path().display();
+    for extra in [
+        "header X-Client {client_ip}",
+        "header X-Host {host}",
+        "@get method GET\n\theader @get X-Get 1",
+        "@ua header User-Agent *bot*\n\theader @ua X-Bot 1",
+        "request_header X-A 1",
+    ] {
+        let config = load(&format!(":0 {{\n\troot * {root}\n\t{extra}\n\tfile_server\n}}\n"));
+        let routes = config.servers[0].sites[0].routes.clone();
+        assert!(web_server::memo::Answers::prepare(&routes, false).is_none(), "{extra}");
+    }
+    let config = load(&format!(
+        ":0 {{\n\troot * {root}\n\theader X-Path {{path}}\n\tfile_server\n}}\n"
+    ));
+    let routes = config.servers[0].sites[0].routes.clone();
+    let answers = web_server::memo::Answers::prepare(&routes, false).expect("path placeholders are fine");
+    let (parts, _) = request_head(&Method::GET, "/sw.js", &[]);
+    let ready = collected(answers.answer(&parts).unwrap()).await;
+    assert_eq!(ready.1["x-path"], "/sw.js");
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const SIZE: usize = 48 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "/big.bin", &vec![7u8; SIZE]);
+    // Kept as it is (no LZ4): this test is about the socket, not about decompressing 48 MB.
+    let text = format!(":0 {{\n\troot * {}\n\tfile_server\n}}\n", dir.path().display());
+    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let mut config = web_server::load_parsed_with(&file, 1 << 27, None).unwrap();
+    config.servers[0].limits.stall = Duration::from_secs(1);
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = socket.connect(SocketAddr::from(([127, 0, 0, 1], port))).await.unwrap();
+    stream
+        .write_all(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    // Not reading: the server's writes stop moving.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut received = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => received += n,
+            Err(_) => panic!("the server did not close the connection"),
+        }
+    }
+    assert!(
+        received < SIZE,
+        "the whole file arrived ({received} bytes): the reader was not cut off"
+    );
+    assert!(received > 0, "the response had started");
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn idle_http2_connections_are_closed() {
+    let mut config = load("{\n\tservers {\n\t\tprotocols h1 h2c\n\t}\n}\n:0 {\n\trespond \"ok\"\n}\n");
+    config.servers[0].limits.idle = Duration::from_millis(600);
+    config.servers[0].limits.read_header = Duration::from_millis(600);
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+
+    // One request, then nothing: GOAWAY after `idle`.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let conn = tokio::spawn(conn);
+    let response = sender
+        .send_request(Request::get("http://localhost/").body(Full::new(Bytes::new())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], b"ok");
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the server closed the idle connection")
+        .unwrap()
+        .unwrap();
+    let after = started.elapsed();
+    assert!(
+        after >= Duration::from_millis(400),
+        "closed after {after:?}, before it was idle"
+    );
+    drop(sender);
+
+    // A connection that never sends a request: closed after `read_header`.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (_sender, conn) =
+        hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .unwrap();
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the server closed the silent connection")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn connections_over_the_per_address_limit_are_refused() {
+    use tokio::io::AsyncReadExt;
+    let mut config = load(":0 {\n\trespond \"ok\"\n}\n");
+    config.servers[0].limits.max_per_ip = 2;
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+    use tokio::io::AsyncWriteExt;
+    // Each sends the start of a request: a connection that sends nothing never reaches the server
+    // (TCP_DEFER_ACCEPT).
+    let open = || async move {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(
+                b"GET / HTTP/1.1
+",
+            )
+            .await
+            .unwrap();
+        stream
+    };
+    let _first = open().await;
+    let _second = open().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut third = open().await;
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+        .await
+        .expect("the third connection was closed at once");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn http3_stops_a_stream_with_an_oversized_header_frame() {
+    let (certified, dir) = self_signed();
+    let text = format!(
+        "localhost:0 {{\n\ttls {cert} {key}\n\trespond \"ok\"\n}}\n",
+        cert = dir.path().join("cert.pem").display(),
+        key = dir.path().join("key.pem").display()
+    );
+    let running = server::start(load(&text)).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(&certified.cert, b"h3")).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let endpoint_ref = &endpoint;
+    let connect = || async move {
+        endpoint_ref
+            .connect(SocketAddr::from(([127, 0, 0, 1], port)), "localhost")
+            .unwrap()
+            .await
+            .unwrap()
+    };
+
+    // A request stream written by hand: HEADERS (type 0x01) announcing 1 MiB, more than the 64 KiB
+    // the server takes.
+    let conn = connect().await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    let mut frame = vec![0x01];
+    frame.extend_from_slice(&(0x8000_0000u32 | (1 << 20)).to_be_bytes());
+    frame.extend_from_slice(&[b'x'; 16 * 1024]);
+    send.write_all(&frame).await.unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), send.stopped())
+        .await
+        .expect("the server stopped the stream")
+        .unwrap();
+    assert_eq!(stopped.map(|code| code.into_inner()), Some(0x0107), "H3_EXCESSIVE_LOAD");
+
+    // Requests of the usual size are served.
+    let (status, body) = h3_request(connect().await, Method::GET, port).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "ok"));
     endpoint.close(0u32.into(), b"done");
     running.shutdown(Duration::from_secs(1)).await;
 }

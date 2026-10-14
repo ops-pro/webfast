@@ -2,7 +2,13 @@
 //! configuration and loads the site files without listening; `web-server healthcheck <http-url>`
 //! probes a running instance (the container HEALTHCHECK, so the image needs no curl).
 //! Environment: LOG_LEVEL (info), WEB_MAX_MEMORY (512MiB) for the site files held in memory,
-//! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches.
+//! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches;
+//! WEB_LZ4_MIN_SAVING (25): files are kept in memory as LZ4 when that saves at least this many
+//! percent (`off`: never; src/files.rs);
+//! WEB_MAX_CONNECTIONS (16384) and WEB_MAX_CONNECTIONS_PER_IP (256) open connections (0: no
+//! limit), WEB_STALL_TIMEOUT (30s): a response the client stops taking for that long ends its
+//! connection (src/guard.rs); WEB_TCP_CONGESTION (bbr; `system`: the kernel's default) for the
+//! clients' TCP connections (src/sockets.rs).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -10,7 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed, parse_size, server};
+use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_with, parse_size, server};
 
 /// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
 #[cfg(feature = "mimalloc")]
@@ -21,6 +27,7 @@ const USAGE: &str =
     "usage: web-server [run|validate] [--config <Caddyfile>] | healthcheck <http://host:port/path> | --version";
 
 fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => {
@@ -83,8 +90,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let loaded = runtime.block_on(async { load_parsed(&file, max_memory) });
-    let config = match loaded {
+    let lz4_min_saving = match web_server::files::lz4_min_saving_from_env() {
+        Ok(setting) => setting,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let loaded = runtime.block_on(async { load_parsed_with(&file, max_memory, lz4_min_saving) });
+    let mut config = match loaded {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %e, config = %config_path.display(), "configuration error");
@@ -92,18 +106,83 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = limits_from_env(&mut config) {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
     if command == "validate" {
         let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
-        println!("valid configuration: {} port(s), {sites} site(s)", config.servers.len());
+        let files = config.files;
+        println!(
+            "valid configuration: {} port(s), {sites} site(s), {} files ({:.1} MiB; {:.1} MiB in memory, {} in LZ4), loaded in {} ms",
+            config.servers.len(),
+            files.files,
+            files.bytes as f64 / 1048576.0,
+            files.stored as f64 / 1048576.0,
+            files.lz4,
+            started.elapsed().as_millis()
+        );
         return ExitCode::SUCCESS;
     }
-    match runtime.block_on(run(config)) {
+    match runtime.block_on(run(config, started)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "web-server stopped with an error");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Connection limits from the environment, for every port.
+fn limits_from_env(config: &mut config::Config) -> Result<(), String> {
+    let count = |name: &str| -> Result<Option<usize>, String> {
+        match std::env::var(name) {
+            Ok(value) => value
+                .trim()
+                .parse()
+                .map(Some)
+                .map_err(|_| format!("{name}: not a number: {value:?}")),
+            Err(_) => Ok(None),
+        }
+    };
+    let max_connections = count("WEB_MAX_CONNECTIONS")?;
+    let max_per_ip = count("WEB_MAX_CONNECTIONS_PER_IP")?;
+    let stall = match std::env::var("WEB_STALL_TIMEOUT") {
+        Ok(value) => match config::parse_duration(&value) {
+            Ok(d) if !d.is_zero() => Some(d),
+            _ => return Err(format!("WEB_STALL_TIMEOUT: invalid duration {value:?} (e.g. 30s)")),
+        },
+        Err(_) => None,
+    };
+    let congestion: Option<Option<&'static str>> = match std::env::var("WEB_TCP_CONGESTION") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("system") => Some(None),
+        Ok(value)
+            if !value.trim().is_empty() && value.trim().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+        {
+            Some(Some(Box::leak(value.trim().to_ascii_lowercase().into_boxed_str())))
+        }
+        Ok(value) => {
+            return Err(format!(
+                "WEB_TCP_CONGESTION: an algorithm name or system, not {value:?}"
+            ));
+        }
+        Err(_) => None,
+    };
+    for server in &mut config.servers {
+        if let Some(congestion) = congestion {
+            server.limits.tcp_congestion = congestion;
+        }
+        if let Some(n) = max_connections {
+            server.limits.max_connections = n;
+        }
+        if let Some(n) = max_per_ip {
+            server.limits.max_per_ip = n;
+        }
+        if let Some(d) = stall {
+            server.limits.stall = d;
+        }
+    }
+    Ok(())
 }
 
 fn init_tracing(debug: bool) {
@@ -118,10 +197,27 @@ fn init_tracing(debug: bool) {
         .init();
 }
 
-async fn run(config: config::Config) -> anyhow::Result<()> {
+async fn run(config: config::Config, started: std::time::Instant) -> anyhow::Result<()> {
     let grace = config.grace_period;
+    let (ports, files) = (config.servers.len(), config.files);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
     let running = server::start(config).await?;
+    web_server::release_free_memory();
+    let mib = |bytes: u64| (bytes as f64 / 1048576.0 * 10.0).round() / 10.0;
+    tracing::info!(
+        ports,
+        files = files.files,
+        files_mib = mib(files.bytes),
+        files_in_memory_mib = mib(files.stored),
+        lz4_files = files.lz4,
+        ready_paths = running.ready.paths,
+        ready_answers = running.ready.answers,
+        ready_mib = mib(running.ready.bytes),
+        ready_ms = running.ready.millis,
+        resident_mib = web_server::resident_bytes().map_or(0.0, mib),
+        startup_ms = started.elapsed().as_millis() as u64,
+        "started"
+    );
     shutdown_signal().await;
     tracing::info!(grace_secs = grace.as_secs(), "shutting down");
     running.shutdown(grace).await;

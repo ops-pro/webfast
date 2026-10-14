@@ -48,6 +48,11 @@ impl MatcherSet {
         self.matchers.iter().all(|m| m.matches(ctx))
     }
 
+    /// Decides by the request path alone (src/memo.rs).
+    pub fn depends_on_path_only(&self) -> bool {
+        self.matchers.iter().all(Matcher::depends_on_path_only)
+    }
+
     /// The only path pattern of the set, if it has a `path` matcher with exactly one pattern
     /// (Caddy sorts directives of the same kind by this).
     pub fn single_path(&self) -> Option<&str> {
@@ -69,6 +74,21 @@ impl Matcher {
             name: Arc::from(name),
             re,
             names: names.into(),
+        }
+    }
+
+    /// Decides by the request path alone: path, path_regexp, file with path placeholders, not.
+    pub fn depends_on_path_only(&self) -> bool {
+        match self {
+            Matcher::Path(_) | Matcher::PathRegexp { .. } => true,
+            Matcher::Not(sets) => sets.iter().all(MatcherSet::depends_on_path_only),
+            Matcher::File(file) => file.try_files.iter().all(|t| t.template.depends_on_path_only()),
+            Matcher::Host(_)
+            | Matcher::Method(_)
+            | Matcher::Header(_)
+            | Matcher::ClientIp(_)
+            | Matcher::RemoteIp(_)
+            | Matcher::Protocol(_) => false,
         }
     }
 

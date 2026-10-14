@@ -392,6 +392,17 @@ impl HeaderOp {
         )
     }
 
+    /// Its value, if any, is the same for every request with the same path (src/memo.rs).
+    pub fn depends_on_path_only(&self) -> bool {
+        match self {
+            HeaderOp::Set(_, value) | HeaderOp::Add(_, value) | HeaderOp::Default(_, value) => match value {
+                Value::Static(_) => true,
+                Value::Dynamic(template) => template.depends_on_path_only(),
+            },
+            HeaderOp::Delete(_) | HeaderOp::DeletePrefix(_) => true,
+        }
+    }
+
     /// Has a value with placeholders.
     pub fn is_dynamic(&self) -> bool {
         matches!(

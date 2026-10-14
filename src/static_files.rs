@@ -126,10 +126,12 @@ impl FileServer {
         let mut response = Response::new(empty());
         // Sized for this response and the site's headers added later: no regrowing.
         *response.headers_mut() = HeaderMap::with_capacity(24);
-        let headers = response.headers_mut();
-        headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Accept-Encoding"));
         // The representation sent: the file or a precompressed sibling (body, ETag, length are its).
-        let mut chosen: &FileEntry = &entry;
+        let mut chosen: &Arc<FileEntry> = &entry;
+        let mut chosen_encoding = None;
         let mut sidecar_key = String::with_capacity(file.len() + 4);
         for encoding in ctx.accept_encoding().ranked(&self.precompressed) {
             sidecar_key.clear();
@@ -137,11 +139,10 @@ impl FileServer {
             sidecar_key.push_str(encoding.suffix());
             if let Some(sidecar) = store.file(&sidecar_key) {
                 chosen = sidecar;
-                headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
+                chosen_encoding = Some(encoding);
                 break;
             }
         }
-        let mut body = chosen.body.clone();
         let etag = chosen.etag.clone();
         let length = chosen.length.clone();
 
@@ -151,38 +152,46 @@ impl FileServer {
                 .headers_mut()
                 .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
             *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-            response.headers_mut().remove(CONTENT_ENCODING);
             return ctx.respond(response);
         }
 
+        // Preconditions (RFC 9110 §13.2.2, as Go's http.ServeContent orders them). A 304 carries the
+        // ETag but not Content-Type and Content-Encoding, so it is answered before they are set.
+        let request = &ctx.req.headers;
+        let if_match_failed = request
+            .get(IF_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|list| !etag_list_matches(list, &etag, true));
+        if !if_match_failed
+            && request
+                .get(IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|list| etag_list_matches(list, &etag, false))
+        {
+            response.headers_mut().insert(ETAG, etag);
+            *response.status_mut() = StatusCode::NOT_MODIFIED;
+            if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+                response.extensions_mut().insert(crate::memo::FromFile(chosen.clone()));
+            }
+            return ctx.respond(response);
+        }
         let headers = response.headers_mut();
         headers.insert(ETAG, etag.clone());
+        if let Some(encoding) = chosen_encoding {
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
+        }
         if !ctx.pre_headers.contains_key(CONTENT_TYPE)
             && let Some(kind) = &entry.content_type
         {
             headers.insert(CONTENT_TYPE, kind.clone());
         }
-
-        // Preconditions (RFC 9110 §13.2.2, as Go's http.ServeContent orders them).
-        let request = &ctx.req.headers;
-        if let Some(if_match) = request.get(IF_MATCH).and_then(|v| v.to_str().ok())
-            && !etag_list_matches(if_match, &etag, true)
-        {
+        if if_match_failed {
             *response.status_mut() = StatusCode::PRECONDITION_FAILED;
-            return ctx.respond(response);
-        }
-        if let Some(if_none_match) = request.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok())
-            && etag_list_matches(if_none_match, &etag, false)
-        {
-            let headers = response.headers_mut();
-            headers.remove(CONTENT_TYPE);
-            headers.remove(CONTENT_ENCODING);
-            *response.status_mut() = StatusCode::NOT_MODIFIED;
             return ctx.respond(response);
         }
 
         // Ranges (Go's http.ServeContent: of the representation sent, also a compressed one).
-        let total = body.len() as u64;
+        let total = chosen.len() as u64;
         let mut status = StatusCode::OK;
         let range_allowed = match request.get(IF_RANGE).and_then(|v| v.to_str().ok()) {
             Some(if_range) => {
@@ -211,6 +220,13 @@ impl FileServer {
         if ranges.iter().map(|(_, len)| len).sum::<u64>() > total {
             ranges.clear();
         }
+        // The bytes, only when they are sent or cut into ranges (a file kept in LZ4 is decompressed
+        // here; a HEAD needs only the headers).
+        let mut body = if method != Method::HEAD || !ranges.is_empty() {
+            chosen.body()
+        } else {
+            bytes::Bytes::new()
+        };
         if ranges.len() == 1 {
             let (start, length) = ranges[0];
             body = body.slice(start as usize..(start + length) as usize);
@@ -265,6 +281,9 @@ impl FileServer {
         if method != Method::HEAD {
             *response.body_mut() = full(body);
         }
+        if status == StatusCode::OK && ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+            response.extensions_mut().insert(crate::memo::FromFile(chosen.clone()));
+        }
         ctx.respond(response)
     }
 
@@ -309,10 +328,13 @@ fn base(path: &str) -> &str {
     trimmed.rsplit('/').next().unwrap_or(trimmed)
 }
 
-/// If-Match (strong comparison) / If-None-Match (weak comparison) against one ETag.
+/// If-Match (strong comparison) / If-None-Match (weak comparison) against one ETag; no allocation.
 fn etag_list_matches(list: &str, etag: &HeaderValue, strong: bool) -> bool {
+    fn opaque(tag: &str) -> &str {
+        tag.trim().trim_start_matches("W/")
+    }
     let etag = etag.to_str().unwrap_or_default();
-    let opaque = |t: &str| t.trim().trim_start_matches("W/").to_string();
+    let wanted = opaque(etag);
     list.split(',').map(str::trim).any(|candidate| {
         if candidate == "*" {
             return true;
@@ -320,7 +342,7 @@ fn etag_list_matches(list: &str, etag: &HeaderValue, strong: bool) -> bool {
         if strong && (candidate.starts_with("W/") || etag.starts_with("W/")) {
             return false;
         }
-        opaque(candidate) == opaque(etag)
+        opaque(candidate) == wanted
     })
 }
 

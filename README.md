@@ -8,14 +8,37 @@ Caddy, and the two can be compared request by request ([`compat/`](compat)).
 What it adds over Caddy, with no extra directives:
 
 - **Files from memory.** Every site root is read once at startup; requests never touch the disk.
-  `WEB_MAX_MEMORY` (default `512MiB`) caps it; the reference site takes about 32 MB with its
-  precompressed siblings.
+  `WEB_MAX_MEMORY` (default `512MiB`) caps it. A file is kept as an LZ4 block when that saves at
+  least `WEB_LZ4_MIN_SAVING` percent (25; `off`: never) — text, in practice: images, fonts and the
+  precompressed siblings do not shrink and stay as they are. Only a response that sends such a
+  file's bytes as they are (a client without Accept-Encoding, a range of them) decompresses it:
+  about 10 µs for a 30–80 KB file; browsers get the `.br` / `.zst` siblings, and 304s and HEAD need
+  no bytes. The reference site: 30 MiB of files (with their siblings) take 19 MiB, 250 of them in
+  LZ4. What is kept lies in one buffer.
 - **ETag = hash of the content** (BLAKE3, 80 bits) instead of modification time + size: unchanged
   files keep their ETag across deploys (304 instead of a full response) and every replica sends the
   same one. There is no `Last-Modified`.
 - **Brotli on the fly** (`encode zstd br gzip`), besides zstd and gzip. Responses of known length up
   to 1 MiB are compressed whole and sent with `Content-Length`; streams are compressed frame by frame,
   so they still flow.
+- **One `Date` for all threads**: a background thread formats it just after each second starts;
+  responses take it without reading the clock (a proxied response keeps the upstream's `Date`).
+- **Ready answers for files** ([`src/memo.rs`](src/memo.rs)): the files never change while the
+  server runs, so when a site's routes decide by the request path alone (no host, method, header or
+  address matchers, no `request_header`, only path-derived placeholders — true for
+  `docker/Caddyfile`), the answer for every path that serves a file — the 200 with all its headers
+  and the 304 for its ETag, for each of the 26 ways Accept-Encoding can rank zstd, br and gzip — is
+  worked out at startup by running the real handler chain. A GET or HEAD for such a path is then a
+  lookup and a copy of a header map. Ranges, If-Match, another If-None-Match, other spellings of a
+  path, files compressed on the fly and everything else take the chain. The reference site: 300 paths,
+  1050 distinct answers, 3.8 MB (the bodies are the files' own bytes).
+- **Startup on every CPU**: files are read, hashed and compressed, and the answers worked out, on one
+  thread per CPU; what is kept is then built on the main thread, so the workers' memory is all given
+  back (mimalloc's `mi_collect`). The reference site: about 25 ms for the files and 40–50 ms for the
+  answers, 49 MiB resident in all (sequentially it was 60 + 190 ms and 66 MiB; started in parallel
+  but with the kept data on the workers, 160 MiB).
+- **Compression off the request threads**: an on-the-fly body over 64 KiB is compressed on the
+  blocking pool, so a worker thread does not spend milliseconds of Brotli while other requests wait.
 
 Protocols: HTTP/1.1; HTTP/2 over TLS (h2c on request); **HTTP/3** (QUIC, quinn + h3) on the same port
 when the site has `tls`, advertised with `Alt-Svc`. TLS is rustls with aws-lc-rs: TLS 1.3/1.2, the
@@ -26,6 +49,27 @@ Connections:
 
 - **SO_REUSEPORT**: one listening socket per CPU, each with its own accept loop; the kernel spreads
   new connections over them, and a new process can bind the port while the old one drains.
+- **Socket options** ([`src/sockets.rs`](src/sockets.rs), Linux; set on the listening socket and
+  inherited by every connection; one the system refuses stays at its default, with a warning at
+  startup):
+  - congestion control `WEB_TCP_CONGESTION` (`bbr`; `system`: the kernel's default) — BBR keeps its
+    pace on long, lossy paths (between continents, mobile) where cubic backs off;
+  - `TCP_NOTSENT_LOWAT` 16 KiB: little unsent data waits in the kernel, so HTTP/2 can still send an
+    urgent stream (CSS, HTML) before a long one;
+  - `TCP_DEFER_ACCEPT`: a connection reaches the server only once it has sent something;
+  - `TCP_USER_TIMEOUT` = `WEB_STALL_TIMEOUT` and keepalive (60 s, then 3 probes 10 s apart): the
+    kernel ends connections whose peer vanished;
+  - listen backlog 4096 (capped at `net.core.somaxconn`);
+  - HTTP/3's UDP socket: 4 MiB receive and send buffers (capped at `net.core.rmem_max` / `wmem_max`;
+    UDP has no autotuning). quinn adds GSO/GRO, ECN, pacing and path MTU discovery.
+
+  On the host: BBR needs the `tcp_bbr` module and, as the container has no capabilities, to be
+  allowed (`net.ipv4.tcp_allowed_congestion_control = reno cubic bbr`, or make it the host's
+  default with `net.core.default_qdisc = fq` and `net.ipv4.tcp_congestion_control = bbr`); larger
+  UDP buffers need `net.core.rmem_max` / `wmem_max` of at least 4 MiB. `compose.yaml` sets the
+  per-container `net.ipv4.tcp_slow_start_after_idle = 0` (a keep-alive connection keeps its
+  congestion window across pauses, so the next page does not start slowly) and `net.core.somaxconn`.
+
 - **TLS resumption**: TLS 1.3 session tickets (keys live in the process, so a restart or another
   replica means a full handshake), and a cache of 16 384 sessions for resumption by ID.
 - **HTTP/3 0-RTT**: a resumed QUIC client sends its first request with the handshake. Early requests
@@ -33,12 +77,26 @@ Connections:
   reach the handler with `Early-Data: 1`; anything else gets `425 Too Early` and the browser repeats
   it after the handshake (RFC 8470). TCP does not take early data.
 
+What keeps one client from holding the server ([`src/guard.rs`](src/guard.rs),
+[`src/h3limit.rs`](src/h3limit.rs)):
+
+| Threat                                                | Limit                                                                                                                                                             |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Many connections (one address, or many)               | `WEB_MAX_CONNECTIONS_PER_IP` (256; an IPv6 /64 is one address; trusted proxies exempt) and `WEB_MAX_CONNECTIONS` (16 384), TCP and QUIC together: refused at once |
+| Slowloris: headers sent byte by byte                  | `timeouts { read_header }` (30 s) for the whole header block; the TLS handshake gets 10 s                                                                         |
+| Connections opened and left silent                    | HTTP/2 and HTTP/3 must send their first request within `read_header` (HTTP/1.1 already must)                                                                      |
+| Idle keep-alive connections                           | `timeouts { idle }` (5 min, Caddy's default) with no request in progress: graceful close (GOAWAY); one that has not finished 10 s later is cut                    |
+| Slow reader: a response the client stops taking       | `WEB_STALL_TIMEOUT` (30 s) with the socket accepting nothing (HTTP/3: the stream) cuts the connection; a slow but moving download is fine                         |
+| HTTP/3 headers of any size (h3 buffers a frame whole) | frames other than DATA over 64 KiB end the stream (`H3_EXCESSIVE_LOAD`), also on the control and QPACK streams; `SETTINGS_MAX_FIELD_SECTION_SIZE` 64 KiB          |
+| QUIC handshake floods from spoofed addresses          | with 64 handshakes under way, unproven addresses get a Retry first; at most 4096 handshakes queued, 32 MB of their packets                                        |
+| HTTP/2 Rapid Reset, CONTINUATION flood, MadeYouReset  | h2 0.4.20; 250 streams per connection, 16 KiB of headers                                                                                                          |
+
 ## Configuration subset
 
 | Kind           | Supported                                                                                                                                                                                                                                                         |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                       |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header } }`                                        |
+| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                  |
 | Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`                                                                                           |
 | Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `respond`, `reverse_proxy`, `file_server` |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                              |
@@ -68,13 +126,42 @@ web-server healthcheck http://127.0.0.1:8080/healthz
 
 Environment: `LOG_LEVEL` (`info`; `debug` also via the `debug` global option), `WEB_MAX_MEMORY`,
 `WEB_LOG_FLUSH_MS` (10: access log lines are written in batches by a background thread; a full
-queue drops lines instead of slowing requests, and they are counted).
+queue drops lines instead of slowing requests, and they are counted), `WEB_LZ4_MIN_SAVING` (25),
+`WEB_MAX_CONNECTIONS`
+(16384), `WEB_MAX_CONNECTIONS_PER_IP` (256; 0 turns a limit off), `WEB_STALL_TIMEOUT` (30s),
+`WEB_TCP_CONGESTION` (`bbr`).
 Logs are JSON on stderr; access logs go where the site's `log` block says.
+
+At startup the log says what was loaded and what it cost — per site root `site files loaded`
+(files, bytes, bytes in memory, files in LZ4, ms), per site `ready answers for the site's files` (paths, distinct answers, their
+memory, ms; or why there are none), and one summary:
+
+```json
+{
+  "message": "started",
+  "ports": 1,
+  "files": 1000,
+  "files_mib": 30.0,
+  "files_in_memory_mib": 19.0,
+  "lz4_files": 250,
+  "ready_paths": 300,
+  "ready_answers": 1050,
+  "ready_mib": 3.8,
+  "ready_ms": 51,
+  "resident_mib": 48.5,
+  "startup_ms": 141
+}
+```
+
+`web-server validate` prints the same for the files: `valid configuration: 1 port(s), 1 site(s),
+1000 files (30 MiB; 19 MiB in memory, 250 in LZ4), loaded in 92 ms`.
 
 ## Tests
 
 ```bash
-# unit + integration (HTTP/1.1 against a stub upstream, SSE timing, TLS with HTTP/2 and HTTP/3)
+# unit + integration (HTTP/1.1 against a stub upstream, SSE timing, TLS with HTTP/2 and HTTP/3,
+# ready answers against the chain, slow readers, idle HTTP/2, connection limits, oversized HTTP/3
+# header frames)
 docker run --rm --network host -v cargo-cache:/cargo -v web-target:/target \
   -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -v "$PWD/services/web-server:/src:ro" -w /src \
   rust:1-slim-bookworm cargo test --locked
@@ -119,6 +206,17 @@ Handler chain in process, page `/en/contact` (precompressed br):
 measured at different times on the same host; fat LTO alone was within the noise of ±5 % here, its
 gain shows under load below.)
 
+304 for the same page (`304:/en/contact`, If-None-Match with its ETag): 3 829–3 956 ns and 28
+allocations, against 3 580–3 615 ns and 24 once the ETag comparison stopped copying strings, the
+`encode` suffix check stopped formatting, and the 304 was answered before `Content-Type` and
+`Content-Encoding` were set — now no dearer than the 200.
+
+Through a socket, one request at a time, the access log shows 6–12 µs per request back to back and
+22–33 µs after a second of idle (CPU caches and TLB gone cold under the VM), whatever the handler:
+`/healthz` costs as much as a page. The first file request after another kind of request pays most
+of it — with `/healthz`, 304, 200 in turn the 304 looked 9 µs slower than the 200, and the other way
+round when the order was swapped. Caddy, same Caddyfile and requests: 40–255 µs.
+
 Load test, 1000 requests/s, page / asset / redirect:
 
 | Version                                                                          | p50 ms                | p99 ms                | server CPU µs per request |
@@ -162,3 +260,30 @@ each side, 20 connections, medians):
 | HTTP/2 over TCP + TLS 1.3, session resumed    | 152.8 |
 | HTTP/3, full handshake                        | 102.6 |
 | HTTP/3 resumed with 0-RTT (accepted 20 of 20) | 51.6  |
+
+Ready answers (`BENCH_CHAIN=1` makes `examples/bench.rs` take the chain for comparison), same binary:
+
+| Request                         | through the chain   | ready answer      |
+| ------------------------------- | ------------------- | ----------------- |
+| page, in process                | 3 639 ns, 26 allocs | 883 ns, 10 allocs |
+| 304 for it, in process          | 3 607 ns, 24 allocs | 853 ns, 8 allocs  |
+| build asset, in process         | 3 281 ns, 26 allocs | 888 ns, 10 allocs |
+| page via socket, back to back   | 11–12 µs            | 4.0–4.3 µs        |
+| page via socket, after 1 s idle | 26–36 µs            | 9–12 µs           |
+| 304 via socket, back to back    | 11–12 µs            | 3.5–3.9 µs        |
+| 304 via socket, after 1 s idle  | 24–34 µs            | 9–10 µs           |
+
+Files kept in LZ4, in process (`identity:` requests send the file's own bytes), same binary:
+
+| Request                                     | `WEB_LZ4_MIN_SAVING=off` | 25 (default)                                             |
+| ------------------------------------------- | ------------------------ | -------------------------------------------------------- |
+| page without Accept-Encoding (77 KB)        | 0.72 µs                  | 11.7 µs (decompressed)                                   |
+| build asset without Accept-Encoding (32 KB) | 0.72 µs                  | 9.9 µs                                                   |
+| page as br; its 304                         | 0.91 µs; 0.85 µs         | the same (a .br sibling does not shrink, stays as it is) |
+| files in memory; process resident           | 30 MiB; 78.2 MiB       | 19 MiB; 65.9 MiB                                       |
+| loading the files                           | 28 ms                    | 61 ms (compressing, checking every block once)           |
+
+(Allocations include the 6 of building the test request. Through a socket: the access log's
+`duration`, one request at a time.) Under load (1000 requests/s) a page and an asset now cost 134–136
+µs of server CPU against 146 for the redirect, which still takes the chain; before, the page cost
+about 6 µs more than the redirect.

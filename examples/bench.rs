@@ -5,10 +5,16 @@
 //!
 //!   cargo run --release --example bench -- <Caddyfile> <iterations> <rounds> <path> [<path>…]
 //!
+//! `304:<path>` sends the path with If-None-Match set to the ETag of its 200 response;
+//! `identity:<path>` sends it without Accept-Encoding (the file's own bytes: decompressed when kept in
+//! LZ4, see WEB_LZ4_MIN_SAVING, read as by the server). Requests
+//! with a ready answer (src/memo.rs) take it, as in the server; `BENCH_CHAIN=1` runs every
+//! request through the handler chain instead.
+//!
 //! services/web-server/bench/run.sh runs it next to the load test; for a profile, run one path with
 //! many iterations under `perf record -e cpu-clock`.
 
-use http::Request;
+use http::{HeaderValue, Request};
 use http_body_util::BodyExt;
 #[cfg(not(feature = "mimalloc"))]
 use std::alloc::System;
@@ -80,8 +86,9 @@ fn main() {
     let iterations: u32 = iterations.parse().expect("iterations");
     let rounds: usize = rounds.parse().expect("rounds");
     let paths = &args[3..];
-    let config =
-        web_server::load_config(Path::new(config_path), web_server::DEFAULT_MAX_MEMORY).expect("configuration");
+    let lz4 = web_server::files::lz4_min_saving_from_env().expect("WEB_LZ4_MIN_SAVING");
+    let file = web_server::caddyfile::parse_file(Path::new(config_path)).expect("Caddyfile");
+    let config = web_server::load_parsed_with(&file, web_server::DEFAULT_MAX_MEMORY, lz4).expect("configuration");
     let routes = config.servers[0].sites[0].routes.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -93,24 +100,50 @@ fn main() {
         tls: false,
         trusted: false,
     });
+    let answers = if std::env::var_os("BENCH_CHAIN").is_some() {
+        None
+    } else {
+        web_server::memo::Answers::prepare(&routes, false)
+    };
 
-    let once = |path: &str| {
+    let once = |path: &str, if_none_match: &Option<HeaderValue>, identity: bool| {
+        let mut request = Request::builder()
+            .uri(path)
+            .header("host", "example.test")
+            .header("user-agent", "bench");
+        if !identity {
+            request = request.header("accept-encoding", "gzip, deflate, br, zstd");
+        }
+        if let Some(etag) = if_none_match {
+            request = request.header("if-none-match", etag.clone());
+        }
+        let request = request.body(web_server::body::empty()).expect("request");
+        let (parts, body) = request.into_parts();
+        let ready = answers.as_ref().and_then(|a| a.answer(&parts));
+        let conn = conn.clone();
+        let routes = routes.clone();
+        async move {
+            let response = match ready {
+                Some(response) => response,
+                None => Next::start(routes).run(Ctx::new(conn, parts, body, remote.ip())).await,
+            };
+            let status = response.status().as_u16();
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            (status, body.len())
+        }
+    };
+    // The ETag of a path's 200 response.
+    let etag_of = |path: &str| {
         let request = Request::builder()
             .uri(path)
             .header("host", "example.test")
             .header("accept-encoding", "gzip, deflate, br, zstd")
-            .header("user-agent", "bench")
             .body(web_server::body::empty())
             .expect("request");
         let (parts, body) = request.into_parts();
         let ctx = Ctx::new(conn.clone(), parts, body, remote.ip());
         let routes = routes.clone();
-        async move {
-            let response = Next::start(routes).run(ctx).await;
-            let status = response.status().as_u16();
-            let body = response.into_body().collect().await.expect("body").to_bytes();
-            (status, body.len())
-        }
+        runtime.block_on(async move { Next::start(routes).run(ctx).await.headers().get("etag").cloned() })
     };
 
     println!(
@@ -145,12 +178,21 @@ fn main() {
             (BYTES.load(Ordering::Relaxed) - b0) as f64 / n
         );
     }
-    for path in paths {
-        let (status, bytes) = runtime.block_on(once(path));
+    for label in paths {
+        let (path, identity) = match label.strip_prefix("identity:") {
+            Some(path) => (path, true),
+            None => (label.as_str(), false),
+        };
+        let (path, if_none_match) = match path.strip_prefix("304:") {
+            Some(path) => (path, Some(etag_of(path).expect("an ETag for the 304 case"))),
+            None => (path, None),
+        };
+        let inm = &if_none_match;
+        let (status, bytes) = runtime.block_on(once(path, inm, identity));
         // Warm-up, then timed rounds.
         runtime.block_on(async {
             for _ in 0..iterations / 10 {
-                black_box(once(path).await);
+                black_box(once(path, inm, identity).await);
             }
         });
         let mut per_request: Vec<(f64, f64)> = (0..rounds)
@@ -159,7 +201,7 @@ fn main() {
                 let t0 = ticks();
                 runtime.block_on(async {
                     for _ in 0..iterations {
-                        black_box(once(path).await);
+                        black_box(once(path, inm, identity).await);
                     }
                 });
                 let elapsed = started.elapsed().as_nanos() as f64 / f64::from(iterations);
@@ -173,13 +215,13 @@ fn main() {
         let (a0, b0) = (ALLOCATIONS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed));
         runtime.block_on(async {
             for _ in 0..iterations {
-                black_box(once(path).await);
+                black_box(once(path, inm, identity).await);
             }
         });
         let allocs = (ALLOCATIONS.load(Ordering::Relaxed) - a0) as f64 / f64::from(iterations);
         let alloc_bytes = (BYTES.load(Ordering::Relaxed) - b0) as f64 / f64::from(iterations);
         println!(
-            "{path:<36} {status:>6} {bytes:>7} {median:>10.0} {:>10.0} {median_tsc:>11.0} {allocs:>8.1} {alloc_bytes:>9.0}",
+            "{label:<36} {status:>6} {bytes:>7} {median:>10.0} {:>10.0} {median_tsc:>11.0} {allocs:>8.1} {alloc_bytes:>9.0}",
             per_request[0].0
         );
     }
