@@ -176,6 +176,31 @@ memory, ms; or why there are none), and one summary:
 `web-server validate` prints the same for the files: `valid configuration: 1 port(s), 1 site(s),
 1000 files (30 MiB; 19 MiB in memory, 250 in LZ4), loaded in 92 ms`.
 
+## Build
+
+The release profile is one codegen unit and fat LTO, with mimalloc as the allocator. The web image
+adds **profile-guided optimisation** ([`pgo/build.sh`](pgo/build.sh), run by the Dockerfile): an
+instrumented build serves a stand-in for the site — `examples/train.rs site`: pages in four
+languages, build assets, fonts, images, the text with `.br`/`.zst`/`.gz` siblings; headers from
+[`pgo/site.caddy`](pgo/site.caddy) — with `docker/Caddyfile`, plain and over TLS, while
+`examples/train.rs run` sends 15 s of every kind of request over HTTP/1.1, HTTP/2 and HTTP/3 and
+plays the app and the streaming service behind it (answers compressed on the fly, whole and streamed; an
+event stream). The release build is then optimised by the profile the servers wrote. The training
+needs no network and nothing from the site's build, so the stage stays cached until the server's
+code changes; it takes about twice as long. `--build-arg WEB_PGO=0` builds without it.
+
+```bash
+# the same outside Docker (needs llvm-tools: rustup component add llvm-tools)
+cd services/web-server && sh pgo/build.sh ../../docker/Caddyfile /tmp/web-server-pgo
+```
+
+What the training never runs is optimised as cold code, so new kinds of work (a handler, a protocol
+feature, a kind of upstream answer) belong in `examples/train.rs` as well.
+
+There is no `-C target-cpu`: built for x86-64-v3 (AVX2, BMI2), with or without the profile, the
+server was no faster (Benchmarks), and the libraries with vector loops — memchr, aws-lc, BLAKE3,
+zstd — choose them at runtime on the CPU they find.
+
 ## Tests
 
 ```bash
@@ -307,3 +332,24 @@ Files kept in LZ4, in process (`identity:` requests send the file's own bytes), 
 `duration`, one request at a time.) Under load (1000 requests/s) a page and an asset now cost 134–136
 µs of server CPU against 146 for the redirect, which still takes the chain; before, the page cost
 about 6 µs more than the redirect.
+
+Profile-guided optimisation (Build) against the plain release build, the built site with
+`docker/Caddyfile`, in process (medians of 3 alternating rounds, ns):
+
+| Request                      | plain  | PGO, the stand-in site | PGO, trained on the real site | x86-64-v3 | PGO + x86-64-v3 |
+| ---------------------------- | ------ | ---------------------- | ----------------------------- | --------- | --------------- |
+| page, through the chain      | 3 559  | 2 830 (−20 %)          | 2 752 (−23 %)                 | +1 %      | −22 %           |
+| 304, through the chain       | 3 479  | 2 741 (−21 %)          | 2 686 (−23 %)                 | 0 %       | −23 %           |
+| build asset, through chain   | 3 221  | 2 649 (−18 %)          | 2 604 (−19 %)                 | +1 %      | −20 %           |
+| redirect (`.html`)           | 2 812  | 2 403 (−15 %)          | 2 359 (−16 %)                 | 0 %       | −18 %           |
+| internal path, 404           | 1 679  | 1 308 (−22 %)          | 1 304 (−22 %)                 | −2 %      | −25 %           |
+| page, ready answer           | 931    | 851 (−9 %)             | 860 (−8 %)                    | +1 %      | −9 %            |
+| 304, ready answer            | 888    | 831 (−6 %)             | 834 (−6 %)                    | −6 %      | −12 %           |
+| page without Accept-Encoding | 11 382 | 11 715 (+3 %)          | 11 974 (+5 %)                 | +6 %      | +8 %            |
+
+(The x86-64-v3 columns come from an earlier sitting against its own plain build. The last row is
+LZ4 decompression of 77 KB, which no build made faster.) Under load, 1000 requests/s of a page, an
+asset, a 304 and a page without Accept-Encoding, server CPU per request over 4 alternating rounds:
+plain 105–127 µs, PGO 92–108 µs, PGO + x86-64-v3 94–103 µs. As fast as it goes (32 connections),
+plain 148–163 thousand requests/s at 20.4–22.0 µs each, PGO 154–164 thousand at 19.3–20.0 µs —
+there the kernel's network stack takes most of the time.
