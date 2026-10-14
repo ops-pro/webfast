@@ -1,0 +1,61 @@
+[package]
+name = "web-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Web server: static files from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a subset of the Caddyfile"
+publish = false
+
+[lib]
+name = "web_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "web-server"
+path = "src/main.rs"
+
+[features]
+default = ["mimalloc"]
+# mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+brotli = "8"
+bytes = "1"
+flate2 = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httpdate = "1"
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful", "client-legacy", "http1", "http2"] }
+ipnet = "2"
+mimalloc = { version = "0.1", default-features = false, optional = true }
+percent-encoding = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+regex = "1"
+rustc-hash = "2"
+rustls = "0.23"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+walkdir = "2"
+zstd = "0.13"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+tempfile = "3"
+tokio-stream = "0.1"
+
+[profile.release]
+# One codegen unit and whole-program LTO: slower builds, faster code (measured in README.md).
+codegen-units = 1
+lto = "fat"
+strip = "symbols"

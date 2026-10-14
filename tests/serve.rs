@@ -1,0 +1,593 @@
+//! End to end: the server started from a Caddyfile shaped like docker/Caddyfile, a stub upstream
+//! for the proxied paths, and real HTTP/1.1, HTTP/2 (TLS) and HTTP/3 clients.
+
+use bytes::Bytes;
+use http::{HeaderMap, Method, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use web_server::server::{self, Running};
+
+fn compress(encoding: &str, data: &[u8]) -> Vec<u8> {
+    match encoding {
+        "br" => {
+            let mut out = Vec::new();
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 9, 22);
+            w.write_all(data).unwrap();
+            drop(w);
+            out
+        }
+        "zst" => zstd::stream::encode_all(data, 3).unwrap(),
+        _ => {
+            let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            w.write_all(data).unwrap();
+            w.finish().unwrap()
+        }
+    }
+}
+
+fn write(root: &Path, path: &str, body: &[u8]) {
+    let file = root.join(path.trim_start_matches('/'));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, body).unwrap();
+}
+
+const HOME: &str = "<!doctype html><title>Home</title><p>en home page</p>";
+
+fn site() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let home = HOME.repeat(20);
+    write(root, "/en/index.html", home.as_bytes());
+    for ext in ["br", "zst", "gz"] {
+        write(
+            root,
+            &format!("/en/index.html.{ext}"),
+            &compress(ext, home.as_bytes()),
+        );
+    }
+    write(root, "/en/contact.html", b"<!doctype html><title>Contact</title>");
+    write(root, "/en/blog/index.html", b"<!doctype html><title>Blog</title>");
+    write(root, "/assets/app-abc.js", b"console.log(1)");
+    write(root, "/sw.js", b"self.addEventListener('fetch', () => {})");
+    write(root, "/_headers", b"internal");
+    write(root, "/.well-known/catalog.json", b"{\"catalog\":true}");
+    dir
+}
+
+/// Upstream stub: SSE on /api/stream/chat, a JSON echo of the request everywhere else.
+async fn upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    if req.uri().path() == "/api/stream/chat" {
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, Infallible>>(4);
+                        tokio::spawn(async move {
+                            let _ = tx.send(Ok(http_body::Frame::data(Bytes::from("data: 1\n\n")))).await;
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let _ = tx.send(Ok(http_body::Frame::data(Bytes::from("data: 2\n\n")))).await;
+                        });
+                        let body = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+                        let response = http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .header("cache-control", "no-cache")
+                            .body(body.boxed_unsync())
+                            .unwrap();
+                        return Ok::<_, Infallible>(response);
+                    }
+                    let header = |name: &str| {
+                        req.headers()
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let echo = serde_json::json!({
+                        "method": req.method().as_str(),
+                        "uri": req.uri().to_string(),
+                        "host": header("host"),
+                        "xff": header("x-forwarded-for"),
+                        "xfp": header("x-forwarded-proto"),
+                        "xfh": header("x-forwarded-host"),
+                        "padding": "x".repeat(600),
+                    });
+                    let response = http::Response::builder()
+                        .header("content-type", "application/json")
+                        .header("x-upstream", "1")
+                        .body(
+                            Full::new(Bytes::from(echo.to_string()))
+                                .map_err(|never| match never {})
+                                .boxed_unsync(),
+                        )
+                        .unwrap();
+                    Ok(response)
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+fn caddyfile(root: &Path, app: SocketAddr, ai: SocketAddr) -> String {
+    format!(
+        r#"{{
+	auto_https off
+	admin off
+	servers {{
+		trusted_proxies static private_ranges
+		client_ip_headers X-Forwarded-For X-Real-IP
+	}}
+}}
+
+(site_headers) {{
+	header {{
+		Content-Security-Policy "default-src 'self'"
+		X-Frame-Options "DENY"
+		-Server
+	}}
+	@hashed path /assets/*
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	@sw path /sw.js
+	header @sw Cache-Control "max-age=300"
+	@catalog path /.well-known/catalog.json
+	header @catalog {{
+		Content-Type "application/x-catalog+json"
+		Access-Control-Allow-Origin "*"
+		defer
+	}}
+	@html_en path /en/*
+	header @html_en Cache-Control "public, max-age=0, must-revalidate"
+	header @html_en Link "</assets/app.css>; rel=preload; as=style, <f.woff2>; rel=preload; type=\"font/woff2\""
+}}
+
+:0 {{
+	root * {root}
+	import site_headers
+
+	route {{
+		respond /healthz "ok" 200
+
+		@internal path /_headers /.buildignore /_internal/* /.cache/*
+		respond @internal 404
+
+		@stream path /api/stream/chat /stream
+		reverse_proxy @stream {ai} {{
+			flush_interval -1
+		}}
+		respond /api/stream/* 404
+
+		encode zstd br gzip
+
+		reverse_proxy /api/* {app}
+
+		@html_suffix path_regexp html ^(.*)\.html$
+		redir @html_suffix {{re.html.1}} 308
+
+		@dir_without_slash {{
+			not path */
+			file {{
+				try_files {{path}}/index.html
+			}}
+		}}
+		redir @dir_without_slash {{path}}/ 308
+
+		@static file {{
+			try_files {{path}} {{path}}.html {{path}}index.html
+		}}
+		handle @static {{
+			rewrite * {{file_match.relative}}
+			file_server {{
+				precompressed br zstd gzip
+			}}
+		}}
+
+		reverse_proxy {app}
+	}}
+
+	log {{
+		output discard
+	}}
+}}
+"#,
+        root = root.display()
+    )
+}
+
+struct Harness {
+    _site: tempfile::TempDir,
+    running: Running,
+    base: String,
+    client: Client<HttpConnector, Full<Bytes>>,
+}
+
+async fn start() -> Harness {
+    let site = site();
+    let app = upstream().await;
+    let ai = upstream().await;
+    let text = caddyfile(site.path(), app, ai);
+    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = web_server::load_parsed(&file, 1 << 24).unwrap();
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    Harness {
+        _site: site,
+        running,
+        base: format!("http://127.0.0.1:{port}"),
+        client,
+    }
+}
+
+struct Got {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl Harness {
+    async fn request(&self, method: Method, path: &str, headers: &[(&str, &str)]) -> Got {
+        let mut builder = Request::builder().method(method).uri(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let response = self
+            .client
+            .request(builder.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Got { status, headers, body }
+    }
+
+    async fn get(&self, path: &str, headers: &[(&str, &str)]) -> Got {
+        self.request(Method::GET, path, headers).await
+    }
+}
+
+fn header<'a>(got: &'a Got, name: &str) -> &'a str {
+    got.headers.get(name).map(|v| v.to_str().unwrap()).unwrap_or("")
+}
+
+#[tokio::test]
+async fn static_site_behaves_like_the_caddy_config() {
+    let h = start().await;
+
+    let health = h.get("/healthz", &[]).await;
+    assert_eq!(health.status, 200);
+    assert_eq!(&health.body[..], b"ok");
+    assert_eq!(header(&health, "content-type"), "text/plain; charset=utf-8");
+    assert_eq!(
+        header(&health, "content-security-policy"),
+        "default-src 'self'",
+        "deferred site headers apply"
+    );
+    assert!(health.headers.get("server").is_none());
+
+    assert_eq!(h.get("/_headers", &[]).await.status, 404);
+
+    let home = h.get("/en/", &[]).await;
+    assert_eq!(home.status, 200);
+    assert_eq!(&home.body[..], HOME.repeat(20).as_bytes());
+    assert_eq!(header(&home, "content-type"), "text/html; charset=utf-8");
+    assert_eq!(header(&home, "cache-control"), "public, max-age=0, must-revalidate");
+    assert!(header(&home, "link").contains("type=\"font/woff2\""));
+    assert_eq!(header(&home, "vary"), "Accept-Encoding");
+    assert_eq!(header(&home, "content-length"), home.body.len().to_string());
+    assert_eq!(
+        header(&home, "etag"),
+        web_server::files::etag_of(HOME.repeat(20).as_bytes())
+    );
+    assert!(home.headers.get("last-modified").is_none());
+
+    let redirect = h.get("/en", &[]).await;
+    assert_eq!(redirect.status, 308);
+    assert_eq!(header(&redirect, "location"), "/en/");
+    let blog = h.get("/en/blog?x=1", &[]).await;
+    assert_eq!(
+        (blog.status, header(&blog, "location")),
+        (StatusCode::PERMANENT_REDIRECT, "/en/blog/")
+    );
+    let suffix = h.get("/en/contact.html", &[]).await;
+    assert_eq!(
+        (suffix.status, header(&suffix, "location")),
+        (StatusCode::PERMANENT_REDIRECT, "/en/contact")
+    );
+    let contact = h.get("/en/contact", &[]).await;
+    assert_eq!(contact.status, 200);
+    assert_eq!(&contact.body[..], b"<!doctype html><title>Contact</title>");
+
+    // Precompressed: the browser's usual header picks br (config order breaks the q=1 tie).
+    let br = h
+        .get("/en/", &[("accept-encoding", "gzip, deflate, br, zstd")])
+        .await;
+    assert_eq!(header(&br, "content-encoding"), "br");
+    assert_eq!(&br.body[..], &compress("br", HOME.repeat(20).as_bytes())[..]);
+    assert_ne!(header(&br, "etag"), header(&home, "etag"));
+    let gz = h.get("/en/", &[("accept-encoding", "gzip")]).await;
+    let mut plain = String::new();
+    flate2::read::GzDecoder::new(&gz.body[..])
+        .read_to_string(&mut plain)
+        .unwrap();
+    assert_eq!(plain, HOME.repeat(20));
+
+    // Conditional and range requests.
+    let etag = header(&home, "etag").to_string();
+    let not_modified = h.get("/en/", &[("if-none-match", &etag)]).await;
+    assert_eq!(not_modified.status, 304);
+    assert!(not_modified.body.is_empty());
+    assert_eq!(header(&not_modified, "etag"), etag);
+    let partial = h.get("/en/contact", &[("range", "bytes=0-8")]).await;
+    assert_eq!(partial.status, 206);
+    assert_eq!(&partial.body[..], b"<!doctype");
+    assert_eq!(header(&partial, "content-range"), "bytes 0-8/37");
+
+    let head = h.request(Method::HEAD, "/en/contact", &[]).await;
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(header(&head, "content-length"), "37");
+
+    let post = h.request(Method::POST, "/en/contact", &[]).await;
+    assert_eq!(post.status, 405);
+    assert_eq!(header(&post, "allow"), "GET, HEAD");
+
+    let catalog = h.get("/.well-known/catalog.json", &[]).await;
+    assert_eq!(header(&catalog, "content-type"), "application/x-catalog+json");
+    assert_eq!(header(&catalog, "access-control-allow-origin"), "*");
+    assert_eq!(header(&h.get("/sw.js", &[]).await, "cache-control"), "max-age=300");
+    assert_eq!(
+        header(&h.get("/assets/app-abc.js", &[]).await, "cache-control"),
+        "public, max-age=31536000, immutable"
+    );
+
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn proxied_paths_stream_and_compress() {
+    let h = start().await;
+
+    let echo = h.get("/api/echo?q=1", &[("x-forwarded-for", "203.0.113.9")]).await;
+    assert_eq!(echo.status, 200);
+    assert_eq!(header(&echo, "x-upstream"), "1");
+    let json: serde_json::Value = serde_json::from_slice(&echo.body).unwrap();
+    assert_eq!(json["uri"], "/api/echo?q=1");
+    assert_eq!(json["host"], h.base.trim_start_matches("http://"));
+    assert_eq!(json["xff"], "203.0.113.9, 127.0.0.1", "127.0.0.1 is a trusted proxy");
+    assert_eq!(json["xfp"], "http");
+
+    for (encoding, accept) in [
+        ("zstd", "gzip, deflate, br, zstd"),
+        ("br", "gzip, br"),
+        ("gzip", "gzip"),
+    ] {
+        let got = h.get("/api/echo", &[("accept-encoding", accept)]).await;
+        assert_eq!(header(&got, "content-encoding"), encoding, "{accept}");
+        assert!(header(&got, "vary").contains("Accept-Encoding"));
+        let mut plain = Vec::new();
+        match encoding {
+            "zstd" => plain = zstd::stream::decode_all(&got.body[..]).unwrap(),
+            "br" => {
+                brotli::Decompressor::new(&got.body[..], 4096)
+                    .read_to_end(&mut plain)
+                    .unwrap();
+            }
+            _ => {
+                flate2::read::GzDecoder::new(&got.body[..])
+                    .read_to_end(&mut plain)
+                    .unwrap();
+            }
+        }
+        assert!(serde_json::from_slice::<serde_json::Value>(&plain).is_ok());
+    }
+
+    // Unknown pages go to the app as well.
+    let fallback = h.get("/robots.txt", &[]).await;
+    assert_eq!(header(&fallback, "x-upstream"), "1");
+    assert_eq!(h.get("/api/stream/other", &[]).await.status, 404);
+
+    // SSE: the first event arrives long before the stream ends, uncompressed.
+    let started = Instant::now();
+    let request = Request::get(format!("{}/api/stream/chat", h.base))
+        .header("accept-encoding", "gzip, br, zstd")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = h.client.request(request).await.unwrap();
+    assert!(response.headers().get("content-encoding").is_none());
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    let first_at = started.elapsed();
+    assert_eq!(&first[..], b"data: 1\n\n");
+    let second = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&second[..], b"data: 2\n\n");
+    assert!(first_at < Duration::from_millis(300), "first event after {first_at:?}");
+    assert!(started.elapsed() >= Duration::from_millis(390));
+
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+fn self_signed() -> (rcgen::CertifiedKey<rcgen::KeyPair>, tempfile::TempDir) {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cert.pem"), certified.cert.pem()).unwrap();
+    std::fs::write(dir.path().join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
+    (certified, dir)
+}
+
+fn client_tls(cert: &rcgen::Certificate, alpn: &[u8]) -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config
+}
+
+#[tokio::test]
+async fn https_over_http2_and_http3() {
+    let (certified, dir) = self_signed();
+    let text = format!(
+        "localhost:0 {{\n\ttls {cert} {key}\n\trespond \"hello {{scheme}}\"\n}}\n",
+        cert = dir.path().join("cert.pem").display(),
+        key = dir.path().join("key.pem").display()
+    );
+    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = web_server::load_parsed(&file, 1 << 20).unwrap();
+    let running = server::start(config).await.unwrap();
+    let (_, tcp, udp) = running.bound[0];
+    let port = tcp.port();
+    let udp = udp.expect("HTTP/3 is on for TLS sites");
+    assert_eq!(udp.port(), port);
+
+    // HTTP/2 over TLS.
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(&certified.cert, b"h2")));
+    let tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let tls_stream = connector
+        .connect("localhost".try_into().unwrap(), tcp_stream)
+        .await
+        .unwrap();
+    assert_eq!(tls_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let response = sender
+        .send_request(
+            Request::get(format!("https://localhost:{port}/"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.version(), http::Version::HTTP_2);
+    assert_eq!(
+        response.headers()["alt-svc"],
+        format!("h3=\":{port}\"; ma=2592000").as_str()
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"hello https");
+
+    // HTTP/3.
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(&certified.cert, b"h3")).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let conn = endpoint
+        .connect(SocketAddr::from(([127, 0, 0, 1], port)), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let mut stream = send_request
+        .send_request(Request::get(format!("https://localhost:{port}/")).body(()).unwrap())
+        .await
+        .unwrap();
+    stream.finish().await.unwrap();
+    let response = stream.recv_response().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.version(), http::Version::HTTP_3);
+    assert!(response.headers().get("alt-svc").is_none());
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        use bytes::Buf;
+        let bytes = chunk.copy_to_bytes(chunk.remaining());
+        body.extend_from_slice(&bytes);
+    }
+    assert_eq!(body, b"hello https");
+    drop(send_request);
+    drive.abort();
+    endpoint.close(0u32.into(), b"done");
+
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+/// One HTTP/3 request on a QUIC connection: status and body.
+async fn h3_request(conn: quinn::Connection, method: Method, port: u16) -> (StatusCode, String) {
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("https://localhost:{port}/"))
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(request).await.unwrap();
+    stream.finish().await.unwrap();
+    let response = stream.recv_response().await.unwrap();
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        use bytes::Buf;
+        let bytes = chunk.copy_to_bytes(chunk.remaining());
+        body.extend_from_slice(&bytes);
+    }
+    drop(send_request);
+    drive.abort();
+    (response.status(), String::from_utf8(body).unwrap())
+}
+
+#[tokio::test]
+async fn http3_resumes_with_zero_rtt() {
+    let (certified, dir) = self_signed();
+    let text = format!(
+        "localhost:0 {{\n\ttls {cert} {key}\n\trespond \"{{method}} early={{header.early-data}}\"\n}}\n",
+        cert = dir.path().join("cert.pem").display(),
+        key = dir.path().join("key.pem").display()
+    );
+    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = web_server::load_parsed(&file, 1 << 20).unwrap();
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    let mut tls = client_tls(&certified.cert, b"h3");
+    tls.enable_early_data = true;
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    // A full handshake: the server hands out session tickets.
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (status, body) = h3_request(conn.clone(), Method::GET, port).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "GET early="));
+    // The tickets come after the handshake; give the client a moment to take them.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    conn.close(0u32.into(), b"done");
+
+    // Resumed: the request leaves together with the ClientHello, as early data.
+    let (conn, accepted) = endpoint
+        .connect(addr, "localhost")
+        .unwrap()
+        .into_0rtt()
+        .unwrap_or_else(|_| panic!("a session ticket allows 0-RTT"));
+    let (status, body) = h3_request(conn.clone(), Method::GET, port).await;
+    assert!(accepted.await, "the server accepted the early data");
+    assert_eq!(status, StatusCode::OK);
+    // On localhost the handshake may complete before the request is taken: early or not, a GET is answered.
+    assert!(body == "GET early=1" || body == "GET early=", "{body}");
+    eprintln!("0-RTT request answered as {body:?}");
+    conn.close(0u32.into(), b"done");
+    endpoint.close(0u32.into(), b"done");
+    running.shutdown(Duration::from_secs(1)).await;
+}

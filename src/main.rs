@@ -1,0 +1,195 @@
+//! `web-server run [--config Caddyfile]` serves; `web-server validate [--config …]` checks the
+//! configuration and loads the site files without listening; `web-server healthcheck <http-url>`
+//! probes a running instance (the container HEALTHCHECK, so the image needs no curl).
+//! Environment: LOG_LEVEL (info), WEB_MAX_MEMORY (512MiB) for the site files held in memory,
+//! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches.
+
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+use tracing_subscriber::EnvFilter;
+use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed, parse_size, server};
+
+/// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const USAGE: &str =
+    "usage: web-server [run|validate] [--config <Caddyfile>] | healthcheck <http://host:port/path> | --version";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (command, rest) = match args.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => {
+            println!("web-server {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some("healthcheck") => return healthcheck(args.get(1).map(String::as_str)),
+        Some(c @ ("run" | "validate")) => (c, &args[1..]),
+        None => ("run", &args[..]),
+        Some(other) if other.starts_with("--") => ("run", &args[..]),
+        Some(other) => {
+            eprintln!("unknown command {other:?}; {USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut config_path = PathBuf::from("Caddyfile");
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--config" | "-c" => {
+                let Some(path) = rest.get(i + 1) else {
+                    eprintln!("--config needs a path; {USAGE}");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(path);
+                i += 2;
+            }
+            // Accepted for familiarity with `caddy run --adapter caddyfile`.
+            "--adapter" if rest.get(i + 1).map(String::as_str) == Some("caddyfile") => i += 2,
+            other => {
+                eprintln!("unknown argument {other:?}; {USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let max_memory = match std::env::var("WEB_MAX_MEMORY") {
+        Ok(value) => match parse_size(&value) {
+            Some(bytes) => bytes,
+            None => {
+                eprintln!("WEB_MAX_MEMORY: invalid size {value:?} (e.g. 512MiB)");
+                return ExitCode::from(2);
+            }
+        },
+        Err(_) => DEFAULT_MAX_MEMORY,
+    };
+
+    let file = match caddyfile::parse_file(&config_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    init_tracing(config::wants_debug(&file));
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let loaded = runtime.block_on(async { load_parsed(&file, max_memory) });
+    let config = match loaded {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %e, config = %config_path.display(), "configuration error");
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if command == "validate" {
+        let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
+        println!("valid configuration: {} port(s), {sites} site(s)", config.servers.len());
+        return ExitCode::SUCCESS;
+    }
+    match runtime.block_on(run(config)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "web-server stopped with an error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn init_tracing(debug: bool) {
+    let level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| if debug { "debug".into() } else { "info".into() });
+    let filter = EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .flatten_event(true)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+async fn run(config: config::Config) -> anyhow::Result<()> {
+    let grace = config.grace_period;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
+    let running = server::start(config).await?;
+    shutdown_signal().await;
+    tracing::info!(grace_secs = grace.as_secs(), "shutting down");
+    running.shutdown(grace).await;
+    web_server::accesslog::flush_all(Duration::from_secs(2));
+    tracing::info!("stopped");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// GET over plain HTTP; success on any 2xx status.
+fn healthcheck(url: Option<&str>) -> ExitCode {
+    let Some(url) = url.and_then(|u| u.strip_prefix("http://")) else {
+        eprintln!("healthcheck needs an http:// URL; {USAGE}");
+        return ExitCode::from(2);
+    };
+    let (authority, path) = match url.find('/') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, "/"),
+    };
+    let address = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    let Some(addr) = address.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+        eprintln!("healthcheck: cannot resolve {authority}");
+        return ExitCode::FAILURE;
+    };
+    let result = (|| -> std::io::Result<String> {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: web-server-healthcheck\r\n\r\n"
+        )?;
+        let mut response = String::new();
+        stream.take(4096).read_to_string(&mut response)?;
+        Ok(response)
+    })();
+    match result {
+        Ok(response) if response.split_whitespace().nth(1).is_some_and(|s| s.starts_with('2')) => ExitCode::SUCCESS,
+        Ok(response) => {
+            eprintln!("unhealthy: {}", response.lines().next().unwrap_or(""));
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("unhealthy: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
