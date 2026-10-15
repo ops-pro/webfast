@@ -1,5 +1,6 @@
-# Profile-guided optimisation: the headers of the training run (pgo/train.sh), shaped as the build's
-# dist/caddy/site.caddy (scripts/prerender.ts) that docker/Caddyfile imports.
+# The sample site's response headers (sample/Caddyfile imports them as /etc/webfast/headers.caddy):
+# security headers for every response, caching by kind of file, preload hints for the pages — the
+# shape a site's build typically generates.
 (site_headers) {
 	header {
 		Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; manifest-src 'self'; worker-src 'self'"
@@ -20,13 +21,10 @@
 	header @images Cache-Control "public, max-age=604800, stale-while-revalidate=86400"
 	@sw path /sw.js /v.json
 	header @sw Cache-Control "max-age=300"
-	@html_en path /en/* /de/*
-	header @html_en Cache-Control "public, max-age=0, must-revalidate"
-	header @html_en Link "</assets/main-PgoTrain.css>; rel=preload; as=style, </assets/main-PgoTrain.js>; rel=modulepreload, </fonts/sans-latin.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin"
-	@html_fr path /fr/*
-	header @html_fr Cache-Control "public, max-age=0, must-revalidate"
-	header @html_fr Link "</assets/main-PgoTrain.css>; rel=preload; as=style, </assets/main-PgoTrain.js>; rel=modulepreload, </fonts/sans-latin.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin, </fonts/display-latin.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin"
-	@html_ru path /ru/*
-	header @html_ru Cache-Control "public, max-age=0, must-revalidate"
-	header @html_ru Link "</assets/main-PgoTrain.css>; rel=preload; as=style, </assets/main-PgoTrain.js>; rel=modulepreload, </fonts/sans-cyrillic.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin"
+	@html_latin path /en/* /de/* /fr/*
+	header @html_latin Cache-Control "public, max-age=0, must-revalidate"
+	header @html_latin Link "</assets/main-Sample.css>; rel=preload; as=style, </assets/main-Sample.js>; rel=modulepreload, </fonts/sans-latin.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin, </fonts/display-latin.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin"
+	@html_cyrillic path /ru/*
+	header @html_cyrillic Cache-Control "public, max-age=0, must-revalidate"
+	header @html_cyrillic Link "</assets/main-Sample.css>; rel=preload; as=style, </assets/main-Sample.js>; rel=modulepreload, </fonts/sans-cyrillic.woff2>; rel=preload; as=font; type=\"font/woff2\"; crossorigin"
 }

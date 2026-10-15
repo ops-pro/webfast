@@ -1,4 +1,4 @@
-//! End to end: the server started from a Caddyfile shaped like docker/Caddyfile, a stub upstream
+//! End to end: the server started from a Caddyfile shaped like sample/Caddyfile, a stub upstream
 //! for the proxied paths, and real HTTP/1.1, HTTP/2 (TLS) and HTTP/3 clients.
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use web_server::server::{self, Running};
+use webfast::server::{self, Running};
 
 fn compress(encoding: &str, data: &[u8]) -> Vec<u8> {
     match encoding {
@@ -49,11 +49,7 @@ fn site() -> tempfile::TempDir {
     let home = HOME.repeat(20);
     write(root, "/en/index.html", home.as_bytes());
     for ext in ["br", "zst", "gz"] {
-        write(
-            root,
-            &format!("/en/index.html.{ext}"),
-            &compress(ext, home.as_bytes()),
-        );
+        write(root, &format!("/en/index.html.{ext}"), &compress(ext, home.as_bytes()));
     }
     write(root, "/en/contact.html", b"<!doctype html><title>Contact</title>");
     write(root, "/en/blog/index.html", b"<!doctype html><title>Blog</title>");
@@ -242,8 +238,8 @@ async fn start() -> Harness {
     let app = upstream().await;
     let ai = upstream().await;
     let text = caddyfile(site.path(), app, ai);
-    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
-    let config = web_server::load_parsed(&file, 1 << 24).unwrap();
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = webfast::load_parsed(&file, 1 << 24).unwrap();
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -317,7 +313,7 @@ async fn static_site_behaves_like_the_caddy_config() {
     assert_eq!(header(&home, "content-length"), home.body.len().to_string());
     assert_eq!(
         header(&home, "etag"),
-        web_server::files::etag_of(HOME.repeat(20).as_bytes())
+        webfast::files::etag_of(HOME.repeat(20).as_bytes())
     );
     assert!(home.headers.get("last-modified").is_none());
 
@@ -353,9 +349,7 @@ async fn static_site_behaves_like_the_caddy_config() {
     }
 
     // Precompressed: the browser's usual header picks br (config order breaks the q=1 tie).
-    let br = h
-        .get("/en/", &[("accept-encoding", "gzip, deflate, br, zstd")])
-        .await;
+    let br = h.get("/en/", &[("accept-encoding", "gzip, deflate, br, zstd")]).await;
     assert_eq!(header(&br, "content-encoding"), "br");
     assert_eq!(&br.body[..], &compress("br", HOME.repeat(20).as_bytes())[..]);
     assert_ne!(header(&br, "etag"), header(&home, "etag"));
@@ -556,8 +550,8 @@ async fn https_over_http2_and_http3() {
         cert = dir.path().join("cert.pem").display(),
         key = dir.path().join("key.pem").display()
     );
-    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
-    let config = web_server::load_parsed(&file, 1 << 20).unwrap();
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = webfast::load_parsed(&file, 1 << 20).unwrap();
     let running = server::start(config).await.unwrap();
     let (_, tcp, udp) = running.bound[0];
     let port = tcp.port();
@@ -659,8 +653,8 @@ async fn http3_resumes_with_zero_rtt() {
         cert = dir.path().join("cert.pem").display(),
         key = dir.path().join("key.pem").display()
     );
-    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
-    let config = web_server::load_parsed(&file, 1 << 20).unwrap();
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = webfast::load_parsed(&file, 1 << 20).unwrap();
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -696,42 +690,38 @@ async fn http3_resumes_with_zero_rtt() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
-fn load(text: &str) -> web_server::config::Config {
-    let file = web_server::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
-    web_server::load_parsed(&file, 1 << 27).unwrap()
+fn load(text: &str) -> webfast::config::Config {
+    let file = webfast::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
+    webfast::load_parsed(&file, 1 << 27).unwrap()
 }
 
-fn request_head(
-    method: &Method,
-    path: &str,
-    headers: &[(&str, &str)],
-) -> (http::request::Parts, web_server::body::Body) {
+fn request_head(method: &Method, path: &str, headers: &[(&str, &str)]) -> (http::request::Parts, webfast::body::Body) {
     let mut builder = Request::builder().method(method.clone()).uri(path);
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
-    builder.body(web_server::body::empty()).unwrap().into_parts()
+    builder.body(webfast::body::empty()).unwrap().into_parts()
 }
 
-async fn collected(response: http::Response<web_server::body::Body>) -> (StatusCode, HeaderMap, Bytes) {
+async fn collected(response: http::Response<webfast::body::Body>) -> (StatusCode, HeaderMap, Bytes) {
     let (parts, body) = response.into_parts();
     (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
 }
 
 async fn through_chain(
-    routes: &Arc<[web_server::handler::Route]>,
+    routes: &Arc<[webfast::handler::Route]>,
     method: &Method,
     path: &str,
     headers: &[(&str, &str)],
 ) -> (StatusCode, HeaderMap, Bytes) {
-    let conn = Arc::new(web_server::handler::ConnInfo {
+    let conn = Arc::new(webfast::handler::ConnInfo {
         remote: "127.0.0.1:5000".parse().unwrap(),
         tls: false,
         trusted: false,
     });
     let (parts, body) = request_head(method, path, headers);
-    let ctx = web_server::handler::Ctx::new(conn.clone(), parts, body, conn.remote.ip());
-    collected(web_server::handler::Next::start(routes.clone()).run(ctx).await).await
+    let ctx = webfast::handler::Ctx::new(conn.clone(), parts, body, conn.remote.ip());
+    collected(webfast::handler::Next::start(routes.clone()).run(ctx).await).await
 }
 
 #[tokio::test]
@@ -744,7 +734,7 @@ async fn ready_answers_are_what_the_chain_answers() {
     let ai = upstream().await;
     let config = load(&caddyfile(site.path(), app, ai));
     let routes = config.servers[0].sites[0].routes.clone();
-    let answers = web_server::memo::Answers::prepare(&routes, false).expect("this site decides by the path");
+    let answers = webfast::memo::Answers::prepare(&routes, false).expect("this site decides by the path");
     // /en/, contact, blog/, the asset, sw.js, the catalog — and /en/index, /en/blog/index,
     // which the chain serves too ({path}.html), as Caddy does.
     assert_eq!(answers.paths(), 8);
@@ -845,13 +835,13 @@ async fn sites_that_look_beyond_the_path_get_no_ready_answers() {
     ] {
         let config = load(&format!(":0 {{\n\troot * {root}\n\t{extra}\n\tfile_server\n}}\n"));
         let routes = config.servers[0].sites[0].routes.clone();
-        assert!(web_server::memo::Answers::prepare(&routes, false).is_none(), "{extra}");
+        assert!(webfast::memo::Answers::prepare(&routes, false).is_none(), "{extra}");
     }
     let config = load(&format!(
         ":0 {{\n\troot * {root}\n\theader X-Path {{path}}\n\tfile_server\n}}\n"
     ));
     let routes = config.servers[0].sites[0].routes.clone();
-    let answers = web_server::memo::Answers::prepare(&routes, false).expect("path placeholders are fine");
+    let answers = webfast::memo::Answers::prepare(&routes, false).expect("path placeholders are fine");
     let (parts, _) = request_head(&Method::GET, "/sw.js", &[]);
     let ready = collected(answers.answer(&parts).unwrap()).await;
     assert_eq!(ready.1["x-path"], "/sw.js");
@@ -901,8 +891,8 @@ async fn a_client_that_stops_reading_is_cut_off() {
     write(dir.path(), "/big.bin", &vec![7u8; SIZE]);
     // Kept as it is (no LZ4): this test is about the socket, not about decompressing 48 MB.
     let text = format!(":0 {{\n\troot * {}\n\tfile_server\n}}\n", dir.path().display());
-    let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
-    let mut config = web_server::load_parsed_with(&file, 1 << 27, None).unwrap();
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let mut config = webfast::load_parsed_with(&file, 1 << 27, None).unwrap();
     config.servers[0].limits.stall = Duration::from_secs(1);
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
@@ -1134,7 +1124,7 @@ async fn eventually(
 
 #[tokio::test]
 async fn changed_files_are_picked_up() {
-    use web_server::watch::{Mode, Watch};
+    use webfast::watch::{Mode, Watch};
     for mode in [Mode::Inotify, Mode::Poll] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1145,12 +1135,12 @@ async fn changed_files_are_picked_up() {
             ":0 {{\n\troot * {}\n\tfile_server {{\n\t\tprecompressed br\n\t}}\n}}\n",
             root.display()
         );
-        let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+        let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
         let watch = Watch {
             mode,
             poll: Duration::from_millis(100),
         };
-        let config = web_server::load_parsed_watching(&file, 1 << 20, None, watch).unwrap();
+        let config = webfast::load_parsed_watching(&file, 1 << 20, None, watch).unwrap();
         let running = server::start(config).await.unwrap();
         let base = format!("http://127.0.0.1:{}", running.bound[0].1.port());
         let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();

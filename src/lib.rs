@@ -1,5 +1,6 @@
-//! Web server: serves the site from memory and proxies the dynamic parts, configured with a
-//! strict subset of the Caddyfile so the same file also runs in Caddy (see README.md).
+//! webfast: a static-first web server. It serves sites from memory and proxies the dynamic parts,
+//! configured with a strict subset of the Caddyfile so the same file also runs in Caddy (README.md,
+//! docs/).
 
 pub mod accesslog;
 pub mod body;

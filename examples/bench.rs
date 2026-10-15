@@ -11,7 +11,7 @@
 //! with a ready answer (src/memo.rs) take it, as in the server; `BENCH_CHAIN=1` runs every
 //! request through the handler chain instead.
 //!
-//! services/web-server/bench/run.sh runs it next to the load test; for a profile, run one path with
+//! bench/run.sh runs it next to the load test; for a profile, run one path with
 //! many iterations under `perf record -e cpu-clock`.
 
 use http::{HeaderValue, Request};
@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use web_server::handler::{ConnInfo, Ctx, Next};
+use webfast::handler::{ConnInfo, Ctx, Next};
 
 /// The binary's allocator (mimalloc, or the system's without the `mimalloc` feature), counting
 /// allocations (reallocations included) and bytes requested.
@@ -86,9 +86,9 @@ fn main() {
     let iterations: u32 = iterations.parse().expect("iterations");
     let rounds: usize = rounds.parse().expect("rounds");
     let paths = &args[3..];
-    let lz4 = web_server::files::lz4_min_saving_from_env().expect("WEB_LZ4_MIN_SAVING");
-    let file = web_server::caddyfile::parse_file(Path::new(config_path)).expect("Caddyfile");
-    let config = web_server::load_parsed_with(&file, web_server::DEFAULT_MAX_MEMORY, lz4).expect("configuration");
+    let lz4 = webfast::files::lz4_min_saving_from_env().expect("WEB_LZ4_MIN_SAVING");
+    let file = webfast::caddyfile::parse_file(Path::new(config_path)).expect("Caddyfile");
+    let config = webfast::load_parsed_with(&file, webfast::DEFAULT_MAX_MEMORY, lz4).expect("configuration");
     let routes = config.servers[0].sites[0].routes.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -103,7 +103,7 @@ fn main() {
     let answers = if std::env::var_os("BENCH_CHAIN").is_some() {
         None
     } else {
-        web_server::memo::Answers::prepare(&routes, false)
+        webfast::memo::Answers::prepare(&routes, false)
     };
 
     let once = |path: &str, if_none_match: &Option<HeaderValue>, identity: bool| {
@@ -117,7 +117,7 @@ fn main() {
         if let Some(etag) = if_none_match {
             request = request.header("if-none-match", etag.clone());
         }
-        let request = request.body(web_server::body::empty()).expect("request");
+        let request = request.body(webfast::body::empty()).expect("request");
         let (parts, body) = request.into_parts();
         let ready = answers.as_ref().and_then(|a| a.answer(&parts));
         let conn = conn.clone();
@@ -138,7 +138,7 @@ fn main() {
             .uri(path)
             .header("host", "example.test")
             .header("accept-encoding", "gzip, deflate, br, zstd")
-            .body(web_server::body::empty())
+            .body(webfast::body::empty())
             .expect("request");
         let (parts, body) = request.into_parts();
         let ctx = Ctx::new(conn.clone(), parts, body, remote.ip());
@@ -161,7 +161,7 @@ fn main() {
                 .header("host", "example.test")
                 .header("accept-encoding", "gzip, deflate, br, zstd")
                 .header("user-agent", "bench")
-                .body(web_server::body::empty())
+                .body(webfast::body::empty())
                 .expect("request");
             black_box(request.into_parts());
         }

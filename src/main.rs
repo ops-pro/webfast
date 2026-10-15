@@ -1,5 +1,5 @@
-//! `web-server run [--config Caddyfile]` serves; `web-server validate [--config …]` checks the
-//! configuration and loads the site files without listening; `web-server healthcheck <http-url>`
+//! `webfast run [--config Caddyfile]` serves; `webfast validate [--config …]` checks the
+//! configuration and loads the site files without listening; `webfast healthcheck <http-url>`
 //! probes a running instance (the container HEALTHCHECK, so the image needs no curl).
 //! Environment: LOG_LEVEL (info), WEB_MAX_MEMORY (512MiB) for the site files held in memory,
 //! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches;
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_watching, parse_size, server};
+use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_watching, parse_size, server};
 
 /// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
 #[cfg(feature = "mimalloc")]
@@ -29,14 +29,14 @@ use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_watching, pa
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const USAGE: &str =
-    "usage: web-server [run|validate] [--config <Caddyfile>] | healthcheck <http://host:port/path> | --version";
+    "usage: webfast [run|validate] [--config <Caddyfile>] | healthcheck <http://host:port/path> | --version";
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => {
-            println!("web-server {}", env!("CARGO_PKG_VERSION"));
+            println!("webfast {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Some("healthcheck") => return healthcheck(args.get(1).map(String::as_str)),
@@ -106,14 +106,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let lz4_min_saving = match web_server::files::lz4_min_saving_from_env() {
+    let lz4_min_saving = match webfast::files::lz4_min_saving_from_env() {
         Ok(setting) => setting,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    let watch = match web_server::watch::Watch::from_env() {
+    let watch = match webfast::watch::Watch::from_env() {
         Ok(watch) => watch,
         Err(e) => {
             eprintln!("{e}");
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
     };
     // Nothing to watch when only validating.
     let watch = if command == "validate" {
-        web_server::watch::Watch::default()
+        webfast::watch::Watch::default()
     } else {
         watch
     };
@@ -156,7 +156,7 @@ fn main() -> ExitCode {
     match runtime.block_on(run(config, started)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!(error = %e, "web-server stopped with an error");
+            tracing::error!(error = %e, "webfast stopped with an error");
             ExitCode::FAILURE
         }
     }
@@ -253,7 +253,7 @@ async fn run(config: config::Config, started: std::time::Instant) -> anyhow::Res
     let (ports, files) = (config.servers.len(), config.files);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
     let running = server::start(config).await?;
-    web_server::release_free_memory();
+    webfast::release_free_memory();
     let mib = |bytes: u64| (bytes as f64 / 1048576.0 * 10.0).round() / 10.0;
     tracing::info!(
         ports,
@@ -265,14 +265,14 @@ async fn run(config: config::Config, started: std::time::Instant) -> anyhow::Res
         ready_answers = running.ready.answers,
         ready_mib = mib(running.ready.bytes),
         ready_ms = running.ready.millis,
-        resident_mib = web_server::resident_bytes().map_or(0.0, mib),
+        resident_mib = webfast::resident_bytes().map_or(0.0, mib),
         startup_ms = started.elapsed().as_millis() as u64,
         "started"
     );
     shutdown_signal().await;
     tracing::info!(grace_secs = grace.as_secs(), "shutting down");
     running.shutdown(grace).await;
-    web_server::accesslog::flush_all(Duration::from_secs(2));
+    webfast::accesslog::flush_all(Duration::from_secs(2));
     tracing::info!("stopped");
     Ok(())
 }
@@ -322,7 +322,7 @@ fn healthcheck(url: Option<&str>) -> ExitCode {
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: web-server-healthcheck\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: webfast-healthcheck\r\n\r\n"
         )?;
         let mut response = String::new();
         stream.take(4096).read_to_string(&mut response)?;

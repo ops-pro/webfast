@@ -1,0 +1,81 @@
+# webfast's sample configuration: a static site from /srv with precompressed siblings, an app behind
+# it for the dynamic paths, and an event-streaming service. A strict subset of the Caddyfile, so
+# Caddy reads this file the same way (Caddy needs the caddy-brotli plugin for `encode … br`). The
+# Docker image starts with it; the PGO build trains on it (pgo/train.sh); compat/ and bench/ serve
+# it. docs/configuration.md describes the subset.
+#
+# Plain HTTP on :8080 behind a reverse proxy that terminates TLS and forwards the original Host and
+# X-Forwarded-For / X-Forwarded-Proto. To serve HTTPS and HTTP/3 directly instead, replace ":8080"
+# with the host names, add `tls /certs/fullchain.pem /certs/privkey.pem` (re-read when renewed) and
+# publish 443/tcp and 443/udp.
+{
+	auto_https off
+	admin off
+	servers {
+		trusted_proxies static private_ranges
+		# The client is the right-most X-Forwarded-For entry that is not a proxy (the left-most is
+		# whatever the client sent, when a proxy appends).
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For X-Real-IP
+	}
+}
+
+import /etc/webfast/headers.caddy
+
+:8080 {
+	# Explicit root: the file matcher's {file_match.relative} is computed against it.
+	root * /srv
+	import site_headers
+
+	# `route` keeps the handlers in exactly this order.
+	route {
+		respond /healthz "ok" 200
+
+		# Never served: version control, environment files, build internals.
+		@internal path /.git/* /.env /_internal/*
+		respond @internal 404
+
+		# The event-streaming service: matched before `encode`, and flushed at once.
+		@events path /api/stream/* /stream /stream/*
+		reverse_proxy @events stream:8800 {
+			flush_interval -1
+		}
+
+		# On-the-fly compression for the app's answers (zstd where the browser takes it, then br,
+		# then gzip); static files below go out as their precompressed siblings, untouched.
+		encode zstd br gzip
+
+		reverse_proxy /api/* app:8787
+
+		# Clean URLs: /page.html → /page, /dir → /dir/ (308).
+		@html_suffix path_regexp html ^(.*)\.html$
+		redir @html_suffix {re.html.1} 308
+
+		@dir_without_slash {
+			not path */
+			file {
+				try_files {path}/index.html
+			}
+		}
+		redir @dir_without_slash {path}/ 308
+
+		@static file {
+			try_files {path} {path}.html {path}index.html
+		}
+		handle @static {
+			rewrite * {file_match.relative}
+			# Brotli first: its siblings are usually the smallest.
+			file_server {
+				precompressed br zstd gzip
+			}
+		}
+
+		# Everything else (/, legacy URLs, robots.txt, sitemaps, 404 pages) → the app.
+		reverse_proxy app:8787
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

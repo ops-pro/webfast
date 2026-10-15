@@ -1,59 +1,59 @@
 #!/usr/bin/env bash
-# Load benchmark of web-server with docker/Caddyfile and the built site (npm run build): oha sends
-# requests at a fixed rate, several runs per scenario; the server's CPU time comes from its cgroup.
-# Then the in-process benchmark of the handler chain (examples/bench.rs) on the same site.
+# Load benchmark of webfast with a Caddyfile and a site: oha sends requests at a fixed rate, several
+# runs per scenario; the server's CPU time comes from its cgroup. Then the in-process benchmark of
+# the handler chain (examples/bench.rs) on the same site.
 #
-#   WEB_SERVER_BIN=… BENCH_BIN=… services/web-server/bench/run.sh <label>
+#   WEBFAST_BIN=… TRAIN_BIN=…/examples/train [BENCH_BIN=…/examples/bench] bench/run.sh <label>
 #
-# RATE (1000 requests/s), RUNS (10), REQUESTS (5000 per run), CONNECTIONS (20); CADDYFILE (the
-# configuration, docker/Caddyfile), WEB_LOG_FLUSH_MS (passed to the server), OHA_ARGS (more oha
-# options, e.g. --disable-keepalive for a new connection per request). Results go to
-# $OUT_DIR/<label> (default /tmp/web-bench); summarize.mjs prints the table.
+# The site and its configuration: scripts/volumes.sh (SITE_DIR, or the sample site; CADDYFILE,
+# HEADERS). Scenarios: PAGE (/en/contact), ASSET (the site's first /assets/main-*.js), REDIRECT
+# (/en/contact.html). RATE (1000 requests/s), RUNS (10), REQUESTS (5000 per run), CONNECTIONS (20);
+# WEB_LOG_FLUSH_MS (passed to the server), OHA_ARGS (more oha options, e.g. --disable-keepalive for
+# a new connection per request). Results go to $OUT_DIR/<label> (default /tmp/webfast-bench);
+# summarize.mjs prints the table.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../../.." && pwd)
+# shellcheck source=../scripts/volumes.sh
+. "$here/../scripts/volumes.sh"
 label=${1:?usage: run.sh <label>}
-bin=${WEB_SERVER_BIN:?set WEB_SERVER_BIN to a Linux web-server binary}
+bin=${WEBFAST_BIN:?set WEBFAST_BIN to a Linux webfast binary}
 bench_bin=${BENCH_BIN:-}
 rate=${RATE:-1000}
 runs=${RUNS:-10}
 requests=${REQUESTS:-5000}
 connections=${CONNECTIONS:-20}
 read -ra oha_args <<<"${OHA_ARGS:-}"
-out=${OUT_DIR:-/tmp/web-bench}/$label
+out=${OUT_DIR:-/tmp/webfast-bench}/$label
 run_image=${RUN_IMAGE:-debian:bookworm-slim}
 oha_image=${OHA_IMAGE:-ghcr.io/hatoo/oha:latest}
 node_image=${NODE_IMAGE:-node:24-bookworm-slim}
-net=web-bench
+net=webfast-bench
 
 cleanup() {
   docker rm -f bench-web >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  docker volume rm -f web-bench-srv web-bench-conf >/dev/null 2>&1 || true
+  docker volume rm -f webfast-bench-srv webfast-bench-conf >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup
 rm -rf "$out" && mkdir -p "$out"
 docker network create "$net" >/dev/null
-docker volume create web-bench-srv >/dev/null
-docker volume create web-bench-conf >/dev/null
-docker run --rm -v "$repo/dist:/from:ro" -v "${CADDYFILE:-$repo/docker/Caddyfile}:/Caddyfile:ro" -v web-bench-srv:/srv \
-  -v web-bench-conf:/conf --entrypoint sh "$run_image" -c '
-    cp -a /from/client/. /srv/ && mkdir -p /conf/generated && cp -a /from/caddy/. /conf/generated/ &&
-    cp /Caddyfile /conf/Caddyfile'
-site=(-v web-bench-conf:/etc/caddy:ro -v web-bench-srv:/srv:ro)
+fill_volumes webfast-bench-srv webfast-bench-conf
+site=(-v webfast-bench-conf:/etc/webfast:ro -v webfast-bench-srv:/srv:ro)
 
 docker run -d --name bench-web --network "$net" "${site[@]}" -e "WEB_LOG_FLUSH_MS=${WEB_LOG_FLUSH_MS:-10}" \
-  -v "$bin:/usr/local/bin/web-server:ro" --entrypoint /usr/local/bin/web-server "$run_image" \
-  run --config /etc/caddy/Caddyfile >/dev/null
+  -v "$bin:/usr/local/bin/webfast:ro" --entrypoint /usr/local/bin/webfast "$run_image" \
+  run --config /etc/webfast/Caddyfile >/dev/null
 for _ in $(seq 1 50); do
-  docker exec bench-web /usr/local/bin/web-server healthcheck http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
+  docker exec bench-web /usr/local/bin/webfast healthcheck http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
   sleep 0.2
 done
 
-asset=$(docker exec bench-web sh -c 'ls /srv/assets | grep -E "^main-.*\.js$" | head -1')
-scenarios=("page /en/contact" "asset /assets/$asset" "redirect /en/contact.html")
+page=${PAGE:-/en/contact}
+asset=${ASSET:-/assets/$(docker exec bench-web sh -c 'ls /srv/assets | grep -E "^main-.*\.js$" | head -1')}
+redirect=${REDIRECT:-$page.html}
+scenarios=("page $page" "asset $asset" "redirect $redirect")
 printf '%s\n' "${scenarios[@]}" >"$out/scenarios.txt"
 
 cpu() { docker exec bench-web sh -c 'grep usage_usec /sys/fs/cgroup/cpu.stat' | awk '{print $2}'; }
@@ -73,7 +73,7 @@ done
 
 if [ -n "$bench_bin" ]; then
   docker run --rm --network none "${site[@]}" -v "$bench_bin:/usr/local/bin/bench:ro" --entrypoint /usr/local/bin/bench \
-    "$run_image" /etc/caddy/Caddyfile 200000 10 /en/contact 304:/en/contact "/assets/$asset" /en/contact.html \
+    "$run_image" /etc/webfast/Caddyfile 200000 10 "$page" "304:$page" "$asset" "$redirect" \
     >"$out/inprocess.txt"
 fi
 

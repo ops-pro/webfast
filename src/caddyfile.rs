@@ -595,9 +595,9 @@ mod tests {
     #[test]
     fn line_continuation_and_env() {
         // SAFETY: tests in this module do not read the environment concurrently with this write.
-        unsafe { std::env::set_var("WEB_SERVER_TEST_PORT", "9000") };
+        unsafe { std::env::set_var("WEBFAST_TEST_PORT", "9000") };
         let file = parse(
-            ":{$WEB_SERVER_TEST_PORT} {\n\trespond \\\n\t\t\"ok\" 200\n\theader X {$WEB_SERVER_TEST_MISSING:fallback}\n}\n",
+            ":{$WEBFAST_TEST_PORT} {\n\trespond \\\n\t\t\"ok\" 200\n\theader X {$WEBFAST_TEST_MISSING:fallback}\n}\n",
         );
         assert_eq!(file.sites[0].keys[0].text, ":9000");
         assert_eq!(texts(&file.sites[0].body[0]), ["respond", "ok", "200"]);

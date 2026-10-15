@@ -1,23 +1,24 @@
 #!/bin/sh
-# web-server's release build with profile-guided optimisation (the web image, Dockerfile): an
-# instrumented build serves a training load (pgo/train.sh, loopback only) and writes a profile, and
-# the release build is optimised by it — about twice the build time. WEB_PGO=0: a plain release build.
+# webfast's release build with profile-guided optimisation (the Docker image builds it this way):
+# an instrumented build serves a training load (pgo/train.sh, loopback only) and writes a profile,
+# and the release build is optimised by it — about twice the build time, 10–20 % less CPU per
+# request (docs/performance.md). WEBFAST_PGO=0: a plain release build.
 #
-#   pgo/build.sh <docker/Caddyfile> <out dir>        → <out dir>/web-server
+#   pgo/build.sh <out dir>        → <out dir>/webfast
 #
-# Run in services/web-server with llvm-tools (rustup component add llvm-tools); RUSTFLAGS are kept
-# (e.g. -Ctarget-cpu=…). CARGO_TARGET_DIR (target), PGO_DIR (/tmp/pgo), PGO_SECONDS (15).
+# Run in the project's root with llvm-tools (rustup component add llvm-tools); RUSTFLAGS are kept
+# (e.g. -Ctarget-cpu=…). CADDYFILE (sample/Caddyfile: the configuration trained on, see train.sh),
+# CARGO_TARGET_DIR (target), PGO_DIR (/tmp/pgo), PGO_SECONDS (15).
 set -eu
-usage='usage: build.sh <docker/Caddyfile> <out dir>'
-caddyfile=${1:?$usage}
-out=${2:?$usage}
+out=${1:?usage: build.sh <out dir>}
 here=$(cd "$(dirname "$0")" && pwd)
+caddyfile=${CADDYFILE:-$here/../sample/Caddyfile}
 target=${CARGO_TARGET_DIR:-target}
 flags=${RUSTFLAGS:-}
 
-if [ "${WEB_PGO:-1}" = 0 ]; then
-  cargo build --release --locked --bin web-server
-  install -D -m 0755 "$target/release/web-server" "$out/web-server"
+if [ "${WEBFAST_PGO:-1}" = 0 ]; then
+  cargo build --release --locked --bin webfast
+  install -D -m 0755 "$target/release/webfast" "$out/webfast"
   exit
 fi
 
@@ -28,12 +29,12 @@ profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
 
 echo "PGO: instrumented build"
 CARGO_TARGET_DIR="$target/pgo-instrumented" RUSTFLAGS="$flags -Cprofile-generate=$dir" \
-  cargo build --release --locked --bin web-server --example train
+  cargo build --release --locked --bin webfast --example train
 instrumented="$target/pgo-instrumented/release"
 echo "PGO: training"
-PGO_DIR=$dir sh "$here/train.sh" "$instrumented/web-server" "$instrumented/examples/train" "$caddyfile"
-"$profdata" merge -o "$dir/web-server.profdata" "$dir"/web-*.profraw
+PGO_DIR=$dir sh "$here/train.sh" "$instrumented/webfast" "$instrumented/examples/train" "$caddyfile"
+"$profdata" merge -o "$dir/webfast.profdata" "$dir"/webfast-*.profraw
 echo "PGO: optimised build"
-CARGO_TARGET_DIR="$target/pgo-optimised" RUSTFLAGS="$flags -Cprofile-use=$dir/web-server.profdata" \
-  cargo build --release --locked --bin web-server
-install -D -m 0755 "$target/pgo-optimised/release/web-server" "$out/web-server"
+CARGO_TARGET_DIR="$target/pgo-optimised" RUSTFLAGS="$flags -Cprofile-use=$dir/webfast.profdata" \
+  cargo build --release --locked --bin webfast
+install -D -m 0755 "$target/pgo-optimised/release/webfast" "$out/webfast"

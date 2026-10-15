@@ -1,51 +1,49 @@
 #!/usr/bin/env bash
-# Differential check of web-server against Caddy: both serve docker/Caddyfile with the built site
-# (dist/), stub upstreams play `app` and `stream`, and compare.mjs sends the same requests to both.
+# Differential check of webfast against Caddy: both serve the same Caddyfile and site (by default
+# sample/Caddyfile and the sample site), stub upstreams play `app` and `stream`, and compare.mjs sends
+# the same ~80 requests to both and reports every difference that is not an expected one.
 #
-#   WEB_SERVER_BIN=/path/to/web-server services/web-server/compat/run.sh
+#   WEBFAST_BIN=…/webfast TRAIN_BIN=…/examples/train compat/run.sh
 #
-# Needs a built site (npm run build) and a Linux web-server binary. Images can be overridden:
-# CADDY_IMAGE (caddy:2-alpine), NODE_IMAGE (node:24-bookworm-slim), RUN_IMAGE (debian:bookworm-slim).
+# The site and configuration: scripts/volumes.sh (SITE_DIR, CADDYFILE, HEADERS); compare.mjs's
+# requests are written for the sample site. Images can be overridden: CADDY_IMAGE (caddy:2-alpine),
+# NODE_IMAGE (node:24-bookworm-slim), RUN_IMAGE (debian:bookworm-slim).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../../.." && pwd)
-bin=${WEB_SERVER_BIN:?set WEB_SERVER_BIN to a Linux web-server binary}
+# shellcheck source=../scripts/volumes.sh
+. "$here/../scripts/volumes.sh"
+bin=${WEBFAST_BIN:?set WEBFAST_BIN to a Linux webfast binary}
 caddy_image=${CADDY_IMAGE:-caddy:2-alpine}
 node_image=${NODE_IMAGE:-node:24-bookworm-slim}
 run_image=${RUN_IMAGE:-debian:bookworm-slim}
-net=web-compat
+net=webfast-compat
 
 cleanup() {
   docker rm -f compat-app compat-stream compat-caddy compat-ours >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  docker volume rm -f web-compat-srv web-compat-conf >/dev/null 2>&1 || true
+  docker volume rm -f webfast-compat-srv webfast-compat-conf >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup
 docker network create "$net" >/dev/null
 
-# The site goes into volumes (a Linux file system: case-sensitive like production, unlike a
-# bind mount from a Windows drive). Stock Caddy has no Brotli encoder, so both servers get the
-# Caddyfile without `br` in `encode` (web-server's own tests cover it).
-docker volume create web-compat-srv >/dev/null
-docker volume create web-compat-conf >/dev/null
-docker run --rm -v "$repo/dist:/from:ro" -v "$repo/docker/Caddyfile:/Caddyfile:ro" -v web-compat-srv:/srv \
-  -v web-compat-conf:/conf --entrypoint sh "$caddy_image" -c '
-    cp -a /from/client/. /srv/ && mkdir -p /conf/generated && cp -a /from/caddy/. /conf/generated/ &&
-    sed -E "s/^([[:space:]]*encode[^#]*) br([[:space:]]|$)/\1\2/" /Caddyfile > /conf/Caddyfile'
+# Stock Caddy has no Brotli encoder, so both servers get the Caddyfile without `br` in `encode`
+# (webfast's own tests cover it).
+fill_volumes webfast-compat-srv webfast-compat-conf 's/^([[:space:]]*encode[^#]*) br([[:space:]]|$)/\1\2/'
 site=(
-  -v web-compat-conf:/etc/caddy:ro
-  -v web-compat-srv:/srv:ro
+  -v webfast-compat-conf:/etc/webfast:ro
+  -v webfast-compat-srv:/srv:ro
 )
 for svc in app:8787 stream:8800; do
   name=${svc%%:*}
   docker run -d --name "compat-$name" --network "$net" --network-alias "$name" -e NAME="$name" -e PORT="${svc##*:}" \
     -v "$here:/compat:ro" --entrypoint node "$node_image" /compat/upstream.mjs >/dev/null
 done
-docker run -d --name compat-caddy --network "$net" "${site[@]}" "$caddy_image" >/dev/null
-docker run -d --name compat-ours --network "$net" "${site[@]}" -v "$bin:/usr/local/bin/web-server:ro" \
-  --entrypoint /usr/local/bin/web-server "$run_image" run --config /etc/caddy/Caddyfile >/dev/null
+docker run -d --name compat-caddy --network "$net" "${site[@]}" "$caddy_image" \
+  caddy run --config /etc/webfast/Caddyfile --adapter caddyfile >/dev/null
+docker run -d --name compat-ours --network "$net" "${site[@]}" -v "$bin:/usr/local/bin/webfast:ro" \
+  --entrypoint /usr/local/bin/webfast "$run_image" run --config /etc/webfast/Caddyfile >/dev/null
 
 for _ in $(seq 1 50); do
   if docker run --rm --network "$net" --entrypoint node "$node_image" -e \
@@ -59,7 +57,9 @@ done
 docker run --rm --network "$net" -v "$here:/compat:ro" --entrypoint node "$node_image" /compat/compare.mjs \
   http://compat-caddy:8080 http://compat-ours:8080 || status=$?
 if [ "${status:-0}" != 0 ]; then
-  echo "--- web-server log (last 20 lines)"
+  echo "--- webfast log (last 20 lines)"
   docker logs --tail 20 compat-ours 2>&1 || true
+  echo "--- caddy log (last 20 lines)"
+  docker logs --tail 20 compat-caddy 2>&1 || true
 fi
 exit "${status:-0}"

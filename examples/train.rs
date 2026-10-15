@@ -1,8 +1,9 @@
 //! The workload a profile-guided build learns from (pgo/train.sh): many kinds of requests over every
-//! protocol the server speaks, so that no path it serves is left looking cold to the optimiser.
+//! protocol the server speaks, so that no path it serves is left looking cold to the optimiser. Its
+//! sample site is also what the compatibility check and the benchmarks serve (compat/, bench/).
 //!
 //!   train cert <dir>     self-signed certificate for "localhost"
-//!   train site <dir>     a stand-in for the built site; prints the paths to request
+//!   train site <dir>     the sample site, for sample/Caddyfile; prints the paths to request
 //!   train run <plain addr> <tls addr> <cert.pem> <upstream addr> <seconds> <path>...
 //!
 //! For each path: GET with a browser's, other and no Accept-Encoding, revalidation (304), HEAD, a
@@ -91,7 +92,7 @@ fn probes(paths: &[String]) -> Vec<Probe> {
         "/EN/contact",
         "/healthz",
         "/%65n/",
-        "/_headers",
+        "/_internal/notes.txt",
         "/api/stream/internal",
     ] {
         out.push(get(path, browser()));
@@ -485,7 +486,7 @@ async fn upstream(addr: SocketAddr) {
     }
 }
 
-/// xorshift64: the stand-in site and the upstream's answers are the same on every run.
+/// xorshift64: the sample site and the upstream's answers are the same on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -555,7 +556,7 @@ fn prose(rng: &mut Rng, words: usize) -> String {
 /// of text with links, a footer.
 fn page(rng: &mut Rng, lang: &str, size: usize) -> String {
     let mut html = format!(
-        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{}</title><link rel="stylesheet" href="/assets/main-PgoTrain.css"><script type="module" src="/assets/main-PgoTrain.js"></script></head><body><header class="site-header"><nav><a href="/{lang}/">Example</a> <a href="/{lang}/services/">{}</a> <a href="/{lang}/contact">{}</a></nav></header><main>"#,
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{}</title><link rel="stylesheet" href="/assets/main-Sample.css"><script type="module" src="/assets/main-Sample.js"></script></head><body><header class="site-header"><nav><a href="/{lang}/">Example</a> <a href="/{lang}/services/">{}</a> <a href="/{lang}/contact">{}</a></nav></header><main>"#,
         prose(rng, 4),
         prose(rng, 1),
         prose(rng, 1)
@@ -643,13 +644,13 @@ fn put(dir: &Path, path: &str, bytes: &[u8], siblings: bool) -> std::io::Result<
     Ok(())
 }
 
-/// A stand-in for the built site (dist/client) in `dir`, the same on every run: pages in four
-/// languages, one with a section of its own, the build's assets, fonts, images, the service worker
-/// and its manifest. Returns the paths to request.
+/// The sample site in `dir`, the same on every run, shaped as a typical built site: pages in four
+/// languages, one with a section of its own, hashed build assets, fonts, images, a service worker
+/// and its manifest, every text file with .br/.zst/.gz siblings. Returns the paths to request.
 fn site(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut paths = Vec::new();
-    for lang in ["en", "fr", "ru", "de"] {
+    for lang in ["en", "de", "fr", "ru"] {
         for (name, size) in [
             ("index", 30_000),
             ("contact", 12_000),
@@ -668,10 +669,10 @@ fn site(dir: &Path) -> std::io::Result<Vec<String>> {
         }
     }
     let text = [
-        ("assets/main-PgoTrain.js", script(&mut rng, 150_000)),
-        ("assets/Form-PgoTrain.js", script(&mut rng, 9_000)),
-        ("assets/Quiz-PgoTrain.js", script(&mut rng, 25_000)),
-        ("assets/main-PgoTrain.css", styles(&mut rng, 40_000)),
+        ("assets/main-Sample.js", script(&mut rng, 150_000)),
+        ("assets/form-Sample.js", script(&mut rng, 9_000)),
+        ("assets/quiz-Sample.js", script(&mut rng, 25_000)),
+        ("assets/main-Sample.css", styles(&mut rng, 40_000)),
         ("sw.js", script(&mut rng, 6_000)),
         ("v.json", r#"{"version":"pgo-train"}"#.to_string()),
         (

@@ -1,17 +1,21 @@
 [package]
-name = "web-server"
+name = "webfast"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Web server: static files from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a subset of the Caddyfile"
+# let chains (`if let … && let …`).
+rust-version = "1.88"
+description = "A static-first web server: the site from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a strict subset of the Caddyfile"
+readme = "README.md"
+keywords = ["http", "web-server", "static", "caddyfile", "http3"]
+categories = ["web-programming::http-server"]
 publish = false
 
 [lib]
-name = "web_server"
+name = "webfast"
 path = "src/lib.rs"
 
 [[bin]]
-name = "web-server"
+name = "webfast"
 path = "src/main.rs"
 
 [features]

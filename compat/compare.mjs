@@ -1,4 +1,4 @@
-// Differential check: sends the same requests to Caddy and to web-server (same Caddyfile, same site)
+// Differential check: sends the same requests to Caddy and to webfast (same Caddyfile, same site)
 // and reports every difference in status, headers and (decoded) body.
 //   node compare.mjs http://caddy:8080 http://ours:8080
 // Expected differences are listed, not failed: ETag values (ours hash the content), Last-Modified
@@ -16,11 +16,10 @@ if (!caddyBase || !oursBase) {
 const BROWSER = 'gzip, deflate, br, zstd';
 const cases = [
   ['GET', '/healthz'],
-  ['GET', '/_headers'],
-  ['GET', '/.buildignore'],
-  ['GET', '/_internal/robots.txt'],
-  ['GET', '/.cache/manifest.json'],
-  ['GET', '/en/../_headers'],
+  ['GET', '/_internal/notes.txt'],
+  ['GET', '/.git/config'],
+  ['GET', '/.env'],
+  ['GET', '/en/../.env'],
   ['GET', '//en/'],
   ['GET', '/en/'],
   ['GET', '/en/', { 'accept-encoding': BROWSER }],
@@ -38,35 +37,30 @@ const cases = [
   ['GET', '/en/%63ontact'],
   ['GET', '/en/index.html'],
   ['GET', '/en/index'],
-  ['GET', '/en/blog'],
-  ['GET', '/en/blog/'],
-  ['GET', '/en/blog/first-post', { 'accept-encoding': BROWSER }],
-  ['GET', '/en/services/overview'],
+  ['GET', '/en/services'],
+  ['GET', '/en/services/'],
+  ['GET', '/en/services/overview', { 'accept-encoding': BROWSER }],
+  ['GET', '/de/pricing'],
   ['GET', '/fr/', { 'accept-encoding': BROWSER }],
-  ['GET', '/ru/pricing'],
-  ['GET', '/de/'],
+  ['GET', '/ru/about', { 'accept-encoding': BROWSER }],
   ['GET', '/EN/'],
-  ['GET', '/en/'],
-  ['GET', '/assets/app-Bc12xYz9.css', { 'accept-encoding': BROWSER }],
-  ['GET', '/assets/widget-Kq8w3Lp2.js'],
-  ['GET', '/fonts/sans-latinwoff2'],
+  ['GET', '/En/contact'],
+  ['GET', '/assets/main-Sample.css', { 'accept-encoding': BROWSER }],
+  ['GET', '/assets/form-Sample.js'],
+  ['GET', '/fonts/sans-latin.woff2'],
   ['GET', '/images/logo.svg', { 'accept-encoding': BROWSER }],
-  ['GET', '/images/hero-1440.avif'],
+  ['GET', '/images/hero.webp'],
   ['GET', '/favicon.svg'],
   ['GET', '/favicon.ico'],
-  ['GET', '/apple-touch-icon.png'],
   ['GET', '/site.webmanifest'],
   ['GET', '/sw.js'],
+  ['GET', '/v.json', { 'accept-encoding': BROWSER }],
   ['GET', '/llms.txt', { 'accept-encoding': BROWSER }],
-  ['GET', '/.well-known/catalog.json'],
-  ['GET', '/.well-known/security.txt'],
-  ['GET', '/data/en.json', { 'accept-encoding': BROWSER }],
-  ['GET', '/pages/en.json'],
   ['HEAD', '/en/'],
   ['HEAD', '/en/', { 'accept-encoding': BROWSER }],
   ['POST', '/en/'],
   ['OPTIONS', '/en/contact'],
-  ['DELETE', '/assets/widget-Kq8w3Lp2.js'],
+  ['DELETE', '/assets/form-Sample.js'],
   ['GET', '/en/', { 'if-none-match': '*' }],
   ['GET', '/en/', { 'if-match': '"nope"' }],
   ['GET', '/en/contact', { range: 'bytes=0-99' }],
@@ -89,7 +83,6 @@ const cases = [
   ['POST', '/api/forms/submit', { 'content-type': 'application/json' }, '{"name":"test"}'],
   ['GET', '/api/stream/chat', { 'accept-encoding': BROWSER }],
   ['GET', '/api/stream/quota'],
-  ['GET', '/api/stream/unknown'],
   ['GET', '/stream'],
   ['GET', '/stream/card'],
   ['GET', '/missing'],
@@ -160,7 +153,7 @@ function normalizeBody(text, clientAcceptEncoding) {
 
 const KNOWN = new Set(['date', 'etag', 'last-modified', 'via']);
 // Caddy skips deferred `header` operations (here: the site's security headers and `-Server`) when a
-// handler returns an error such as file_server's 405; web-server keeps them.
+// handler returns an error such as file_server's 405; webfast keeps them.
 const DEFERRED_ON_ERRORS = new Set([
   'content-security-policy',
   'cross-origin-opener-policy',
@@ -248,7 +241,7 @@ for (const [method, path, headers, body] of cases) {
 for (const [path, enc] of [
   ['/en/', undefined],
   ['/en/', 'br'],
-  ['/assets/app-Bc12xYz9.css', BROWSER],
+  ['/assets/main-Sample.css', BROWSER],
 ]) {
   const headers = enc ? { 'accept-encoding': enc } : {};
   for (const [who, base] of [
