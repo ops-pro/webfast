@@ -52,6 +52,9 @@ pub struct ServerConfig {
     /// own, as nginx's workers (the default on Unix, where there is a socket per CPU); otherwise on
     /// the process's shared runtime (src/server.rs).
     pub per_core: bool,
+    /// Listening sockets for the port on Unix — with `per_core`, the threads that serve its
+    /// connections (WEB_WORKERS); `None`: one per CPU, at most 64.
+    pub workers: Option<usize>,
     pub sites: Vec<Site>,
 }
 
@@ -370,6 +373,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                         ..Limits::default()
                     },
                     per_core: cfg!(unix),
+                    workers: None,
                     sites: Vec::new(),
                 });
                 servers.last_mut().expect("just pushed")

@@ -1059,7 +1059,7 @@ async fn http3_stops_a_stream_with_an_oversized_header_frame() {
 
 #[tokio::test]
 async fn both_runtimes_serve_and_shut_down() {
-    for per_core in [true, false] {
+    for (per_core, workers) in [(true, None), (true, Some(1)), (false, None)] {
         let mut config = load(
             ":0 {
 	respond \"ok {method}\"
@@ -1067,6 +1067,7 @@ async fn both_runtimes_serve_and_shut_down() {
 ",
         );
         config.servers[0].per_core = per_core;
+        config.servers[0].workers = workers;
         let running = server::start(config).await.unwrap();
         let port = running.bound[0].1.port();
         let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
@@ -1096,7 +1097,7 @@ async fn both_runtimes_serve_and_shut_down() {
         running.shutdown(Duration::from_secs(2)).await;
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "per_core={per_core}: the connections closed at the stop"
+            "per_core={per_core}, workers={workers:?}: the connections closed at the stop"
         );
     }
 }

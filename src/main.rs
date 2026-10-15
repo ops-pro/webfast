@@ -9,7 +9,9 @@
 //! limit), WEB_STALL_TIMEOUT (30s): a response the client stops taking for that long ends its
 //! connection (src/guard.rs); WEB_TCP_CONGESTION (bbr; `system`: the kernel's default) for the
 //! clients' TCP connections (src/sockets.rs); WEB_RUNTIME (`per-core`: a thread and runtime per
-//! listening socket, the default on Unix; `shared`: one runtime for all, src/server.rs).
+//! listening socket, the default on Unix; `shared`: one runtime for all, src/server.rs);
+//! WEB_WORKERS (one per CPU; `auto`): the listening sockets per port, so the threads that serve
+//! the connections, and the shared runtime's threads.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -84,7 +86,18 @@ fn main() -> ExitCode {
     };
     init_tracing(config::wants_debug(&file));
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let workers = match workers_from_env() {
+        Ok(workers) => workers,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = workers {
+        builder.worker_threads(n);
+    }
+    let runtime = match builder.enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = %e, "cannot start the async runtime");
@@ -107,7 +120,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = limits_from_env(&mut config) {
+    if let Err(e) = limits_from_env(&mut config, workers) {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
@@ -134,8 +147,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Connection limits from the environment, for every port.
-fn limits_from_env(config: &mut config::Config) -> Result<(), String> {
+/// WEB_WORKERS: how many threads serve connections (`auto` or unset: one per CPU).
+fn workers_from_env() -> Result<Option<usize>, String> {
+    match std::env::var("WEB_WORKERS") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("auto") => Ok(None),
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(n) if (1..=1024).contains(&n) => Ok(Some(n)),
+            _ => Err(format!("WEB_WORKERS: auto or 1 to 1024 threads, not {value:?}")),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// Connection limits and threads from the environment, for every port.
+fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Result<(), String> {
     let count = |name: &str| -> Result<Option<usize>, String> {
         match std::env::var(name) {
             Ok(value) => value
@@ -179,6 +204,7 @@ fn limits_from_env(config: &mut config::Config) -> Result<(), String> {
         if let Some(per_core) = per_core {
             server.per_core = per_core;
         }
+        server.workers = workers;
         if let Some(congestion) = congestion {
             server.limits.tcp_congestion = congestion;
         }

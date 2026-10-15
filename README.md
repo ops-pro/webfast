@@ -51,8 +51,9 @@ from PEM files and are re-read within a minute when they change — there is no 
 
 Connections:
 
-- **SO_REUSEPORT**: one listening socket per CPU, each with its own accept loop; the kernel spreads
-  new connections over them, and a new process can bind the port while the old one drains.
+- **SO_REUSEPORT**: one listening socket per CPU (`WEB_WORKERS` sets how many), each with its own
+  accept loop; the kernel spreads new connections over them, and a new process can bind the port
+  while the old one drains.
 - **A runtime per core** (`WEB_RUNTIME=per-core`, the default on Unix): each listening socket gets a
   thread with a single-threaded tokio runtime and its own epoll, and the connections it accepts stay
   there — no handing of work between threads, as with nginx's worker processes. As fast as it goes
@@ -62,6 +63,15 @@ Connections:
   about 7 MiB (8 more threads). A connection's work stays on its core, so one HTTP/2 connection
   carrying many clients (a CDN in front) is served by one core. HTTP/3 stays on the shared runtime
   (quinn drives one UDP socket).
+- **Workers** (`WEB_WORKERS`, default one per CPU the process may use — a container's `cpus` limit
+  or CPU set counts): the listening sockets per port, so the threads serving the connections, and
+  the shared runtime's threads. Under light load fewer cost less per request: the connections are
+  spread over all workers, and a thread that gets a request only every few milliseconds finds its
+  CPU caches cold. At 1000 requests/s (a page, 20 connections, 8 CPUs under WSL2): 69 µs of CPU per
+  request with 8 workers, 61 with 4, 57–58 with 2, 49 with 1 (lighttpd, one thread: 57; nginx: 81–84
+  with 8 workers, 55–56 with 1). Flat out, one worker is at most one core; the default (8 here)
+  served about 230 thousand requests/s over 128 connections. A small site with little traffic does
+  well with 1–2.
 - **Socket options** ([`src/sockets.rs`](src/sockets.rs), Linux; set on the listening socket and
   inherited by every connection; one the system refuses stays at its default, with a warning at
   startup):
@@ -149,7 +159,8 @@ Environment: `LOG_LEVEL` (`info`; `debug` also via the `debug` global option), `
 queue drops lines instead of slowing requests, and they are counted), `WEB_LZ4_MIN_SAVING` (25),
 `WEB_MAX_CONNECTIONS`
 (16384), `WEB_MAX_CONNECTIONS_PER_IP` (256; 0 turns a limit off), `WEB_STALL_TIMEOUT` (30s),
-`WEB_TCP_CONGESTION` (`bbr`), `WEB_RUNTIME` (`per-core`; `shared`).
+`WEB_TCP_CONGESTION` (`bbr`), `WEB_RUNTIME` (`per-core`; `shared`), `WEB_WORKERS` (one per CPU;
+`auto`; 1–1024).
 Logs are JSON on stderr; access logs go where the site's `log` block says.
 
 At startup the log says what was loaded and what it cost — per site root `site files loaded`

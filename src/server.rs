@@ -256,13 +256,14 @@ pub async fn start(config: Config) -> Result<Running> {
     Ok(running)
 }
 
-/// Listening sockets for a port: on Unix one per CPU with SO_REUSEPORT, each with its own accept
-/// loop — the kernel spreads new connections over them, and another process can bind the port while
-/// this one finishes (restarts without a gap). Dual-stack `[::]` when available, else `0.0.0.0`.
-/// Also returns the socket options the system refused (src/sockets.rs).
-fn bind_tcp(port: u16, limits: &Limits) -> Result<(Vec<TcpListener>, Vec<String>)> {
+/// Listening sockets for a port: on Unix `workers` of them (`None`: one per CPU, at most 64) with
+/// SO_REUSEPORT, each with its own accept loop — the kernel spreads new connections over them, and
+/// another process can bind the port while this one finishes (restarts without a gap). Dual-stack
+/// `[::]` when available, else `0.0.0.0`. Also returns the socket options the system refused
+/// (src/sockets.rs).
+fn bind_tcp(port: u16, limits: &Limits, workers: Option<usize>) -> Result<(Vec<TcpListener>, Vec<String>)> {
     let count = if cfg!(unix) {
-        std::thread::available_parallelism().map_or(1, |n| n.get()).min(64)
+        workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(64))
     } else {
         1
     };
@@ -310,6 +311,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         client_ip_headers,
         limits,
         per_core,
+        workers,
         mut sites,
     } = server;
     let admission = Admission::new(&limits);
@@ -341,7 +343,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         }
     }
     running.admissions.push(admission.clone());
-    let (listeners, refused) = bind_tcp(port, &limits)?;
+    let (listeners, refused) = bind_tcp(port, &limits, workers)?;
     for option in &refused {
         tracing::warn!(port, option = %option, "socket option not available; the system's default stays");
     }
@@ -621,5 +623,17 @@ mod tests {
         // Every entry a proxy: the peer.
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.9"));
         assert_eq!(state(true).client_ip(&headers, peer), peer);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workers_set_the_listening_sockets() {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+        let (listeners, _) = bind_tcp(0, &Limits::default(), None).unwrap();
+        assert_eq!(listeners.len(), cpus);
+        let (listeners, _) = bind_tcp(0, &Limits::default(), Some(3)).unwrap();
+        assert_eq!(listeners.len(), 3);
+        let port = listeners[0].local_addr().unwrap().port();
+        assert!(listeners.iter().all(|l| l.local_addr().unwrap().port() == port));
     }
 }
