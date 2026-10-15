@@ -369,17 +369,18 @@ impl FileMatcher {
         let Some(store) = self.root.as_ref().or(ctx.root.as_ref()).cloned() else {
             return false;
         };
+        let files = store.files();
         let mut candidate = String::with_capacity(ctx.path().len() + 16);
         for try_file in &self.try_files {
             candidate.clear();
             try_file.template.render_into(ctx, &mut candidate);
             normalize_candidate(&mut candidate, try_file.wants_dir);
             let kind = if try_file.wants_dir {
-                store.is_dir(&candidate).then_some("directory")
+                files.is_dir(&candidate).then_some("directory")
             } else if candidate == "/" {
                 None
             } else {
-                store.file(&candidate).is_some().then_some("file")
+                files.contains(&candidate).then_some("file")
             };
             if let Some(kind) = kind {
                 ctx.file_match = Some(FileMatch {

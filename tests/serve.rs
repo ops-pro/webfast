@@ -1101,3 +1101,97 @@ async fn both_runtimes_serve_and_shut_down() {
         );
     }
 }
+
+/// GETs `url` (with `accept` as Accept-Encoding, if any) until `done` holds, for up to 10 s.
+async fn eventually(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    url: &str,
+    accept: Option<&str>,
+    done: impl Fn(StatusCode, &HeaderMap, &[u8]) -> bool,
+) -> (StatusCode, HeaderMap, Bytes) {
+    let started = Instant::now();
+    loop {
+        let mut request = Request::get(url);
+        if let Some(accept) = accept {
+            request = request.header("accept-encoding", accept);
+        }
+        let response = client
+            .request(request.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (response.status(), response.headers().clone());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if done(status, &headers, &body) {
+            return (status, headers, body);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{url}: still {status} {body:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn changed_files_are_picked_up() {
+    use web_server::watch::{Mode, Watch};
+    for mode in [Mode::Inotify, Mode::Poll] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "/page.html", b"one");
+        write(root, "/page.html.br", &compress("br", b"one"));
+        write(root, "/keep.txt", b"kept");
+        let text = format!(
+            ":0 {{\n\troot * {}\n\tfile_server {{\n\t\tprecompressed br\n\t}}\n}}\n",
+            root.display()
+        );
+        let file = web_server::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+        let watch = Watch {
+            mode,
+            poll: Duration::from_millis(100),
+        };
+        let config = web_server::load_parsed_watching(&file, 1 << 20, None, watch).unwrap();
+        let running = server::start(config).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", running.bound[0].1.port());
+        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let page = format!("{base}/page.html");
+        let any = |_: StatusCode, _: &HeaderMap, _: &[u8]| true;
+        let (_, before, body) = eventually(&client, &page, Some("br"), any).await;
+        assert_eq!(decompress("br", &body), b"one");
+
+        // The page and its sibling changed, a file added in a new directory, one removed.
+        write(root, "/page.html", b"two!");
+        write(root, "/page.html.br", &compress("br", b"two!"));
+        write(root, "/new/added.txt", b"added");
+        std::fs::remove_file(root.join("keep.txt")).unwrap();
+        let (_, _, body) = eventually(&client, &page, None, |_, _, body| body == b"two!").await;
+        assert_eq!(&body[..], b"two!", "{mode:?}");
+        let (_, after, body) = eventually(&client, &page, Some("br"), |_, headers, _| {
+            headers.get("etag") != before.get("etag")
+        })
+        .await;
+        assert_eq!(decompress("br", &body), b"two!", "{mode:?}: the sibling too");
+        assert_eq!(after.get("content-length").unwrap(), &body.len().to_string());
+        let added = format!("{base}/new/added.txt");
+        let (status, _, body) = eventually(&client, &added, None, |status, _, _| status == 200).await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, &b"added"[..]));
+        let keep = format!("{base}/keep.txt");
+        eventually(&client, &keep, None, |status, _, _| status == 404).await;
+
+        // A file made later in the directory that came: watched too.
+        write(root, "/new/later.txt", b"later");
+        let later = format!("{base}/new/later.txt");
+        let (_, _, body) = eventually(&client, &later, None, |status, _, _| status == 200).await;
+        assert_eq!(&body[..], b"later", "{mode:?}");
+        running.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+fn decompress(encoding: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match encoding {
+        "br" => brotli::Decompressor::new(data, 4096).read_to_end(&mut out).unwrap(),
+        _ => unreachable!(),
+    };
+    out
+}

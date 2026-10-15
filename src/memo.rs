@@ -1,8 +1,8 @@
-//! Ready answers for the site's files. The files never change while the server runs, so when a
-//! site's routes decide by the request path alone (plus Accept-Encoding), the answer for every
-//! path that serves a file — status 200 with all its headers, and the 304 for its ETag — is worked
-//! out once at startup by running the real handler chain; a request for that path is then a table
-//! lookup and a copy of a header map.
+//! Ready answers for the site's files. The files do not change between rescans (src/watch.rs), so
+//! when a site's routes decide by the request path alone (plus Accept-Encoding), the answer for
+//! every path that serves a file — status 200 with all its headers, and the 304 for its ETag — is
+//! worked out at startup, and again after the files changed, by running the real handler chain; a
+//! request for that path is then a table lookup and a copy of a header map.
 //!
 //! Kept are only answers that `file_server` gave from a stored file unchanged (not compressed on
 //! the fly). What a request's Accept-Encoding changes is decided by which of zstd, br and gzip it
@@ -216,14 +216,14 @@ impl Answers {
                 drafts
             })
         });
-        let mut strings = FxHashMap::default();
+        let mut strings = FxHashSet::default();
         let mut paths = FxHashMap::default();
         for (path, drafts, slots) in drafted.into_iter().flatten() {
             let kept: Vec<Arc<Answer>> = drafts.iter().map(|draft| Arc::new(draft.kept(&mut strings))).collect();
             let answers: PerSignature = slots.iter().map(|slot| slot.map(|i| kept[i].clone())).collect();
             paths.insert(Box::from(path.as_str()), answers);
         }
-        let strings = strings.keys().map(String::len).sum();
+        let strings = strings.iter().map(|s: &&str| s.len()).sum();
         Some(Answers {
             signatures,
             paths,
@@ -233,9 +233,9 @@ impl Answers {
 }
 
 impl Answer {
-    /// The answer to keep: its header values made `'static` (interned in `strings`), allocated by
-    /// the calling thread.
-    fn kept(&self, strings: &mut FxHashMap<String, &'static str>) -> Answer {
+    /// The answer to keep: its header values made `'static` (interned; `strings` collects those it
+    /// uses), allocated by the calling thread.
+    fn kept(&self, strings: &mut FxHashSet<&'static str>) -> Answer {
         let headers = permanent(&self.headers, strings);
         Answer {
             etag: headers.get(ETAG).cloned(),
@@ -315,21 +315,16 @@ async fn run(
     Some(Next::start(routes.clone()).run(ctx).await)
 }
 
-/// The header map with every value made `'static` (interned; the answers live as long as the
-/// process), so copying it for a response counts no references.
-fn permanent(headers: &HeaderMap, strings: &mut FxHashMap<String, &'static str>) -> HeaderMap {
+/// The header map with every value made `'static` (interned for the life of the process, the same
+/// value once however often answers are prepared again), so copying it for a response counts no
+/// references.
+fn permanent(headers: &HeaderMap, strings: &mut FxHashSet<&'static str>) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
         let value = match value.to_str() {
             Ok(text) => {
-                let text = match strings.get(text) {
-                    Some(interned) => *interned,
-                    None => {
-                        let interned: &'static str = Box::leak(text.to_owned().into_boxed_str());
-                        strings.insert(text.to_owned(), interned);
-                        interned
-                    }
-                };
+                let text = crate::files::intern(text);
+                strings.insert(text);
                 HeaderValue::from_static(text)
             }
             Err(_) => value.clone(),
@@ -344,10 +339,11 @@ fn permanent(headers: &HeaderMap, strings: &mut FxHashMap<String, &'static str>)
 fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
     let mut paths = FxHashSet::default();
     for store in stores {
-        for file in store.paths() {
+        let files = store.files();
+        for file in files.paths() {
             let sibling = [".br", ".zst", ".gz"]
                 .iter()
-                .any(|suffix| file.strip_suffix(suffix).is_some_and(|base| store.file(base).is_some()));
+                .any(|suffix| file.strip_suffix(suffix).is_some_and(|base| files.contains(base)));
             if sibling {
                 continue;
             }
@@ -370,7 +366,7 @@ fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
 }
 
 /// Every file store the routes read from.
-fn collect_stores(routes: &[Route], out: &mut Vec<Arc<FileStore>>) {
+pub(crate) fn collect_stores(routes: &[Route], out: &mut Vec<Arc<FileStore>>) {
     fn add(out: &mut Vec<Arc<FileStore>>, store: &Arc<FileStore>) {
         if !out.iter().any(|s| Arc::ptr_eq(s, store)) {
             out.push(store.clone());

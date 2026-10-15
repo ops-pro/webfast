@@ -35,6 +35,12 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     /// Site files in memory (precompressed siblings included): count, size, what they take.
     pub files: crate::files::Totals,
+    /// Every site root, loaded once.
+    pub stores: Vec<Arc<crate::files::FileStore>>,
+    /// What the site files may take together (WEB_MAX_MEMORY), also when they are read again.
+    pub max_memory: u64,
+    /// Whether and how changed files are picked up while the server runs (src/watch.rs).
+    pub watch: crate::watch::Watch,
     pub grace_period: Duration,
     pub debug: bool,
 }
@@ -130,8 +136,9 @@ pub struct Site {
     pub hosts: Vec<String>,
     pub routes: Arc<[Route]>,
     pub log: Option<Arc<AccessLog>>,
-    /// Ready answers for its files, worked out when the server starts (src/memo.rs).
-    pub answers: Option<Arc<crate::memo::Answers>>,
+    /// Ready answers for its files, worked out when the server starts and again when its files
+    /// change (src/memo.rs, src/watch.rs); empty meanwhile: requests take the chain.
+    pub answers: arc_swap::ArcSwapOption<crate::memo::Answers>,
 }
 
 /// Caddy's default directive order (httpcaddyfile).
@@ -344,7 +351,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     hosts,
                     routes: routes.clone(),
                     log: log.clone(),
-                    answers: None,
+                    answers: arc_swap::ArcSwapOption::empty(),
                 },
                 at: block.at.clone(),
             });
@@ -420,6 +427,9 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
     Ok(Config {
         servers,
         files: crate::files::Totals::default(),
+        stores: Vec::new(),
+        max_memory: 0,
+        watch: crate::watch::Watch::default(),
         grace_period: globals.grace,
         debug: globals.debug,
     })

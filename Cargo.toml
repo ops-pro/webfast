@@ -21,6 +21,9 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 anyhow = "1"
+# The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
+# requests load them without counting references.
+arc-swap = "1"
 blake3 = "1"
 brotli = "8"
 bytes = "1"

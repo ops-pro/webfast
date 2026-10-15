@@ -11,7 +11,9 @@
 //! clients' TCP connections (src/sockets.rs); WEB_RUNTIME (`per-core`: a thread and runtime per
 //! listening socket, the default on Unix; `shared`: one runtime for all, src/server.rs);
 //! WEB_WORKERS (one per CPU; `auto`): the listening sockets per port, so the threads that serve
-//! the connections, and the shared runtime's threads.
+//! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
+//! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
+//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -19,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_with, parse_size, server};
+use web_server::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_watching, parse_size, server};
 
 /// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
 #[cfg(feature = "mimalloc")]
@@ -111,7 +113,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let loaded = runtime.block_on(async { load_parsed_with(&file, max_memory, lz4_min_saving) });
+    let watch = match web_server::watch::Watch::from_env() {
+        Ok(watch) => watch,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Nothing to watch when only validating.
+    let watch = if command == "validate" {
+        web_server::watch::Watch::default()
+    } else {
+        watch
+    };
+    let loaded = runtime.block_on(async { load_parsed_watching(&file, max_memory, lz4_min_saving, watch) });
     let mut config = match loaded {
         Ok(config) => config,
         Err(e) => {

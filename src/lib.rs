@@ -20,6 +20,7 @@ pub mod server;
 pub mod sockets;
 pub mod static_files;
 pub mod tls;
+pub mod watch;
 
 use std::path::Path;
 use std::time::Duration;
@@ -44,10 +45,24 @@ pub fn load_parsed_with(
     max_memory: u64,
     lz4_min_saving: Option<u8>,
 ) -> anyhow::Result<config::Config> {
-    let mut loader = files::Loader::with_lz4(max_memory, lz4_min_saving);
+    load_parsed_watching(file, max_memory, lz4_min_saving, watch::Watch::default())
+}
+
+/// With `watch` on, the files are loaded so that they can be replaced, and the started server
+/// picks up changes to them (src/watch.rs).
+pub fn load_parsed_watching(
+    file: &caddyfile::Caddyfile,
+    max_memory: u64,
+    lz4_min_saving: Option<u8>,
+    watch: watch::Watch,
+) -> anyhow::Result<config::Config> {
+    let mut loader = files::Loader::with_lz4(max_memory, lz4_min_saving).reloadable(watch.is_on());
     let client = proxy::client(Duration::from_secs(3), Some(Duration::from_secs(120)));
     let mut config = config::compile(file, &mut loader, client)?;
     config.files = loader.totals();
+    config.stores = loader.stores();
+    config.max_memory = loader.max_bytes();
+    config.watch = watch;
     Ok(config)
 }
 

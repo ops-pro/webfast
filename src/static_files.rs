@@ -53,8 +53,10 @@ impl FileServer {
         };
         let mut implicit_index = false;
         let mut found: Option<(String, Arc<FileEntry>)> = None;
+        // The files as they are now: the same for every lookup of this request.
+        let files = store.files();
         if !key.ends_with('/')
-            && let Some(entry) = store.file(&key)
+            && let Some(entry) = files.file(&key)
         {
             let entry = entry.clone();
             found = Some((key, entry));
@@ -62,7 +64,7 @@ impl FileServer {
             if !key.ends_with('/') {
                 key.push('/');
             }
-            if store.is_dir(&key) {
+            if files.is_dir(&key) {
                 let dir_len = key.len();
                 for index in &self.index {
                     key.truncate(dir_len);
@@ -70,7 +72,7 @@ impl FileServer {
                     if self.hidden(&key) {
                         continue;
                     }
-                    if let Some(entry) = store.file(&key) {
+                    if let Some(entry) = files.file(&key) {
                         let entry = entry.clone();
                         found = Some((key, entry));
                         implicit_index = true;
@@ -80,6 +82,7 @@ impl FileServer {
             }
         }
         let Some((file, entry)) = found.filter(|(file, _)| !self.hidden(file)) else {
+            drop(files);
             if self.pass_thru {
                 return next.run(ctx).await;
             }
@@ -135,7 +138,7 @@ impl FileServer {
             sidecar_key.clear();
             sidecar_key.push_str(&file);
             sidecar_key.push_str(encoding.suffix());
-            if let Some(sidecar) = store.file(&sidecar_key) {
+            if let Some(sidecar) = files.file(&sidecar_key) {
                 chosen = sidecar;
                 chosen_encoding = Some(encoding);
                 break;

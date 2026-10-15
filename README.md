@@ -7,15 +7,38 @@ Caddy, and the two can be compared request by request ([`compat/`](compat)).
 
 What it adds over Caddy, with no extra directives:
 
-- **Files from memory.** Every site root is read once at startup; requests never touch the disk.
-  `WEB_MAX_MEMORY` (default `512MiB`) caps it. A file of up to 1 MiB is kept as an LZ4 block when
+- **Files from memory.** Every site root is read at startup, and again where files change (below);
+  requests never touch the disk. `WEB_MAX_MEMORY` (default `512MiB`) caps it. A file of up to 1 MiB is kept as an LZ4 block when
   that saves at least `WEB_LZ4_MIN_SAVING` percent (25; `off`: never) — text, in practice: images,
   fonts and the precompressed siblings do not shrink and stay as they are. Only a response that
   sends such a file's bytes as they are (a client without Accept-Encoding, a range of them)
   decompresses it: about 10 µs for a 30–80 KB file (the 1 MiB cap bounds what one request can make
   the server do: `Range: bytes=0-0` decompresses the whole block); browsers get the `.br` / `.zst`
   siblings, and 304s and HEAD need no bytes. The reference site: 30 MiB of files (with their
-  siblings) take 19 MiB, 250 of them in LZ4. What is kept lies in one buffer.
+  siblings) take 19 MiB, 250 of them in LZ4.
+- **Changes picked up while running** ([`src/watch.rs`](src/watch.rs), `WEB_FILES_WATCH`): on a
+  local filesystem (ext4, xfs, btrfs, overlay, tmpfs, …) a thread waits for inotify events — a
+  watch per directory, nothing done until one comes — and once a burst has passed (200 ms without
+  events, at most 2 s) looks at the root again. On NFS, SMB, FUSE or 9p (WSL's `/mnt/*`, Docker
+  Desktop's bind mounts), where changes made by another system raise no event, the root is looked
+  at every `WEB_FILES_POLL` (30 s) instead. A look compares each file's size, modification time,
+  inode and status-change time with what was read and reads only what differs — the reference site:
+  3–12 ms for one changed page — and replaces the site's snapshot whole: a request keeps the one it
+  found, and a page and its assets switch together. Files that changed while being read are looked
+  at again half a second later; new directories are watched at once; a root that is a symlink is
+  followed when it is switched; an overflowing event queue means a full look. The sites that read
+  the root take the chain until their ready answers are worked out again (65–85 ms). A page
+  changed on disk is served changed about 0.6 s later. Under load (133 thousand requests/s, the
+  page rewritten every 100 ms, every asset once): all 1.3 million responses 200, 100 changes looked
+  at 6 times. Files read together lie in shared buffers of about 1 MiB, each freed once no
+  snapshot or response holds any of its files (copied into new ones when replaced files fill more
+  than a quarter of them); with nothing watched (`WEB_FILES_WATCH=off`) everything lies in one
+  buffer for good and a response's copy of a body counts no references — no difference measured:
+  97–105 µs of CPU per request at 1000 requests/s watched, 99–104 off; flat out 160–170 thousand
+  requests/s over 32 connections and 209–214 thousand over 128 either way. Resident: 60–62 MiB
+  watched, 57–59 off (a thousand files each in a buffer of its own took 16 MiB more); over 30
+  rounds of replacing 93 files the allocator settles about 15 MiB higher (it keeps freed memory for
+  reuse; no growth).
 - **ETag = hash of the content** (BLAKE3, 80 bits) instead of modification time + size: unchanged
   files keep their ETag across deploys (304 instead of a full response) and every replica sends the
   same one. There is no `Last-Modified`.
@@ -27,12 +50,13 @@ What it adds over Caddy, with no extra directives:
   proxied response keeps the upstream's `Date`). 26–28 ns per response on 1 or 8 threads; one value
   cloned by all threads costs 35 ns alone but 830–880 ns on 8 (they fight over its reference
   count); formatting it for each response 120–130 ns.
-- **Ready answers for files** ([`src/memo.rs`](src/memo.rs)): the files never change while the
-  server runs, so when a site's routes decide by the request path alone (no host, method, header or
+- **Ready answers for files** ([`src/memo.rs`](src/memo.rs)): the files do not change between two
+  looks at them, so when a site's routes decide by the request path alone (no host, method, header or
   address matchers, no `request_header`, only path-derived placeholders — true for
   `docker/Caddyfile`), the answer for every path that serves a file — the 200 with all its headers
   and the 304 for its ETag, for each of the 26 ways Accept-Encoding can rank zstd, br and gzip — is
-  worked out at startup by running the real handler chain. A GET or HEAD for such a path is then a
+  worked out at startup, and again after its files changed, by running the real handler chain. A
+  GET or HEAD for such a path is then a
   lookup and a copy of a header map. Ranges, If-Match, another If-None-Match, other spellings of a
   path, files compressed on the fly and everything else take the chain. The reference site: 300 paths,
   1050 distinct answers, 3.8 MB (the bodies are the files' own bytes).
@@ -160,12 +184,16 @@ queue drops lines instead of slowing requests, and they are counted), `WEB_LZ4_M
 `WEB_MAX_CONNECTIONS`
 (16384), `WEB_MAX_CONNECTIONS_PER_IP` (256; 0 turns a limit off), `WEB_STALL_TIMEOUT` (30s),
 `WEB_TCP_CONGESTION` (`bbr`), `WEB_RUNTIME` (`per-core`; `shared`), `WEB_WORKERS` (one per CPU;
-`auto`; 1–1024).
+`auto`; 1–1024), `WEB_FILES_WATCH` (`auto`: inotify on a local filesystem, polling elsewhere;
+`inotify`; `poll`; `off`: the files as loaded at startup), `WEB_FILES_POLL` (`30s`).
 Logs are JSON on stderr; access logs go where the site's `log` block says.
 
 At startup the log says what was loaded and what it cost — per site root `site files loaded`
-(files, bytes, bytes in memory, files in LZ4, ms), per site `ready answers for the site's files` (paths, distinct answers, their
-memory, ms; or why there are none), and one summary:
+(files, bytes, bytes in memory, files in LZ4, ms) and `watching the site files` (`inotify` with
+the directories watched, or `poll` with the interval and why), per site `ready answers for the
+site's files` (paths, distinct answers, their memory, ms; or why there are none), and one summary
+(later, per change: `site files changed` with what was added, changed and removed, and `ready
+answers worked out again`):
 
 ```json
 {

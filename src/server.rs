@@ -40,6 +40,14 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    pub(crate) fn sites(&self) -> &[Site] {
+        &self.sites
+    }
+
+    pub(crate) fn tls(&self) -> bool {
+        self.tls
+    }
+
     /// Connection facts shared by all its requests.
     pub fn conn_info(&self, remote: SocketAddr) -> Arc<ConnInfo> {
         Arc::new(ConnInfo {
@@ -135,7 +143,8 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
         started,
     });
     // A file's ready answer (src/memo.rs), or the handler chain.
-    let mut response = match site.answers.as_ref().and_then(|answers| answers.answer(&parts)) {
+    let ready = site.answers.load().as_ref().and_then(|answers| answers.answer(&parts));
+    let mut response = match ready {
         Some(response) => response,
         None => {
             let ctx = Ctx::new(conn, parts, body, client_ip);
@@ -250,9 +259,11 @@ pub async fn start(config: Config) -> Result<Running> {
         tasks: Vec::new(),
         quic: Vec::new(),
     };
+    let mut states = Vec::new();
     for server in config.servers {
-        start_server(server, &mut running).await?;
+        states.push(start_server(server, &mut running).await?);
     }
+    crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
     Ok(running)
 }
 
@@ -301,7 +312,7 @@ fn bind_quic(port: u16, config: quinn::ServerConfig) -> Result<quinn::Endpoint> 
     .with_context(|| format!("cannot serve HTTP/3 on UDP port {port}"))
 }
 
-async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()> {
+async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc<ServerState>> {
     let ServerConfig {
         port,
         tls,
@@ -333,7 +344,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
             running.ready.answers += answers.answers();
             running.ready.bytes += bytes;
             running.ready.millis += millis;
-            site.answers = Some(Arc::new(answers));
+            site.answers.store(Some(Arc::new(answers)));
         } else {
             tracing::info!(
                 port,
@@ -466,7 +477,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
             .context("cannot start a connection thread")?;
     }
     running.bound.push((port, tcp_addr, quic_addr));
-    Ok(())
+    Ok(state)
 }
 
 #[derive(Clone, Copy)]
