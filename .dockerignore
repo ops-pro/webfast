@@ -1,7 +1,2 @@
 target/
-tests/
-**/*.rs.bk
-README.md
-Dockerfile
-.dockerignore
-compat/
+.git/

@@ -1,0 +1,42 @@
+# cargo-deny (scripts/check.sh deny, CI): known vulnerabilities, licenses, banned and duplicate
+# crates, and where crates come from.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# RustSec: a vulnerability in any crate fails; an unmaintained one only when we depend on it directly.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+version = 2
+# Every license in the dependency graph today; a new one has to be looked at and added here.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+# webfast itself (not published, no license chosen yet).
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
