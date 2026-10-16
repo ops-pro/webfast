@@ -1541,6 +1541,7 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         header_up,
         header_down,
         response_header_timeout,
+        dial_timeout,
         client,
         counter: AtomicUsize::new(0),
     })

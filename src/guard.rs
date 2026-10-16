@@ -117,6 +117,34 @@ pub struct Permit {
     address: Option<IpAddr>,
 }
 
+/// A connection's place, carried by its requests: a WebSocket tunnel (src/proxy.rs) keeps it until
+/// it closes, so tunnels count against the limits as the connections they came from; and the
+/// server's stop, on which a tunnel closes (as Caddy closes them when it stops).
+#[derive(Clone)]
+pub struct Place {
+    _permit: Arc<Permit>,
+    stop: watch::Receiver<bool>,
+}
+
+impl Place {
+    pub fn new(permit: Permit, stop: watch::Receiver<bool>) -> Place {
+        Place {
+            _permit: Arc::new(permit),
+            stop,
+        }
+    }
+
+    /// Resolves when the server stops.
+    pub async fn stopped(mut self) {
+        while !*self.stop.borrow_and_update() {
+            if self.stop.changed().await.is_err() {
+                // The server is gone without a stop: nothing will ask the tunnel to close.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(address) = self.address {

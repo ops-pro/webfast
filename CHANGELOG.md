@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- WebSocket through `reverse_proxy`: a `Connection: upgrade` handshake over HTTP/1.1 goes to the
+  upstream, and its 101 joins the two connections into a tunnel. Tunnels count against the
+  connection limits and close when the server stops.
+
 ## 0.1.0 — 2026-10-15
 
 The first version as a project of its own (its history before that is kept: it began as the static

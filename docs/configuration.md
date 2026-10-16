@@ -31,6 +31,12 @@ an empty 200, as in Caddy.
 Files are served from memory, so a site that uses `file_server` or the `file` matcher needs an
 explicit `root * <dir>` (the files are loaded from it at startup).
 
+`reverse_proxy` passes WebSocket (any `Connection: upgrade` request over HTTP/1.1) with nothing to
+configure: the handshake goes to the upstream with the same `header_up` and forwarded headers as
+any request, and when the upstream answers 101 the two connections are joined and copied both ways
+until either side closes. Any other answer reaches the client as it is. Browsers open WebSocket
+over HTTP/1.1 (webfast does not offer it over HTTP/2, RFC 8441), so keep `h1` in `protocols`.
+
 ## Differences from Caddy
 
 All of them are checked by `compat/`:
@@ -45,6 +51,9 @@ All of them are checked by `compat/`:
   default (`0` restores Caddy's none), 408 for a request body the client stops sending, at most 64
   non-overlapping ranges, redirect targets kept on the site, client identity headers
   (`X-Real-IP`, `CF-Connecting-IP`, `Forwarded`, …) dropped from untrusted peers.
+- A WebSocket tunnel keeps the place of the connection it came from, so it counts against the
+  connection limits; it has no idle limit, and closes when the server stops (Caddy's default,
+  `stream_close_delay 0`). `stream_timeout` and `stream_close_delay` are not supported.
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
 

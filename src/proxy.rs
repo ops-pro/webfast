@@ -9,16 +9,22 @@
 //! trusted proxy, so an upstream that reads them cannot be fed a made-up address or country; a
 //! request body the client stops sending (src/guard.rs `StalledBody`) answers 408; and
 //! `response_header_timeout` has a default (src/config.rs).
+//!
+//! WebSocket (any `Connection: upgrade` over HTTP/1.1): the handshake goes to the upstream on a
+//! connection of its own, and when it answers 101 the client's and the upstream's connections are
+//! joined into a tunnel that copies bytes both ways until either side closes. The tunnel keeps the
+//! client connection's place (src/guard.rs `Place`), so it counts against the connection limits.
 
 use crate::body::{Body, boxed};
-use crate::guard::BodyStalled;
-use crate::handler::{Ctx, HeaderOp, apply_ops};
-use http::header::{CONNECTION, HOST};
+use crate::guard::{BodyStalled, Place};
+use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
+use http::header::{CONNECTION, HOST, UPGRADE};
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
+use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -52,6 +58,8 @@ pub struct ReverseProxy {
     pub header_up: Vec<HeaderOp>,
     pub header_down: Vec<HeaderOp>,
     pub response_header_timeout: Option<Duration>,
+    /// For the connections of WebSocket handshakes (the pooled client has its own).
+    pub dial_timeout: Duration,
     pub client: HttpClient,
     pub counter: AtomicUsize,
 }
@@ -105,6 +113,18 @@ fn remove_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// The protocol a request asks to switch to (`Connection: upgrade` and an `Upgrade` field), e.g.
+/// `websocket`.
+fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
+    let wanted = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    if wanted { headers.get(UPGRADE).cloned() } else { None }
+}
+
 impl ReverseProxy {
     fn pick(&self, attempt: usize) -> &Authority {
         let n = self.upstreams.len();
@@ -131,15 +151,14 @@ impl ReverseProxy {
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
             return ctx.status(StatusCode::BAD_GATEWAY);
         }
-        let mut headers = ctx.req.headers.clone();
-        remove_hop_headers(&mut headers);
-        forwarded_headers(&ctx, &mut headers);
-        if !headers.contains_key(HOST)
-            && let Ok(value) = HeaderValue::from_str(ctx.hostport())
+        // A WebSocket handshake on a connection that can be handed over (HTTP/1.1); anything else
+        // goes on as an ordinary request, its Upgrade dropped as hop-by-hop.
+        if let Some(protocol) = upgrade_of(&ctx.req.headers)
+            && let Some(client) = ctx.req.extensions.remove::<OnUpgrade>()
         {
-            headers.insert(HOST, value);
+            return self.tunnel(ctx, protocol, client).await;
         }
-        apply_ops(&self.header_up, &ctx, &mut headers);
+        let headers = self.upstream_headers(&ctx);
         let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
         let path_and_query = ctx.req.uri.path_and_query().cloned();
         let method = ctx.req.method.clone();
@@ -209,6 +228,106 @@ impl ReverseProxy {
             }
             Err(status) => ctx.status(status),
         }
+    }
+
+    /// The request's headers as the upstream gets them.
+    fn upstream_headers(&self, ctx: &Ctx) -> HeaderMap {
+        let mut headers = ctx.req.headers.clone();
+        remove_hop_headers(&mut headers);
+        forwarded_headers(ctx, &mut headers);
+        if !headers.contains_key(HOST)
+            && let Ok(value) = HeaderValue::from_str(ctx.hostport())
+        {
+            headers.insert(HOST, value);
+        }
+        apply_ops(&self.header_up, ctx, &mut headers);
+        headers
+    }
+
+    /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own;
+    /// when it answers 101, the client's connection and that one become a tunnel, copied both ways
+    /// until either side closes. Any other answer is passed on as it is, with no tunnel.
+    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade) -> Response<Body> {
+        let mut headers = self.upstream_headers(&ctx);
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, protocol);
+        let rendered_down: Vec<RenderedOp> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
+        let place = ctx.req.extensions.get::<Place>().cloned();
+        let upstream = self.pick(0).clone();
+        let target = ctx.req.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        let mut request = Request::new(crate::body::empty());
+        *request.method_mut() = ctx.req.method.clone();
+        *request.uri_mut() = target.parse().unwrap_or_else(|_| Uri::from_static("/"));
+        *request.headers_mut() = headers;
+        let (dial_timeout, address) = (self.dial_timeout, upstream.clone());
+        let exchange = async move {
+            let tcp = tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address.as_str()))
+                .await
+                .map_err(|_| "connection timed out".to_string())?
+                .map_err(|e| e.to_string())?;
+            let _ = tcp.set_nodelay(true);
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                .await
+                .map_err(|e| e.to_string())?;
+            // Drives the connection, and hands it over when the upstream switches protocols.
+            tokio::spawn(connection.with_upgrades());
+            sender.send_request(request).await.map_err(|e| e.to_string())
+        };
+        let answered = match self.response_header_timeout {
+            Some(limit) => match tokio::time::timeout(limit, exchange).await {
+                Ok(result) => result.map_err(|e| (StatusCode::BAD_GATEWAY, e)),
+                Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "no answer in time".to_string())),
+            },
+            None => exchange.await.map_err(|e| (StatusCode::BAD_GATEWAY, e)),
+        };
+        let mut response = match answered {
+            Ok(response) => response,
+            Err((status, error)) => {
+                tracing::warn!(upstream = %upstream, %error, "upstream WebSocket handshake failed");
+                return ctx.status(status);
+            }
+        };
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let (mut parts, incoming) = response.into_parts();
+            remove_hop_headers(&mut parts.headers);
+            for op in &rendered_down {
+                op.apply(&mut parts.headers);
+            }
+            return ctx.respond_appending(Response::from_parts(parts, boxed(incoming)));
+        }
+        let upstream_io = hyper::upgrade::on(&mut response);
+        let (mut parts, _) = response.into_parts();
+        let switched_to = parts.headers.get(UPGRADE).cloned();
+        remove_hop_headers(&mut parts.headers);
+        parts.headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        if let Some(protocol) = switched_to {
+            parts.headers.insert(UPGRADE, protocol);
+        }
+        for op in &rendered_down {
+            op.apply(&mut parts.headers);
+        }
+        tokio::spawn(async move {
+            let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream_io) else {
+                return;
+            };
+            let (mut client, mut upstream) = (TokioIo::new(client), TokioIo::new(upstream));
+            let copied = tokio::io::copy_bidirectional(&mut client, &mut upstream);
+            // The client connection's place is held until the tunnel closes: either side closing
+            // it, or the server stopping.
+            match place {
+                Some(place) => {
+                    tokio::select! {
+                        _ = copied => {}
+                        _ = place.clone().stopped() => {}
+                    }
+                    drop(place);
+                }
+                None => {
+                    let _ = copied.await;
+                }
+            }
+        });
+        ctx.respond_appending(Response::from_parts(parts, crate::body::empty()))
     }
 }
 

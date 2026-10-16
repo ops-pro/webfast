@@ -35,6 +35,7 @@ compared request by request ([`compat/`](compat)).
   idle and stall timeouts, a timeout for hung upstreams, bounded ranges, HTTP/3 frame limits.
 - **TLS** with rustls on aws-lc-rs (post-quantum key exchange preferred), certificates re-read when
   renewed; **HTTP/3** with 0-RTT for safe methods.
+- **Proxying** with streaming (server-sent events reach the client as they come) and WebSocket.
 - Unknown directives, options and placeholders stop the server at startup with the file and line,
   instead of being ignored.
 

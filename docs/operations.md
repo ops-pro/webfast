@@ -10,7 +10,8 @@ webfast --version
 ```
 
 SIGTERM or SIGINT stop it gracefully: no new connections, open ones are asked to finish (HTTP/2
-and HTTP/3: GOAWAY), and whatever is still open after `grace_period` (30 s) is closed.
+and HTTP/3: GOAWAY), WebSocket tunnels are closed, and whatever is still open after
+`grace_period` (30 s) is closed.
 
 ## The Docker image
 
@@ -192,3 +193,4 @@ What keeps one client from holding the server:
 | QUIC handshake floods from spoofed addresses          | with 64 handshakes under way, unproven addresses get a Retry first; at most 4096 handshakes queued, 32 MB of their packets                                        |
 | HTTP/2 Rapid Reset, CONTINUATION flood, MadeYouReset  | h2 0.4.20 or later; 250 streams per connection, 16 KiB of headers                                                                                                 |
 | A file that one request would make the server unpack  | LZ4 only for files of up to 1 MiB, so `Range: bytes=0-0` decompresses at most that                                                                                |
+| WebSocket tunnels held open                           | a tunnel keeps its connection's place, so the connection limits count it; the idle and stall timeouts end with the handshake (a quiet socket is a live one)       |

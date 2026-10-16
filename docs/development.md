@@ -18,7 +18,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `src/memo.rs`                                    | ready answers for the files                                                                         |
 | `src/watch.rs`                                   | changed files picked up: inotify or polling                                                         |
 | `src/encode.rs`                                  | Accept-Encoding and on-the-fly zstd / Brotli / gzip                                                 |
-| `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams                                                             |
+| `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; WebSocket tunnels                                          |
 | `src/server.rs`                                  | listeners, connections, runtimes; one request on any protocol                                       |
 | `src/h3.rs`, `src/h3limit.rs`                    | HTTP/3 over QUIC, and its frame size limit                                                          |
 | `src/tls.rs`                                     | rustls: certificates from PEM files, re-read on change; tickets, 0-RTT                              |
@@ -27,6 +27,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `src/accesslog.rs`, `src/date.rs`, `src/body.rs` | access logs, the shared `Date`, the body type                                                       |
 | `tests/serve.rs`                                 | end to end, against real HTTP/1.1, HTTP/2 and HTTP/3 clients                                        |
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
+| `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -64,7 +65,9 @@ builds the image on the default branch and tags.
 timing; ready answers against the chain for every case; slow readers and senders; idle HTTP/2;
 connection limits; oversized HTTP/3 header frames; both runtimes and their shutdown; changed files
 picked up by inotify and by polling. `tests/recipes.rs` loads every `recipes/*/Caddyfile` (a new
-recipe has to be added to its list) and serves the static site and the SPA.
+recipe has to be added to its list) and serves the static site and the SPA. `tests/websocket.rs`
+sends handshakes through to an upstream written by hand: the tunnel both ways, what the upstream
+is sent, answers other than 101, the connection limits and the shutdown.
 
 ## The PGO build
 

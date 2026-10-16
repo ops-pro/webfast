@@ -9,7 +9,7 @@
 use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ServerConfig, Site};
-use crate::guard::{Activity, Admission, Tracked};
+use crate::guard::{Activity, Admission, Place, Tracked};
 use crate::handler::{ConnInfo, Ctx, Next, hostport_of, strip_port};
 use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
@@ -532,14 +532,16 @@ async fn accept_loop(
         let builder = builder.clone();
         let stop = stop.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            // The connection's place: its requests carry it, and a WebSocket tunnel keeps it.
+            let place = Place::new(permit, stop.clone());
             let service = {
                 let activity = activity.clone();
-                service_fn(move |request: Request<Incoming>| {
+                service_fn(move |mut request: Request<Incoming>| {
                     // The request counts as in progress until its response body ends.
                     let flight = activity.begin();
                     let state = state.clone();
                     let conn = conn.clone();
+                    request.extensions_mut().insert(place.clone());
                     async move {
                         let request = stall_limited(request.map(boxed), limits.stall);
                         let response = handle(state, conn, request).await;
@@ -594,7 +596,8 @@ async fn serve_connection<I, S>(
         Mode::Http2 => builder.http2_only(),
         Mode::Auto => builder,
     };
-    let connection = builder.serve_connection(io, service).into_owned();
+    // With upgrades: a request that switches protocols (WebSocket) hands the connection over.
+    let connection = builder.serve_connection_with_upgrades(io, service).into_owned();
     crate::guard::drive(connection, |c| c.graceful_shutdown(), activity, limits, stop).await;
 }
 
