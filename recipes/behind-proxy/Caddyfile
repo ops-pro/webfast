@@ -1,0 +1,29 @@
+# Behind nginx, Traefik, HAProxy or a cloud load balancer that terminates TLS: the proxies'
+# X-Forwarded-For is believed, anyone else's is not, and the client is the right-most address in it
+# that is not a proxy (the left-most is whatever the client wrote). nginx.conf next to this file is
+# the matching front.
+{
+	auto_https off
+	admin off
+	servers {
+		# The proxies: private addresses and loopback here (a proxy on the same host or network).
+		# Their headers are believed, and they are not limited per address.
+		trusted_proxies static private_ranges
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+:8080 {
+	root * /srv
+	encode zstd br gzip
+	file_server {
+		precompressed br zstd gzip
+	}
+
+	# The access log's client_ip is the client's, not the proxy's.
+	log {
+		output stdout
+		format json
+	}
+}

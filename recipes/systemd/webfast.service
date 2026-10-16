@@ -1,0 +1,45 @@
+# webfast as a systemd service, without Docker: the binary at /usr/local/bin/webfast, the
+# configuration in /etc/webfast (Caddyfile, and optionally `environment`), the site where the
+# Caddyfile's root says. It runs as a user of its own made at start (DynamicUser), may bind ports
+# below 1024 and little else.
+#
+#   cp webfast.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now webfast
+#   systemctl restart webfast     # after changing the Caddyfile (the site's files are picked up by themselves)
+
+[Unit]
+Description=webfast web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/webfast/environment
+ExecStartPre=/usr/local/bin/webfast validate --config /etc/webfast/Caddyfile
+ExecStart=/usr/local/bin/webfast run --config /etc/webfast/Caddyfile
+Restart=on-failure
+# SIGTERM: open requests finish within the Caddyfile's grace_period (30 s).
+KillSignal=SIGTERM
+TimeoutStopSec=40
+LimitNOFILE=65536
+
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

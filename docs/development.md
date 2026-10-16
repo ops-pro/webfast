@@ -26,6 +26,8 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `src/sockets.rs`                                 | socket options                                                                                      |
 | `src/accesslog.rs`, `src/date.rs`, `src/body.rs` | access logs, the shared `Date`, the body type                                                       |
 | `tests/serve.rs`                                 | end to end, against real HTTP/1.1, HTTP/2 and HTTP/3 clients                                        |
+| `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
+| `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
 | `examples/rtt.rs`                                | the client of `bench/rtt.sh`                                                                        |
@@ -61,7 +63,8 @@ builds the image on the default branch and tags.
 `sample/Caddyfile` with a stub upstream; HTTP/1.1, HTTP/2 over TLS and HTTP/3 clients; SSE
 timing; ready answers against the chain for every case; slow readers and senders; idle HTTP/2;
 connection limits; oversized HTTP/3 header frames; both runtimes and their shutdown; changed files
-picked up by inotify and by polling.
+picked up by inotify and by polling. `tests/recipes.rs` loads every `recipes/*/Caddyfile` (a new
+recipe has to be added to its list) and serves the static site and the SPA.
 
 ## The PGO build
 

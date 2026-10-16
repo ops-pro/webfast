@@ -1,0 +1,24 @@
+# webfast serving HTTPS and HTTP/3 itself: the certificate from PEM files (certbot, lego or
+# acme.sh write them; webfast re-reads them within a minute of a renewal), HTTP redirected to
+# HTTPS, HTTP/3 advertised to browsers with Alt-Svc. Publish 80/tcp, 443/tcp and 443/udp; in Docker
+# the image's user may bind them (containers allow unprivileged ports from 0), with systemd see
+# ../systemd.
+{
+	auto_https off
+	admin off
+}
+
+http://example.com, http://www.example.com {
+	redir https://{host}{uri} 308
+}
+
+example.com, www.example.com {
+	tls /certs/fullchain.pem /certs/privkey.pem
+	root * /srv
+
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains"
+	encode zstd br gzip
+	file_server {
+		precompressed br zstd gzip
+	}
+}

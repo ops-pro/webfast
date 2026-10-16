@@ -1,0 +1,34 @@
+# A site built ahead of time (Astro, Hugo, Eleventy, Vite, …) served from /srv: clean URLs
+# (/about serves about.html, /about.html redirects to /about), the build's precompressed
+# .br/.zst/.gz siblings for browsers, the rest compressed on the fly, hashed assets cached for a
+# year, and a few security headers.
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	root * /srv
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+	header /assets/* Cache-Control "public, max-age=31536000, immutable"
+
+	encode zstd br gzip
+
+	@html_suffix path_regexp html ^(.*)\.html$
+	redir @html_suffix {re.html.1} 308
+
+	try_files {path} {path}.html {path}/index.html
+	file_server {
+		precompressed br zstd gzip
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

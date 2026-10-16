@@ -1,0 +1,5 @@
+# /etc/webfast/environment: settings for webfast.service (docs/configuration.md, Environment).
+LOG_LEVEL=info
+WEB_MAX_MEMORY=512MiB
+# Little traffic: fewer threads cost less CPU per request.
+WEB_WORKERS=2

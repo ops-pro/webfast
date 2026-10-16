@@ -74,8 +74,13 @@ target/release/webfast run --config Caddyfile
 target/release/webfast healthcheck http://127.0.0.1:8080/healthz
 ```
 
+[Recipes](recipes) has complete configurations for common setups — a static site, a single-page
+app, a site in front of an application (with docker-compose.yml), behind nginx or another proxy,
+HTTPS and HTTP/3 served directly, a hardened systemd service — each checked by the tests.
+
 ## Documentation
 
+- [Recipes](recipes): configurations for common setups.
 - [Configuration](docs/configuration.md): the Caddyfile subset, how it differs from Caddy, the
   environment variables.
 - [Operations](docs/operations.md): the Docker image, running behind a proxy or with TLS and
@@ -84,6 +89,7 @@ target/release/webfast healthcheck http://127.0.0.1:8080/healthz
 - [Development](docs/development.md): layout, checks, tests, the PGO build, the compatibility check
   and the benchmarks.
 - [Changelog](CHANGELOG.md).
+- [Security policy](SECURITY.md): how to report a vulnerability, privately.
 
 ## Checks
 

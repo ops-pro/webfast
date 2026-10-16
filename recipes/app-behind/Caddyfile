@@ -1,0 +1,37 @@
+# The site from /srv in front of an application at app:3000: /api/* goes to the application, and
+# so does every path that is not a file (server-rendered pages, redirects, 404 pages). The
+# application's answers are compressed on the fly; files go out as their precompressed siblings.
+# docker-compose.yml next to this file runs both.
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	root * /srv
+	encode zstd br gzip
+
+	# `route` keeps the handlers in exactly this order.
+	route {
+		respond /healthz "ok" 200
+
+		reverse_proxy /api/* app:3000
+
+		@static file {
+			try_files {path} {path}.html {path}/index.html
+		}
+		handle @static {
+			rewrite * {file_match.relative}
+			file_server {
+				precompressed br zstd gzip
+			}
+		}
+
+		reverse_proxy app:3000
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

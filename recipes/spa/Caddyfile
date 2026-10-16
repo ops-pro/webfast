@@ -1,0 +1,23 @@
+# A single-page application (React, Vue, Svelte, …) served from /srv: its files as they are, and
+# every other path answered with index.html, so the app's router takes it. Hashed assets are cached
+# for a year, everything else revalidated each time (a new deploy is seen at once; unchanged files
+# get a 304, their ETags being hashes of the content).
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	root * /srv
+
+	header /assets/* Cache-Control "public, max-age=31536000, immutable"
+	@not_hashed not path /assets/*
+	header @not_hashed Cache-Control "no-cache"
+
+	encode zstd br gzip
+
+	try_files {path} /index.html
+	file_server {
+		precompressed br zstd gzip
+	}
+}

@@ -1,0 +1,26 @@
+# webfast in front of an application. In this directory, with the site's files in ./public:
+#
+#   docker build -t webfast ../..        (once, in the project's root: the image with PGO)
+#   docker compose up
+#
+# then http://localhost:8080. `app` stands in for your application: it answers every request with
+# what it received.
+services:
+  web:
+    image: webfast
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./public:/srv:ro
+      - ./Caddyfile:/etc/webfast/Caddyfile:ro
+    environment:
+      # Little traffic: fewer threads cost less CPU per request (docs/operations.md, Workers).
+      WEB_WORKERS: "2"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [app]
+
+  app:
+    image: traefik/whoami:v1.11.0
+    command: ["--port", "3000"]
