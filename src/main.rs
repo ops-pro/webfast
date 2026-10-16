@@ -14,7 +14,9 @@
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
 //! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
-//! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection; SIGTERM
+//! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection —
+//! WEB_RELOAD (`immediate`: open connections take it for their next request; `lazy`: they keep
+//! the configuration they were accepted with until they close); SIGTERM
 //! and SIGINT stop gracefully.
 
 use std::io::{Read, Write};
@@ -225,11 +227,18 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         Ok(value) => return Err(format!("WEB_RUNTIME: shared or per-core, not {value:?}")),
         Err(_) => None,
     };
+    let reload = match std::env::var("WEB_RELOAD") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("immediate") => config::ReloadMode::Immediate,
+        Ok(value) if value.trim().eq_ignore_ascii_case("lazy") => config::ReloadMode::Lazy,
+        Ok(value) => return Err(format!("WEB_RELOAD: immediate or lazy, not {value:?}")),
+        Err(_) => config::ReloadMode::default(),
+    };
     for server in &mut config.servers {
         if let Some(per_core) = per_core {
             server.per_core = per_core;
         }
         server.workers = workers;
+        server.reload = reload;
         if let Some(congestion) = congestion {
             server.limits.tcp_congestion = congestion;
         }

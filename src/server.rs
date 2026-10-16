@@ -8,7 +8,7 @@
 
 use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
-use crate::config::{Config, Limits, Protocols, ServerConfig, Site};
+use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
 use crate::guard::{Activity, Admission, Place, Tracked};
 use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, hostport_of, strip_port};
 use crate::matcher::host_matches;
@@ -23,7 +23,7 @@ use hyper_util::server::conn::auto;
 use ipnet::IpNet;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -34,6 +34,12 @@ use tokio_rustls::TlsAcceptor;
 /// configuration is reloaded (`Running::reload`); the rest is the port's own.
 pub struct ServerState {
     routing: ArcSwap<Routing>,
+    /// WEB_RELOAD=lazy: a connection keeps the routing it was accepted with (`ConnState`).
+    lazy: bool,
+    /// With `lazy`, the routings a reload replaced, while connections still use them: when files
+    /// change their ready answers are forgotten too (src/watch.rs), so that those connections serve
+    /// the files as they are now.
+    retired: Mutex<Vec<Weak<Routing>>>,
     tls: bool,
     alt_svc: Option<HeaderValue>,
 }
@@ -44,6 +50,41 @@ pub struct Routing {
     trusted: Vec<IpNet>,
     strict: bool,
     client_ip_headers: Vec<HeaderName>,
+    /// Counts the reloads: a connection that outlives the routing it was accepted with works out
+    /// again whether its peer is trusted.
+    generation: u64,
+}
+
+/// What the requests of one connection share: the port, the connection's facts, and — with
+/// WEB_RELOAD=lazy — the routing it was accepted with, which it keeps for as long as it is open.
+/// One per connection, so that its requests count references on it, not on the port that every
+/// connection shares.
+pub struct ConnState {
+    state: Arc<ServerState>,
+    info: Arc<ConnInfo>,
+    pinned: Option<Arc<Routing>>,
+    /// The routing's generation `info.trusted` was worked out with.
+    generation: u64,
+}
+
+impl ConnState {
+    pub fn info(&self) -> &Arc<ConnInfo> {
+        &self.info
+    }
+
+    /// The connection's facts under `routing`: the same unless a reload changed whether its peer
+    /// is trusted.
+    fn info_under(&self, routing: &Routing) -> Arc<ConnInfo> {
+        let trusted = routing.trusts(self.info.remote.ip());
+        if trusted == self.info.trusted {
+            return self.info.clone();
+        }
+        Arc::new(ConnInfo {
+            remote: self.info.remote,
+            tls: self.info.tls,
+            trusted,
+        })
+    }
 }
 
 impl ServerState {
@@ -52,17 +93,36 @@ impl ServerState {
         self.routing.load_full()
     }
 
+    /// The routings that connections use: the current one, and with WEB_RELOAD=lazy those that
+    /// connections accepted before a reload still keep.
+    pub(crate) fn routings(&self) -> Vec<Arc<Routing>> {
+        let mut all = vec![self.routing.load_full()];
+        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        retired.retain(|routing| routing.strong_count() > 0);
+        all.extend(retired.iter().filter_map(Weak::upgrade));
+        all
+    }
+
     pub(crate) fn tls(&self) -> bool {
         self.tls
     }
 
-    /// Connection facts shared by all its requests.
-    pub fn conn_info(&self, remote: SocketAddr) -> Arc<ConnInfo> {
-        let trusted = self.routing.load().trusted.iter().any(|n| n.contains(&remote.ip()));
-        Arc::new(ConnInfo {
+    /// A new connection: its facts, worked out with the routing in use now — which it keeps with
+    /// WEB_RELOAD=lazy.
+    pub fn connection(self: &Arc<Self>, remote: SocketAddr) -> Arc<ConnState> {
+        let current = self.routing.load();
+        let info = Arc::new(ConnInfo {
             remote,
             tls: self.tls,
-            trusted,
+            trusted: current.trusts(remote.ip()),
+        });
+        let generation = current.generation;
+        let pinned = self.lazy.then(|| arc_swap::Guard::into_inner(current));
+        Arc::new(ConnState {
+            state: self.clone(),
+            info,
+            pinned,
+            generation,
         })
     }
 }
@@ -70,6 +130,10 @@ impl ServerState {
 impl Routing {
     pub(crate) fn sites(&self) -> &[Site] {
         &self.sites
+    }
+
+    fn trusts(&self, peer: IpAddr) -> bool {
+        self.trusted.iter().any(|n| n.contains(&peer))
     }
 
     /// The site for the request's host; the host is looked at only when a site names hosts.
@@ -139,15 +203,27 @@ enum Way {
 }
 
 /// Handles one request on any protocol.
-pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Request<Body>) -> Response<Body> {
+pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Response<Body> {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let remote = conn.remote;
+    let remote = connection.info.remote;
     let version = parts.version;
-    // The site, in the routing as it is now; what the request needs of it is taken out, so that
-    // nothing holds the routing across an await.
+    // The site, in the connection's routing (WEB_RELOAD=lazy) or in the port's as it is now; what
+    // the request needs of it is taken out, so that nothing holds the routing across an await.
     let picked = {
-        let routing = state.routing.load();
+        let current;
+        let routing: &Routing = match &connection.pinned {
+            Some(pinned) => pinned,
+            None => {
+                current = connection.state.routing.load();
+                &current
+            }
+        };
+        let conn = if routing.generation == connection.generation {
+            connection.info.clone()
+        } else {
+            connection.info_under(routing)
+        };
         let client_ip = if conn.trusted {
             routing.client_ip(&parts.headers, remote.ip())
         } else {
@@ -158,13 +234,14 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
                 Some(response) => Way::Ready(response),
                 None => Way::Chain(site.routes.clone(), site.errors.clone()),
             };
-            (client_ip, site.log.clone(), way)
+            (conn, client_ip, site.log.clone(), way)
         })
     };
-    let Some((client_ip, log, way)) = picked else {
+    let state = &connection.state;
+    let Some((conn, client_ip, log, way)) = picked else {
         // Like Caddy: a host no site serves gets an empty 200.
         let mut response = Response::new(crate::body::empty());
-        common_headers(&state, version, &mut response);
+        common_headers(state, version, &mut response);
         return response;
     };
     // What the access log needs, as cheap copies, and only when the site logs.
@@ -193,7 +270,7 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
             }
         }
     };
-    common_headers(&state, version, &mut response);
+    common_headers(state, version, &mut response);
     match (log, info) {
         (Some(log), Some(info)) => {
             let status = response.status().as_u16();
@@ -274,7 +351,7 @@ struct Port {
 }
 
 /// What a port was started with that only a restart can change: its listening sockets, TLS or
-/// not, its protocols (and so its QUIC endpoint), limits and threads.
+/// not, its protocols (and so its QUIC endpoint), limits, threads and reload mode.
 #[derive(Debug, Clone, PartialEq)]
 struct Shape {
     port: u16,
@@ -283,6 +360,7 @@ struct Shape {
     limits: Limits,
     per_core: bool,
     workers: Option<usize>,
+    reload: ReloadMode,
 }
 
 impl Shape {
@@ -294,6 +372,7 @@ impl Shape {
             limits: server.limits,
             per_core: server.per_core,
             workers: server.workers,
+            reload: server.reload,
         }
     }
 
@@ -311,6 +390,9 @@ impl Shape {
         }
         if self.per_core != new.per_core || self.workers != new.workers {
             what.push("threads");
+        }
+        if self.reload != new.reload {
+            what.push("WEB_RELOAD");
         }
         what
     }
@@ -384,12 +466,22 @@ impl Running {
         .context("preparing the ready answers")?;
         for (i, server, certificates) in placed {
             let port = &self.ports[i];
-            port.state.routing.store(Arc::new(Routing {
+            let state = &port.state;
+            let generation = state.routing.load().generation + 1;
+            let old = state.routing.swap(Arc::new(Routing {
                 sites: server.sites,
                 trusted: server.trusted_proxies,
                 strict: server.trusted_strict,
                 client_ip_headers: server.client_ip_headers,
+                generation,
             }));
+            // WEB_RELOAD=lazy: connections keep the old routing as long as they are open (also one
+            // being accepted right now, which may not hold it yet: kept whatever its count).
+            if state.lazy {
+                let mut retired = state.retired.lock().unwrap_or_else(PoisonError::into_inner);
+                retired.retain(|routing| routing.strong_count() > 0);
+                retired.push(Arc::downgrade(&old));
+            }
             if let (Some(resolver), Some(certificates)) = (&port.resolver, certificates) {
                 resolver.install(certificates);
             }
@@ -544,6 +636,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         limits,
         per_core,
         workers,
+        reload,
         mut sites,
     } = server;
     let admission = Admission::new(&limits);
@@ -585,7 +678,10 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
             trusted: trusted_proxies,
             strict: trusted_strict,
             client_ip_headers,
+            generation: 0,
         }),
+        lazy: reload == ReloadMode::Lazy,
+        retired: Mutex::new(Vec::new()),
         tls: state_tls,
         alt_svc: None,
     };
@@ -725,15 +821,14 @@ async fn accept_loop(
             _ = stop.changed() => break,
         };
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
-        let conn = state.conn_info(remote);
-        let Some(permit) = admission.admit(remote.ip(), conn.trusted) else {
+        let conn = state.connection(remote);
+        let Some(permit) = admission.admit(remote.ip(), conn.info.trusted) else {
             tracing::debug!(%remote, "connection refused: too many open");
             continue;
         };
         let _ = stream.set_nodelay(true);
         let activity = Activity::new();
         let stream = crate::guard::Io::new(stream, activity.clone());
-        let state = state.clone();
         let acceptor = acceptor.clone();
         let builder = builder.clone();
         let stop = stop.clone();
@@ -742,15 +837,15 @@ async fn accept_loop(
             let place = Place::new(permit, stop.clone());
             let service = {
                 let activity = activity.clone();
+                // Per request only this connection's own reference counts change.
                 service_fn(move |mut request: Request<Incoming>| {
                     // The request counts as in progress until its response body ends.
                     let flight = activity.begin();
-                    let state = state.clone();
                     let conn = conn.clone();
                     request.extensions_mut().insert(place.clone());
                     async move {
                         let request = stall_limited(request.map(boxed), limits.stall);
-                        let response = handle(state, conn, request).await;
+                        let response = handle(conn, request).await;
                         Ok::<_, Infallible>(response.map(|body| boxed(Tracked::new(body, flight))))
                     }
                 })
@@ -817,6 +912,7 @@ mod tests {
             trusted: vec!["10.0.0.0/8".parse().unwrap(), "172.16.0.0/12".parse().unwrap()],
             strict,
             client_ip_headers: vec![HeaderName::from_static("x-forwarded-for")],
+            generation: 0,
         }
     }
 

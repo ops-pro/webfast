@@ -73,8 +73,10 @@ is sent, answers other than 101, the connection limits and the shutdown. `tests/
 requests in each way a handler can and checks the `handle_errors` answers against what Caddy 2.11
 answers to the same Caddyfile. `tests/reload.rs` reloads a running server: the next request on an
 open connection gets the new sites, kept roots are not read again, the files watched and the
-certificates are the new configuration's, and what needs a restart is refused; on Linux it also
-sends SIGHUP and SIGTERM to the binary.
+certificates are the new configuration's, a connection's trust follows `trusted_proxies`, and
+what needs a restart is refused; with `WEB_RELOAD=lazy` an open connection keeps its
+configuration while a new one gets the new, and both serve changed files; on Linux it also sends
+SIGHUP and SIGTERM to the binary.
 
 ## The PGO build
 
@@ -125,6 +127,8 @@ in `encode`.
 # oha at a fixed rate (RATE=1000/s, RUNS=10 × REQUESTS=5000) per scenario — a page, a build asset, a
 # redirect — the server's CPU time per request from its cgroup; then examples/bench.rs in process
 WEBFAST_BIN=… TRAIN_BIN=… BENCH_BIN=…/examples/bench bench/run.sh <label>
+# as fast as it goes over 128 connections, with variables for the server
+RATE=0 CONNECTIONS=128 REQUESTS=1000000 SERVER_ENV="WEB_RELOAD=lazy" WEBFAST_BIN=… TRAIN_BIN=… bench/run.sh <label>
 
 # time from a new connection to the first response over a slow link (tc netem, DELAY_MS=25 on each
 # side): HTTP/2 over TCP + TLS, HTTP/3, HTTP/3 with 0-RTT

@@ -99,20 +99,21 @@ Those an answer shows are checked by `compat/`:
 
 ## Environment
 
-| Variable                     | Default    | What it sets                                                                                                                                  |
-| ---------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOG_LEVEL`                  | `info`     | the server's own log (JSON on stderr); `debug` also via the `debug` global option                                                             |
-| `WEB_MAX_MEMORY`             | `512MiB`   | what the site files may take in memory, over all roots; a site that does not fit stops the startup, a change that does not fit is not taken   |
-| `WEB_LZ4_MIN_SAVING`         | `25`       | a file of up to 1 MiB is kept as an LZ4 block when that saves at least this many percent; `off`: never                                        |
-| `WEB_FILES_WATCH`            | `auto`     | changed files picked up: `auto` (inotify on a local filesystem, polling elsewhere), `inotify`, `poll`, `off` (the files as loaded at startup) |
-| `WEB_FILES_POLL`             | `30s`      | how often a polled root is looked at again                                                                                                    |
-| `WEB_WORKERS`                | `auto`     | threads serving connections, 1–1024 (`auto`: one per CPU the process may use, at most 64 — a container's CPU limit counts)                    |
-| `WEB_RUNTIME`                | `per-core` | `per-core`: a thread with its own runtime per listening socket (Unix); `shared`: one multi-threaded runtime for all connections               |
-| `WEB_MAX_CONNECTIONS`        | `16384`    | open connections, TCP and QUIC together; `0`: no limit                                                                                        |
-| `WEB_MAX_CONNECTIONS_PER_IP` | `256`      | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                           |
-| `WEB_STALL_TIMEOUT`          | `30s`      | a response the client stops taking, or a request body it stops sending, for this long ends it                                                 |
-| `WEB_TCP_CONGESTION`         | `bbr`      | TCP congestion control for the clients' connections; `system`: the kernel's default                                                           |
-| `WEB_LOG_FLUSH_MS`           | `10`       | access log lines are written in batches this often by a background thread; a full queue drops lines (counted) instead of slowing requests     |
+| Variable                     | Default     | What it sets                                                                                                                                                                           |
+| ---------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`                  | `info`      | the server's own log (JSON on stderr); `debug` also via the `debug` global option                                                                                                      |
+| `WEB_MAX_MEMORY`             | `512MiB`    | what the site files may take in memory, over all roots; a site that does not fit stops the startup, a change that does not fit is not taken                                            |
+| `WEB_LZ4_MIN_SAVING`         | `25`        | a file of up to 1 MiB is kept as an LZ4 block when that saves at least this many percent; `off`: never                                                                                 |
+| `WEB_FILES_WATCH`            | `auto`      | changed files picked up: `auto` (inotify on a local filesystem, polling elsewhere), `inotify`, `poll`, `off` (the files as loaded at startup)                                          |
+| `WEB_FILES_POLL`             | `30s`       | how often a polled root is looked at again                                                                                                                                             |
+| `WEB_WORKERS`                | `auto`      | threads serving connections, 1–1024 (`auto`: one per CPU the process may use, at most 64 — a container's CPU limit counts)                                                             |
+| `WEB_RUNTIME`                | `per-core`  | `per-core`: a thread with its own runtime per listening socket (Unix); `shared`: one multi-threaded runtime for all connections                                                        |
+| `WEB_RELOAD`                 | `immediate` | what a reload (SIGHUP) does to open connections: `immediate`, their next request gets the new configuration; `lazy`, they keep theirs until they close (docs/operations.md, Reloading) |
+| `WEB_MAX_CONNECTIONS`        | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                 |
+| `WEB_MAX_CONNECTIONS_PER_IP` | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                    |
+| `WEB_STALL_TIMEOUT`          | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                          |
+| `WEB_TCP_CONGESTION`         | `bbr`       | TCP congestion control for the clients' connections; `system`: the kernel's default                                                                                                    |
+| `WEB_LOG_FLUSH_MS`           | `10`        | access log lines are written in batches this often by a background thread; a full queue drops lines (counted) instead of slowing requests                                              |
 
 Durations are written as in the Caddyfile (`500ms`, `30s`, `5m`); sizes as `512MiB`, `1G` or bytes.
 A value that does not parse stops the server at startup.

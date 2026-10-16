@@ -62,7 +62,22 @@ pub struct ServerConfig {
     /// Listening sockets for the port on Unix — with `per_core`, the threads that serve its
     /// connections (WEB_WORKERS); `None`: one per CPU, at most 64.
     pub workers: Option<usize>,
+    /// What a reload does to the connections already open (WEB_RELOAD).
+    pub reload: ReloadMode,
     pub sites: Vec<Site>,
+}
+
+/// What a reload (SIGHUP, src/server.rs `Running::reload`) does to the connections already open
+/// (WEB_RELOAD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReloadMode {
+    /// Their next request is answered with the new configuration: each request looks the port's
+    /// current one up (one atomic read).
+    #[default]
+    Immediate,
+    /// They keep the configuration they were accepted with for as long as they stay open, and new
+    /// connections get the new one; requests look nothing up.
+    Lazy,
 }
 
 /// What a connection may take of the server (src/guard.rs); `timeouts` in the Caddyfile, the
@@ -390,6 +405,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     },
                     per_core: cfg!(unix),
                     workers: None,
+                    reload: ReloadMode::default(),
                     sites: Vec::new(),
                 });
                 servers.last_mut().expect("just pushed")

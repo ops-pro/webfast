@@ -269,29 +269,42 @@ fn watch_root(inotify: &mut Option<Inotify>, roots: usize, i: usize, root: &Path
 }
 
 /// The sites that read any of `changed`, on every server still running.
+/// `retired`: also the sites of the routings that connections accepted before a reload still keep
+/// (WEB_RELOAD=lazy).
 fn sites_reading(
     states: &[Weak<ServerState>],
     changed: &[Arc<FileStore>],
+    retired: bool,
     mut each: impl FnMut(&ServerState, &crate::config::Site),
 ) {
     for state in states.iter().filter_map(Weak::upgrade) {
-        let routing = state.routing();
-        for site in routing.sites() {
-            let mut stores = Vec::new();
-            crate::memo::collect_stores(&site.routes, &mut stores);
-            if stores.iter().any(|s| changed.iter().any(|c| Arc::ptr_eq(s, c))) {
-                each(&state, site);
+        let routings = if retired {
+            state.routings()
+        } else {
+            vec![state.routing()]
+        };
+        for routing in &routings {
+            for site in routing.sites() {
+                let mut stores = Vec::new();
+                crate::memo::collect_stores(&site.routes, &mut stores);
+                if stores.iter().any(|s| changed.iter().any(|c| Arc::ptr_eq(s, c))) {
+                    each(&state, site);
+                }
             }
         }
     }
 }
 
+/// The old answers go everywhere, also for connections that keep an older configuration: those
+/// take the chain, which reads the files as they are now; only the current sites get new ones.
 fn forget_answers(states: &[Weak<ServerState>], store: &Arc<FileStore>) {
-    sites_reading(states, std::slice::from_ref(store), |_, site| site.answers.store(None));
+    sites_reading(states, std::slice::from_ref(store), true, |_, site| {
+        site.answers.store(None)
+    });
 }
 
 fn prepare_answers(states: &[Weak<ServerState>], changed: &[Arc<FileStore>]) {
-    sites_reading(states, changed, |state, site| {
+    sites_reading(states, changed, false, |state, site| {
         let started = Instant::now();
         let answers = crate::memo::Answers::prepare(&site.routes, state.tls());
         if let Some(answers) = &answers {

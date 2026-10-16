@@ -11,7 +11,7 @@
 use crate::body::{Body, BoxError, boxed};
 use crate::config::Limits;
 use crate::guard::{Activity, Admission, Due, Permit};
-use crate::server::{ServerState, handle};
+use crate::server::{ConnState, ServerState, handle};
 use bytes::{Buf, Bytes};
 use h3::server::{RequestResolver, RequestStream};
 use http::header::{CONNECTION, DATE, HOST, TRANSFER_ENCODING, UPGRADE};
@@ -61,18 +61,17 @@ pub async fn serve(
         }
         let remote = incoming.remote_address();
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
-        let conn_info = state.conn_info(remote);
-        let Some(permit) = admission.admit(remote.ip(), conn_info.trusted) else {
+        let conn = state.connection(remote);
+        let Some(permit) = admission.admit(remote.ip(), conn.info().trusted) else {
             tracing::debug!(%remote, "QUIC connection refused: too many open");
             incoming.refuse();
             continue;
         };
-        let state = state.clone();
         let stop = stop.clone();
         let handshakes = handshakes.clone();
         tokio::spawn(async move {
             let _permit: Permit = permit;
-            if let Err(e) = connection(incoming, state, conn_info, stop, limits, handshakes).await {
+            if let Err(e) = connection(incoming, conn, stop, limits, handshakes).await {
                 tracing::debug!(error = %e, "HTTP/3 connection ended with an error");
             }
         });
@@ -90,8 +89,7 @@ impl Drop for Handshake {
 
 async fn connection(
     incoming: quinn::Incoming,
-    state: Arc<ServerState>,
-    conn_info: Arc<crate::handler::ConnInfo>,
+    served: Arc<ConnState>,
     mut stop: watch::Receiver<bool>,
     limits: Limits,
     handshakes: Arc<AtomicUsize>,
@@ -137,13 +135,12 @@ async fn connection(
         tokio::select! {
             accepted = h3.accept() => match accepted {
                 Ok(Some(resolver)) => {
-                    let state = state.clone();
-                    let conn_info = conn_info.clone();
+                    let served = served.clone();
                     let early = !confirmed.load(Ordering::Acquire);
                     let flight = activity.begin();
                     tokio::spawn(async move {
                         let _flight = flight;
-                        if let Err(e) = request(resolver, state, conn_info, early, limits).await {
+                        if let Err(e) = request(resolver, served, early, limits).await {
                             tracing::debug!(error = %e, "HTTP/3 request failed");
                         }
                     });
@@ -194,8 +191,7 @@ async fn within<T, E: Into<BoxError>>(
 
 async fn request(
     resolver: RequestResolver<crate::h3limit::Connection, Bytes>,
-    state: Arc<ServerState>,
-    conn: Arc<crate::handler::ConnInfo>,
+    conn: Arc<ConnState>,
     early: bool,
     limits: Limits,
 ) -> Result<(), BoxError> {
@@ -228,7 +224,7 @@ async fn request(
         done: false,
     });
     let request = crate::server::stall_limited(Request::from_parts(parts, body), limits.stall);
-    let response = handle(state, conn, request).await;
+    let response = handle(conn, request).await;
     let (mut head_parts, mut body) = response.into_parts();
     for name in [CONNECTION, TRANSFER_ENCODING, UPGRADE] {
         head_parts.headers.remove(name);

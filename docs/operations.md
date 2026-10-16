@@ -23,16 +23,37 @@ docker kill --signal HUP web
 systemctl reload webfast          # recipes/systemd: validates first, then sends SIGHUP
 ```
 
-- Each port's sites, `trusted_proxies`, `client_ip_headers` and `grace_period` are replaced whole;
-  the next request is answered by the new configuration, also on a connection that stays open,
-  and a request under way finishes with the one it started with. The certificates are read again,
-  and the ready answers are worked out for the new sites before anything changes.
+What is replaced: each port's sites, `trusted_proxies`, `client_ip_headers` and `grace_period`,
+whole. The certificates are read again, and the ready answers are worked out for the new sites,
+before anything changes. A request under way always finishes with the configuration it started
+with, and no connection is closed by a reload. What the connections already open get next is
+`WEB_RELOAD`:
+
+| `WEB_RELOAD`          | A connection open before the reload                                                     | New connections       | Per request                                         |
+| --------------------- | --------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------- |
+| `immediate` (default) | its next request is answered by the new configuration                                   | the new configuration | one atomic read of the port's current configuration |
+| `lazy`                | keeps the configuration it was accepted with for as long as it stays open, however long | the new configuration | nothing: the connection holds its configuration     |
+
+- `immediate`: the new configuration is in force for every request from the moment the reload is
+  done; a connection's trust (`trusted_proxies`) is worked out again on its next request.
+- `lazy`: a reload never changes what a connection already open sees — its sites, headers,
+  proxies, trusted proxies — until it closes: when the client closes it, when it has been idle for
+  `timeouts { idle }` (5 min), or when the server stops. Only new connections get the new
+  configuration. The old one stays in memory (its sites, ready answers, upstream connection pools)
+  until the last connection that holds it closes; behind a proxy that keeps its connections open
+  (nginx `keepalive`, a CDN) that can be hours, and requests through those connections keep the
+  old configuration as long. The site files are the exception: they are served as they are now on
+  every connection, as long as the new configuration still uses their root (the old
+  configuration's ready answers are dropped when its files change, and those connections take the
+  handler chain for them).
+- In both modes a TLS connection keeps the certificate it was opened with, and a WebSocket
+  tunnel stays as it is.
 - Site roots that stay are taken over as they are, not read again (with `WEB_FILES_WATCH` on they
   are looked at again at once, as at startup); new roots are loaded, and what all of them take
   must fit `WEB_MAX_MEMORY`.
 - What only a restart can change is refused: other ports, TLS on or off on a port, `protocols`,
-  `timeouts`, and the `WEB_*` variables (read at startup). The `debug` option takes effect on a
-  restart.
+  `timeouts`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at startup). The `debug`
+  option takes effect on a restart.
 - A reload that fails — a syntax error, a root that is missing, a certificate that cannot be read,
   one of the above — changes nothing: the log says `configuration not reloaded; the running one
   stays` with the reason. A reload that succeeds says `configuration reloaded`.

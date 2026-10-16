@@ -120,6 +120,31 @@ higher (it keeps freed memory for reuse; no growth). One changed page: 3–12 ms
 thousand requests/s, the page rewritten every 100 ms, every asset once): all 1.3 million responses
 200, the 100 changes looked at 6 times.
 
+## Reloading
+
+What a request pays for the configuration to be replaceable (SIGHUP; docs/operations.md,
+Reloading): with `WEB_RELOAD=immediate` one atomic read of the port's current configuration (an
+`ArcSwap` load: a slot of the thread's own, no shared reference count); with `lazy` nothing, the
+connection holds its configuration. A request's other reference counts are its connection's own:
+the port's state and the WebSocket bookkeeping are held once per connection (before, every
+request cloned the port's state and the server's stop signal, counts that all connections share).
+
+Plain release builds (no PGO), the sample site, 2026-10-16, two passes in opposite order; at 1000
+requests/s server CPU per request, median of 12 runs; as fast as it goes over 128 connections,
+requests per second, median of 8 runs:
+
+| Build                                              | CPU µs at 1000/s (page / asset / redirect) | thousand/s flat out (page / asset / redirect) | CPU µs flat out, page |
+| -------------------------------------------------- | ------------------------------------------ | --------------------------------------------- | --------------------- |
+| before WebSocket and reloading                     | 163.7 / 170.3 / 168.9                      | 161 / 138 / 165                               | 20.9                  |
+| WebSocket (a per-request clone of the stop signal) | 163.3 / 169.2 / 169.7                      | 167 / 145 / 164                               | 20.6                  |
+| reloading, the configuration read per request      | 165.0 / 168.9 / 168.1                      | 163 / 147 / 163                               | 21.2                  |
+| now, `WEB_RELOAD=immediate`                        | 162.4 / 170.4 / 167.7                      | 164 / 148 / 158                               | 20.8                  |
+| now, `WEB_RELOAD=lazy`                             | 168.4 / 172.9 / 172.8                      | 166 / 145 / 162                               | 20.7                  |
+
+No difference within the noise: a variant's own runs spread over 10–25 µs at 1000 requests/s and
+by 10–30 thousand requests/s flat out, while what is measured costs nanoseconds. The choice
+between the modes is about what open connections get after a reload, not about speed.
+
 ## The way here
 
 Handler chain in process, a page as br (precompressed):
@@ -164,7 +189,7 @@ Files kept in LZ4, in process (`identity:` requests send the file's own bytes):
 | page without Accept-Encoding (77 KB)        | 0.72 µs                  | 11.7 µs (decompressed)                                   |
 | build asset without Accept-Encoding (32 KB) | 0.72 µs                  | 9.9 µs                                                   |
 | page as br; its 304                         | 0.91 µs; 0.85 µs         | the same (a .br sibling does not shrink, stays as it is) |
-| files in memory; process resident           | 30 MiB; 78.2 MiB       | 19 MiB; 65.9 MiB                                       |
+| files in memory; process resident           | 30 MiB; 78.2 MiB         | 19 MiB; 65.9 MiB                                         |
 | loading the files                           | 28 ms                    | 61 ms (compressing, checking every block once)           |
 
 Load test, 1000 requests/s, page / asset / redirect, in one sitting:

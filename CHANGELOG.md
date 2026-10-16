@@ -14,7 +14,11 @@
   headers, certificates and the grace period are replaced; site roots that stay are taken over;
   what needs a restart (ports, TLS on or off, protocols, timeouts) is refused, as is anything that
   fails, and the running configuration stays. The systemd recipe has `ExecReload` (validate, then
-  SIGHUP).
+  SIGHUP). `WEB_RELOAD` says what open connections get: `immediate` (the default), the new
+  configuration for their next request; `lazy`, the one they were accepted with, for as long as
+  they stay open.
+- Per request, only the connection's own reference counts change: the port's state and the
+  WebSocket bookkeeping (the server's stop signal) are held once per connection.
 - Header values with bytes outside visible ASCII no longer stop the startup with a panic.
 
 ## 0.1.0 — 2026-10-15

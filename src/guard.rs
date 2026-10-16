@@ -119,25 +119,26 @@ pub struct Permit {
 
 /// A connection's place, carried by its requests: a WebSocket tunnel (src/proxy.rs) keeps it until
 /// it closes, so tunnels count against the limits as the connections they came from; and the
-/// server's stop, on which a tunnel closes (as Caddy closes them when it stops).
+/// server's stop, on which a tunnel closes (as Caddy closes them when it stops). One reference
+/// count per connection: cloning it for a request touches nothing that other connections share.
 #[derive(Clone)]
-pub struct Place {
-    _permit: Arc<Permit>,
+pub struct Place(Arc<Held>);
+
+struct Held {
+    _permit: Permit,
     stop: watch::Receiver<bool>,
 }
 
 impl Place {
     pub fn new(permit: Permit, stop: watch::Receiver<bool>) -> Place {
-        Place {
-            _permit: Arc::new(permit),
-            stop,
-        }
+        Place(Arc::new(Held { _permit: permit, stop }))
     }
 
     /// Resolves when the server stops.
-    pub async fn stopped(mut self) {
-        while !*self.stop.borrow_and_update() {
-            if self.stop.changed().await.is_err() {
+    pub async fn stopped(self) {
+        let mut stop = self.0.stop.clone();
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
                 // The server is gone without a stop: nothing will ask the tunnel to close.
                 std::future::pending::<()>().await;
             }

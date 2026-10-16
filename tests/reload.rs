@@ -26,7 +26,12 @@ fn load_watching(
 
 /// One request on an open connection; the head and body as text.
 async fn ask(stream: &mut TcpStream, path: &str) -> String {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    ask_with(stream, path, "").await
+}
+
+/// `extra`: more header lines, each ending in CRLF.
+async fn ask_with(stream: &mut TcpStream, path: &str, extra: &str) -> String {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut answer = Vec::new();
     let mut buf = [0u8; 4096];
@@ -151,6 +156,73 @@ async fn after_a_reload_the_files_watched_are_the_new_configurations() {
         assert!(started.elapsed() < Duration::from_secs(10), "{one}\n{two}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn a_connection_open_across_a_reload_is_trusted_as_the_new_configuration_says() {
+    let site = ":0 {\n\trespond \"{client_ip}\"\n}\n";
+    let mut running = server::start(load(site, None).unwrap()).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let forwarded = "X-Forwarded-For: 203.0.113.9\r\n";
+    assert!(ask_with(&mut stream, "/", forwarded).await.ends_with("127.0.0.1"));
+    let trusting = format!("{{\n\tservers {{\n\t\ttrusted_proxies static 127.0.0.1/8\n\t}}\n}}\n{site}");
+    running.reload(load(&trusting, Some(&running)).unwrap()).await.unwrap();
+    assert!(ask_with(&mut stream, "/", forwarded).await.ends_with("203.0.113.9"));
+    running.reload(load(site, Some(&running)).unwrap()).await.unwrap();
+    assert!(ask_with(&mut stream, "/", forwarded).await.ends_with("127.0.0.1"));
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn lazy_connections_keep_their_configuration_until_they_close() {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("page.txt"), "v1").unwrap();
+    let watch = webfast::watch::Watch {
+        mode: webfast::watch::Mode::Poll,
+        poll: Duration::from_millis(200),
+    };
+    let lazy = |version: u32, running: Option<&Running>| {
+        let text = format!(
+            ":0 {{\n\troot * {}\n\theader X-Version {version}\n\tfile_server\n}}\n",
+            site.path().display()
+        );
+        let mut config = load_watching(&text, running, watch).unwrap();
+        config.servers[0].reload = webfast::config::ReloadMode::Lazy;
+        config
+    };
+    let mut running = server::start(lazy(1, None)).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut old = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(ask(&mut old, "/page.txt").await.contains("x-version: 1"));
+
+    running.reload(lazy(2, Some(&running))).await.unwrap();
+    // The connection open before the reload keeps its configuration; a new one gets the new.
+    let mut new = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(ask(&mut new, "/page.txt").await.contains("x-version: 2"));
+    for _ in 0..3 {
+        assert!(ask(&mut old, "/page.txt").await.contains("x-version: 1"));
+    }
+
+    // Changed files reach both: the old configuration's ready answers are forgotten too.
+    std::fs::write(site.path().join("page.txt"), "v2").unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let (before, after) = (ask(&mut old, "/page.txt").await, ask(&mut new, "/page.txt").await);
+        if before.ends_with("v2") && after.ends_with("v2") {
+            assert!(before.contains("x-version: 1") && after.contains("x-version: 2"));
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "{before}\n{after}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The mode itself needs a restart.
+    let mut immediate = lazy(3, Some(&running));
+    immediate.servers[0].reload = webfast::config::ReloadMode::Immediate;
+    let refused = running.reload(immediate).await.unwrap_err();
+    assert!(refused.to_string().contains("WEB_RELOAD"), "{refused}");
     running.shutdown(Duration::from_secs(1)).await;
 }
 
