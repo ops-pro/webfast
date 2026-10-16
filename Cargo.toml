@@ -5,6 +5,7 @@ edition = "2024"
 # let chains (`if let … && let …`).
 rust-version = "1.88"
 description = "A static-first web server: the site from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a strict subset of the Caddyfile"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["http", "web-server", "static", "caddyfile", "http3"]
 categories = ["web-programming::http-server"]

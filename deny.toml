@@ -28,10 +28,6 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# webfast itself (not published, no license chosen yet).
-[licenses.private]
-ignore = true
-
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

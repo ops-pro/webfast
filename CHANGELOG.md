@@ -18,6 +18,7 @@ front of a site's Docker deployment).
 - Limits against slow and greedy clients (docs/operations.md, Limits); tuned sockets (BBR,
   `TCP_NOTSENT_LOWAT`, `TCP_DEFER_ACCEPT`, `TCP_USER_TIMEOUT`, UDP buffers).
 - A Docker image built with profile-guided optimisation, trained on a sample site of its own.
+- Licensed under MIT or Apache-2.0, at your option.
 - Renamed from `web-server`: the crate, library and binary are `webfast`, the image's
   configuration is `/etc/webfast/Caddyfile`; the environment variables keep their `WEB_` names;
   the minimum Rust version is 1.88 (it said 1.85, but let chains need 1.88).
