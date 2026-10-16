@@ -105,7 +105,7 @@ impl Default for Limits {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertSpec {
     /// Host names the certificate is for (empty: any).
     pub hosts: Vec<String>,
@@ -1384,14 +1384,12 @@ fn parse_header_op(tokens: &[Token], at: &Location) -> Result<HeaderOp> {
     })
 }
 
-/// Checked, then kept as a `'static` name for the life of the process (cloned without a reference
-/// count; the configuration is never reloaded).
+/// Checked, then kept as an interned `'static` name (cloned without a reference count; once however
+/// often the configuration is reloaded).
 fn header_name(token: &Token, name: &str) -> Result<HeaderName> {
     let checked = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| token_err(token, format!("invalid header name {name:?}")))?;
-    Ok(HeaderName::from_static(Box::leak(
-        checked.as_str().to_owned().into_boxed_str(),
-    )))
+    Ok(HeaderName::from_static(crate::files::intern(checked.as_str())))
 }
 
 fn parse_encode(line: &Line, start: usize) -> Result<Encode> {
@@ -1963,6 +1961,18 @@ mod tests {
         assert!(matches!(&matchers[..], [Matcher::ErrorStatus(r)] if r == &[(404, 404), (500, 599)]));
         assert!(errors[1].matcher.is_none(), "the catch-all last");
         assert_eq!(names(&site.routes), ["respond"], "error blocks are not in the chain");
+    }
+
+    #[test]
+    fn header_values_beyond_ascii_are_kept() {
+        let config = compile_text(":8080 {\n\theader X-Title \"Café ✓\"\n\trespond 1\n}\n").unwrap();
+        let routes = &config.servers[0].sites[0].routes;
+        let Handler::Header { ops, .. } = &routes[0].handler else {
+            panic!("the header route first")
+        };
+        let mut headers = http::HeaderMap::new();
+        ops[0].apply(None, &mut headers);
+        assert_eq!(headers["x-title"].as_bytes(), "Café ✓".as_bytes());
     }
 
     #[test]

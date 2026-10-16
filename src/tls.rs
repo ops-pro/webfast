@@ -1,6 +1,7 @@
 //! TLS with rustls on aws-lc-rs: TLS 1.3 and 1.2, the hybrid post-quantum key exchange
 //! X25519MLKEM768 preferred, ML-DSA certificates accepted. Certificates come from PEM files
-//! (`tls <cert> <key>`), are chosen by SNI and are re-read when the files change (renewals).
+//! (`tls <cert> <key>`), are chosen by SNI and are re-read when the files change (renewals) and
+//! when the configuration is reloaded.
 //!
 //! Resumption, kept in this process (a restart or another replica means a full handshake):
 //!   - TCP: stateless session tickets for TLS 1.3 (keys rotated by the ticketer), the session cache
@@ -32,18 +33,24 @@ pub fn provider() -> Arc<CryptoProvider> {
 /// hosts, else the first one.
 #[derive(Debug)]
 pub struct CertResolver {
-    specs: Vec<CertSpec>,
     loaded: RwLock<Vec<LoadedEntry>>,
 }
 
 #[derive(Debug, Clone)]
 struct LoadedEntry {
-    hosts: Vec<String>,
+    spec: CertSpec,
     key: Arc<CertifiedKey>,
-    stamp: Vec<(u64, Option<SystemTime>)>,
+    stamp: Stamp,
 }
 
-fn stamp(spec: &CertSpec) -> Vec<(u64, Option<SystemTime>)> {
+/// Certificates read for a configuration, not yet in use (`CertResolver::install`).
+#[derive(Debug)]
+pub struct Certificates(Vec<LoadedEntry>);
+
+/// The certificate and key files' sizes and modification times: changed when renewed.
+type Stamp = Vec<(u64, Option<SystemTime>)>;
+
+fn stamp(spec: &CertSpec) -> Stamp {
     [&spec.cert, &spec.key]
         .iter()
         .map(|p| {
@@ -68,7 +75,7 @@ fn load(spec: &CertSpec, provider: &CryptoProvider) -> Result<LoadedEntry> {
         .load_private_key(key)
         .with_context(|| format!("unsupported private key {}", spec.key.display()))?;
     Ok(LoadedEntry {
-        hosts: spec.hosts.clone(),
+        spec: spec.clone(),
         key: Arc::new(CertifiedKey::new(certs, signing)),
         stamp: stamp(spec),
     })
@@ -76,26 +83,46 @@ fn load(spec: &CertSpec, provider: &CryptoProvider) -> Result<LoadedEntry> {
 
 impl CertResolver {
     pub fn new(specs: Vec<CertSpec>, provider: &CryptoProvider) -> Result<CertResolver> {
-        let mut loaded = Vec::new();
-        for spec in &specs {
-            loaded.push(load(spec, provider)?);
-        }
         Ok(CertResolver {
-            specs,
-            loaded: RwLock::new(loaded),
+            loaded: RwLock::new(CertResolver::read(&specs, provider)?.0),
         })
+    }
+
+    /// Reads every certificate of `specs` (a reload: they are installed once the rest of the new
+    /// configuration is ready too).
+    pub fn read(specs: &[CertSpec], provider: &CryptoProvider) -> Result<Certificates> {
+        specs
+            .iter()
+            .map(|spec| load(spec, provider))
+            .collect::<Result<_>>()
+            .map(Certificates)
+    }
+
+    /// The certificates of a reloaded configuration, in place of the current ones; handshakes
+    /// under way keep the certificate they chose.
+    pub fn install(&self, certificates: Certificates) {
+        if let Ok(mut loaded) = self.loaded.write() {
+            *loaded = certificates.0;
+        }
     }
 
     /// Re-reads certificates whose files changed; a broken new file keeps the old certificate.
     pub fn reload_changed(&self, provider: &CryptoProvider) {
-        for (i, spec) in self.specs.iter().enumerate() {
-            let current = self.loaded.read().map(|l| l[i].stamp.clone()).unwrap_or_default();
-            if stamp(spec) == current {
+        let current: Vec<(CertSpec, Stamp)> = self
+            .loaded
+            .read()
+            .map(|l| l.iter().map(|e| (e.spec.clone(), e.stamp.clone())).collect())
+            .unwrap_or_default();
+        for (i, (spec, current)) in current.iter().enumerate() {
+            if stamp(spec) == *current {
                 continue;
             }
             match load(spec, provider) {
                 Ok(fresh) => {
-                    if let Ok(mut loaded) = self.loaded.write() {
+                    if let Ok(mut loaded) = self.loaded.write()
+                        // Unless a reload installed other certificates meanwhile.
+                        && loaded.get(i).is_some_and(|e| e.spec == *spec)
+                    {
                         loaded[i] = fresh;
                     }
                     tracing::info!(cert = %spec.cert.display(), "certificate reloaded");
@@ -113,13 +140,16 @@ impl ResolvesServerCert for CertResolver {
         let loaded = self.loaded.read().ok()?;
         if let Some(name) = hello.server_name() {
             let name = name.to_ascii_lowercase();
-            if let Some(e) = loaded.iter().find(|e| e.hosts.iter().any(|h| host_matches(h, &name))) {
+            if let Some(e) = loaded
+                .iter()
+                .find(|e| e.spec.hosts.iter().any(|h| host_matches(h, &name)))
+            {
                 return Some(e.key.clone());
             }
         }
         loaded
             .iter()
-            .find(|e| e.hosts.is_empty())
+            .find(|e| e.spec.hosts.is_empty())
             .or_else(|| loaded.first())
             .map(|e| e.key.clone())
     }

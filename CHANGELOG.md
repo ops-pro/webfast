@@ -10,6 +10,12 @@
   routes, with `{err.status_code}`, `{err.status_text}` and `{err.message}`; checked against Caddy
   by a second compat scenario (`SCENARIO=errors`). The static-site recipe serves the build's
   404.html.
+- SIGHUP reloads the Caddyfile without dropping a connection: sites, trusted proxies, client IP
+  headers, certificates and the grace period are replaced; site roots that stay are taken over;
+  what needs a restart (ports, TLS on or off, protocols, timeouts) is refused, as is anything that
+  fails, and the running configuration stays. The systemd recipe has `ExecReload` (validate, then
+  SIGHUP).
+- Header values with bytes outside visible ASCII no longer stop the startup with a panic.
 
 ## 0.1.0 — 2026-10-15
 

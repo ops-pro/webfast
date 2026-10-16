@@ -14,6 +14,8 @@
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
 //! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
+//! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection; SIGTERM
+//! and SIGINT stop gracefully.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_watching, parse_size, server};
+use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_reusing, load_parsed_watching, parse_size, server};
 
 /// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
 #[cfg(feature = "mimalloc")]
@@ -153,7 +155,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    match runtime.block_on(run(config, started)) {
+    let reload = Reload {
+        path: config_path,
+        max_memory,
+        lz4_min_saving,
+        watch,
+        workers,
+        debug: config.debug,
+    };
+    match runtime.block_on(run(config, started, reload)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "webfast stopped with an error");
@@ -200,7 +210,7 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         Ok(value)
             if !value.trim().is_empty() && value.trim().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
         {
-            Some(Some(Box::leak(value.trim().to_ascii_lowercase().into_boxed_str())))
+            Some(Some(webfast::files::intern(&value.trim().to_ascii_lowercase())))
         }
         Ok(value) => {
             return Err(format!(
@@ -248,11 +258,24 @@ fn init_tracing(debug: bool) {
         .init();
 }
 
-async fn run(config: config::Config, started: std::time::Instant) -> anyhow::Result<()> {
-    let grace = config.grace_period;
+/// What loading the configuration again (SIGHUP) needs, as at startup.
+struct Reload {
+    path: PathBuf,
+    max_memory: u64,
+    lz4_min_saving: Option<u8>,
+    watch: webfast::watch::Watch,
+    workers: Option<usize>,
+    /// The `debug` option as started (logging is set up once).
+    debug: bool,
+}
+
+async fn run(config: config::Config, started: std::time::Instant, reload: Reload) -> anyhow::Result<()> {
+    let mut grace = config.grace_period;
     let (ports, files) = (config.servers.len(), config.files);
+    // Before anything else: from here on, SIGHUP reloads instead of ending the process.
+    let mut hangup = hangups();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
-    let running = server::start(config).await?;
+    let mut running = server::start(config).await?;
     webfast::release_free_memory();
     let mib = |bytes: u64| (bytes as f64 / 1048576.0 * 10.0).round() / 10.0;
     tracing::info!(
@@ -269,12 +292,81 @@ async fn run(config: config::Config, started: std::time::Instant) -> anyhow::Res
         startup_ms = started.elapsed().as_millis() as u64,
         "started"
     );
-    shutdown_signal().await;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = next_hangup(&mut hangup) => match reload_config(&mut running, &reload).await {
+                Ok(new_grace) => grace = new_grace,
+                Err(e) => tracing::error!(error = format!("{e:#}"), "configuration not reloaded; the running one stays"),
+            },
+        }
+    }
     tracing::info!(grace_secs = grace.as_secs(), "shutting down");
     running.shutdown(grace).await;
     webfast::accesslog::flush_all(Duration::from_secs(2));
     tracing::info!("stopped");
     Ok(())
+}
+
+/// SIGHUP: reads the Caddyfile again and puts it in place (`server::Running::reload`); the
+/// configuration's grace period is returned.
+async fn reload_config(running: &mut server::Running, reload: &Reload) -> anyhow::Result<Duration> {
+    let started = std::time::Instant::now();
+    tracing::info!(config = %reload.path.display(), "reloading the configuration");
+    let file = caddyfile::parse_file(&reload.path)?;
+    if config::wants_debug(&file) != reload.debug {
+        tracing::warn!("the debug option takes effect on a restart");
+    }
+    let stores = running.stores();
+    let (max_memory, lz4_min_saving, watch) = (reload.max_memory, reload.lz4_min_saving, reload.watch);
+    let mut config =
+        tokio::task::spawn_blocking(move || load_parsed_reusing(&file, max_memory, lz4_min_saving, watch, &stores))
+            .await??;
+    limits_from_env(&mut config, reload.workers).map_err(anyhow::Error::msg)?;
+    let grace = config.grace_period;
+    let ports = config.servers.len();
+    let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
+    let files = config.files;
+    let ready = running.reload(config).await?;
+    webfast::release_free_memory();
+    tracing::info!(
+        ports,
+        sites,
+        files = files.files,
+        files_in_memory_mib = (files.stored as f64 / 1048576.0 * 10.0).round() / 10.0,
+        ready_paths = ready.paths,
+        ready_answers = ready.answers,
+        ms = started.elapsed().as_millis() as u64,
+        "configuration reloaded"
+    );
+    Ok(grace)
+}
+
+#[cfg(unix)]
+type Hangups = Option<tokio::signal::unix::Signal>;
+#[cfg(not(unix))]
+type Hangups = ();
+
+/// SIGHUP, caught (where there is one).
+fn hangups() -> Hangups {
+    #[cfg(unix)]
+    {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok()
+    }
+}
+
+/// The next SIGHUP; never where there is none.
+async fn next_hangup(hangups: &mut Hangups) {
+    #[cfg(unix)]
+    if let Some(signal) = hangups
+        && signal.recv().await.is_some()
+    {
+        return;
+    }
+    let _ = hangups;
+    std::future::pending::<()>().await
 }
 
 async fn shutdown_signal() {

@@ -25,7 +25,8 @@ compared request by request ([`compat/`](compat)).
   out once by the real handler chain; a request is then a lookup (0.8–0.9 µs in process).
 - **Changes picked up while running.** inotify on local filesystems, polling where events do not
   come (NFS, SMB, FUSE, 9p); only changed files are read again, and the site's snapshot is replaced
-  whole, so a page and its assets switch together.
+  whole, so a page and its assets switch together. A changed Caddyfile is put in place on SIGHUP,
+  without dropping a connection.
 - **ETag = hash of the content** (BLAKE3): unchanged files keep their ETag across deploys and
   replicas.
 - **A runtime per core**, as nginx's workers: one thread with its own epoll per listening socket

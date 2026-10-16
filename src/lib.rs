@@ -57,7 +57,22 @@ pub fn load_parsed_watching(
     lz4_min_saving: Option<u8>,
     watch: watch::Watch,
 ) -> anyhow::Result<config::Config> {
-    let mut loader = files::Loader::with_lz4(max_memory, lz4_min_saving).reloadable(watch.is_on());
+    load_parsed_reusing(file, max_memory, lz4_min_saving, watch, &[])
+}
+
+/// For a reload (`server::Running::reload`): site roots among `stores` — the running server's,
+/// `Running::stores` — are taken over as they are instead of being read again; the others are
+/// loaded.
+pub fn load_parsed_reusing(
+    file: &caddyfile::Caddyfile,
+    max_memory: u64,
+    lz4_min_saving: Option<u8>,
+    watch: watch::Watch,
+    stores: &[std::sync::Arc<files::FileStore>],
+) -> anyhow::Result<config::Config> {
+    let mut loader = files::Loader::with_lz4(max_memory, lz4_min_saving)
+        .reloadable(watch.is_on())
+        .reusing(stores);
     let client = proxy::client(Duration::from_secs(3), Some(Duration::from_secs(120)));
     let mut config = config::compile(file, &mut loader, client)?;
     config.files = loader.totals();

@@ -409,6 +409,9 @@ pub struct FileStore {
     configured: PathBuf,
     current: ArcSwap<Files>,
     lz4_min_saving: Option<u8>,
+    /// One rescan at a time (after a reload, the watcher that ends and the one that starts may
+    /// overlap).
+    rescanning: Mutex<()>,
 }
 
 impl FileStore {
@@ -509,6 +512,7 @@ impl FileStore {
             configured: root.to_path_buf(),
             current: ArcSwap::from_pointee(Files::new(files)),
             lz4_min_saving,
+            rescanning: Mutex::new(()),
         })
     }
 
@@ -518,6 +522,7 @@ impl FileStore {
     /// replaced. Requests keep using the snapshot they found; the store must have been loaded
     /// `reloadable` (otherwise replaced files would stay in memory for good).
     pub fn rescan(&self, budget: u64) -> anyhow::Result<Rescan> {
+        let _one = self.rescanning.lock().unwrap_or_else(PoisonError::into_inner);
         let started = Instant::now();
         if !self.configured.is_dir() {
             anyhow::bail!("site root {} is not a directory (any more)", self.configured.display());
@@ -767,6 +772,8 @@ pub fn content_type(path: &str) -> Option<&'static str> {
 /// Every site root used by the configuration, loaded once.
 pub struct Loader {
     stores: HashMap<PathBuf, Arc<FileStore>>,
+    /// Roots the running server already holds (a reload): taken over instead of read again.
+    previous: HashMap<PathBuf, Arc<FileStore>>,
     max_bytes: u64,
     budget: u64,
     lz4_min_saving: Option<u8>,
@@ -805,6 +812,7 @@ impl Loader {
     pub fn with_lz4(max_bytes: u64, lz4_min_saving: Option<u8>) -> Loader {
         Loader {
             stores: HashMap::new(),
+            previous: HashMap::new(),
             max_bytes,
             budget: max_bytes,
             lz4_min_saving,
@@ -818,6 +826,14 @@ impl Loader {
         self
     }
 
+    /// For a reload: a root among `stores` (the running server's) is taken over as it is — kept
+    /// current by the watcher, or as loaded at startup with WEB_FILES_WATCH=off — instead of being
+    /// read again.
+    pub fn reusing(mut self, stores: &[Arc<FileStore>]) -> Loader {
+        self.previous = stores.iter().map(|s| (s.root.clone(), s.clone())).collect();
+        self
+    }
+
     pub fn store(&mut self, root: &str) -> anyhow::Result<Arc<FileStore>> {
         let path = PathBuf::from(root);
         let canonical = path
@@ -825,6 +841,24 @@ impl Loader {
             .map_err(|e| anyhow::anyhow!("site root {root}: {e}"))?;
         if let Some(store) = self.stores.get(&canonical) {
             return Ok(store.clone());
+        }
+        if let Some(store) = self.previous.remove(&canonical) {
+            let totals = store.totals();
+            if totals.stored > self.budget {
+                anyhow::bail!(
+                    "the site files do not fit in memory (WEB_MAX_MEMORY): {root} takes {} bytes",
+                    totals.stored
+                );
+            }
+            self.budget -= totals.stored;
+            tracing::info!(
+                root = %canonical.display(),
+                files = totals.files,
+                in_memory = totals.stored,
+                "site files kept"
+            );
+            self.stores.insert(canonical, store.clone());
+            return Ok(store);
         }
         let started = std::time::Instant::now();
         let store = Arc::new(FileStore::load_with(

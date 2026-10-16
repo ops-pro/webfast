@@ -29,6 +29,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
 | `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
 | `tests/errors.rs`                                | `handle_errors` and `error`, as Caddy answers them                                                  |
+| `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -70,7 +71,10 @@ recipe has to be added to its list) and serves the static site and the SPA. `tes
 sends handshakes through to an upstream written by hand: the tunnel both ways, what the upstream
 is sent, answers other than 101, the connection limits and the shutdown. `tests/errors.rs` fails
 requests in each way a handler can and checks the `handle_errors` answers against what Caddy 2.11
-answers to the same Caddyfile.
+answers to the same Caddyfile. `tests/reload.rs` reloads a running server: the next request on an
+open connection gets the new sites, kept roots are not read again, the files watched and the
+certificates are the new configuration's, and what needs a restart is refused; on Linux it also
+sends SIGHUP and SIGTERM to the binary.
 
 ## The PGO build
 

@@ -94,6 +94,8 @@ Those an answer shows are checked by `compat/`:
   `stream_close_delay 0`). `stream_timeout` and `stream_close_delay` are not supported.
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
+- The configuration is reloaded with SIGHUP (docs/operations.md, Reloading); Caddy reloads
+  through its admin API (`caddy reload`), which `admin off` turns off.
 
 ## Environment
 

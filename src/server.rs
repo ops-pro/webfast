@@ -10,10 +10,11 @@ use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ServerConfig, Site};
 use crate::guard::{Activity, Admission, Place, Tracked};
-use crate::handler::{ConnInfo, Ctx, Failed, Next, hostport_of, strip_port};
+use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, hostport_of, strip_port};
 use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Version};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -29,19 +30,26 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
-/// What a request needs from its server (port).
+/// What a request needs from its server (port). The routing is replaced whole when the
+/// configuration is reloaded (`Running::reload`); the rest is the port's own.
 pub struct ServerState {
-    sites: Vec<Site>,
-    trusted: Vec<IpNet>,
-    strict: bool,
-    client_ip_headers: Vec<HeaderName>,
+    routing: ArcSwap<Routing>,
     tls: bool,
     alt_svc: Option<HeaderValue>,
 }
 
+/// A port's sites, and whose word on the client's address is taken.
+pub struct Routing {
+    sites: Vec<Site>,
+    trusted: Vec<IpNet>,
+    strict: bool,
+    client_ip_headers: Vec<HeaderName>,
+}
+
 impl ServerState {
-    pub(crate) fn sites(&self) -> &[Site] {
-        &self.sites
+    /// The routing in use, counted: for work that outlives a request (src/watch.rs).
+    pub(crate) fn routing(&self) -> Arc<Routing> {
+        self.routing.load_full()
     }
 
     pub(crate) fn tls(&self) -> bool {
@@ -50,11 +58,18 @@ impl ServerState {
 
     /// Connection facts shared by all its requests.
     pub fn conn_info(&self, remote: SocketAddr) -> Arc<ConnInfo> {
+        let trusted = self.routing.load().trusted.iter().any(|n| n.contains(&remote.ip()));
         Arc::new(ConnInfo {
             remote,
             tls: self.tls,
-            trusted: self.trusted.iter().any(|n| n.contains(&remote.ip())),
+            trusted,
         })
+    }
+}
+
+impl Routing {
+    pub(crate) fn sites(&self) -> &[Site] {
+        &self.sites
     }
 
     /// The site for the request's host; the host is looked at only when a site names hosts.
@@ -115,25 +130,45 @@ fn parse_ip(part: &str) -> Option<IpAddr> {
         .map(|ip| ip.to_canonical())
 }
 
+/// How a request is answered.
+enum Way {
+    /// A file's ready answer (src/memo.rs).
+    Ready(Response<Body>),
+    /// The handler chain, and the site's `handle_errors` routes.
+    Chain(Arc<[Route]>, Option<Arc<[Route]>>),
+}
+
 /// Handles one request on any protocol.
 pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Request<Body>) -> Response<Body> {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
     let remote = conn.remote;
-    let client_ip = if conn.trusted {
-        state.client_ip(&parts.headers, remote.ip())
-    } else {
-        remote.ip()
-    };
     let version = parts.version;
-    let Some(site) = state.select(&parts) else {
+    // The site, in the routing as it is now; what the request needs of it is taken out, so that
+    // nothing holds the routing across an await.
+    let picked = {
+        let routing = state.routing.load();
+        let client_ip = if conn.trusted {
+            routing.client_ip(&parts.headers, remote.ip())
+        } else {
+            remote.ip()
+        };
+        routing.select(&parts).map(|site| {
+            let way = match site.answers.load().as_ref().and_then(|answers| answers.answer(&parts)) {
+                Some(response) => Way::Ready(response),
+                None => Way::Chain(site.routes.clone(), site.errors.clone()),
+            };
+            (client_ip, site.log.clone(), way)
+        })
+    };
+    let Some((client_ip, log, way)) = picked else {
         // Like Caddy: a host no site serves gets an empty 200.
         let mut response = Response::new(crate::body::empty());
         common_headers(&state, version, &mut response);
         return response;
     };
     // What the access log needs, as cheap copies, and only when the site logs.
-    let info = site.log.as_ref().map(|_| RequestInfo {
+    let info = log.as_ref().map(|_| RequestInfo {
         remote,
         client_ip,
         proto: proto_name(version),
@@ -142,29 +177,26 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
         uri: parts.uri.clone(),
         started,
     });
-    // A file's ready answer (src/memo.rs), or the handler chain.
-    let ready = site.answers.load().as_ref().and_then(|answers| answers.answer(&parts));
-    let mut response = match ready {
-        Some(response) => response,
-        None => {
+    let mut response = match way {
+        Way::Ready(response) => response,
+        Way::Chain(routes, errors) => {
             // With `handle_errors`, the request as sent is kept for them.
-            let original = site.errors.as_ref().map(|_| request_head(&parts));
-            let ctx = Ctx::new(conn.clone(), parts, body, client_ip);
-            let response = Next::start(site.routes.clone()).run(ctx).await;
-            match (&site.errors, original, response.extensions().get::<Failed>()) {
-                (Some(errors), Some(original), Some(Failed(error))) => {
+            let kept = errors.map(|errors| (errors, request_head(&parts), conn.clone()));
+            let ctx = Ctx::new(conn, parts, body, client_ip);
+            let response = Next::start(routes).run(ctx).await;
+            match (kept, response.extensions().get::<Failed>()) {
+                (Some((errors, original, conn)), Some(Failed(error))) => {
                     let error = error.clone();
-                    crate::handler::handle_error(errors, conn, original, client_ip, error, response).await
+                    crate::handler::handle_error(&errors, conn, original, client_ip, error, response).await
                 }
                 _ => response,
             }
         }
     };
     common_headers(&state, version, &mut response);
-    match (&site.log, info) {
+    match (log, info) {
         (Some(log), Some(info)) => {
             let status = response.status().as_u16();
-            let log = log.clone();
             response.map(|b| boxed(LoggedBody::new(b, log, info, status)))
         }
         _ => response,
@@ -216,7 +248,7 @@ fn proto_name(version: Version) -> &'static str {
     }
 }
 
-/// A started server: its bound addresses and how to stop it.
+/// A started server: its bound addresses, how to reload and how to stop it.
 pub struct Running {
     /// Configured port → bound TCP address (and the QUIC one when HTTP/3 is on).
     pub bound: Vec<(u16, SocketAddr, Option<SocketAddr>)>,
@@ -227,6 +259,61 @@ pub struct Running {
     admissions: Vec<Arc<Admission>>,
     tasks: Vec<JoinHandle<()>>,
     quic: Vec<quinn::Endpoint>,
+    /// Each port as started: what a reload may change (its routing, its certificates) and what it
+    /// may not (`Shape`).
+    ports: Vec<Port>,
+    /// The site roots in memory, which a reload takes over (src/files.rs `Loader::reusing`).
+    stores: Vec<Arc<crate::files::FileStore>>,
+    watcher: Option<crate::watch::Watcher>,
+}
+
+struct Port {
+    shape: Shape,
+    state: Arc<ServerState>,
+    resolver: Option<Arc<CertResolver>>,
+}
+
+/// What a port was started with that only a restart can change: its listening sockets, TLS or
+/// not, its protocols (and so its QUIC endpoint), limits and threads.
+#[derive(Debug, Clone, PartialEq)]
+struct Shape {
+    port: u16,
+    tls: bool,
+    protocols: Protocols,
+    limits: Limits,
+    per_core: bool,
+    workers: Option<usize>,
+}
+
+impl Shape {
+    fn of(server: &ServerConfig) -> Shape {
+        Shape {
+            port: server.port,
+            tls: server.tls.is_some(),
+            protocols: server.protocols,
+            limits: server.limits,
+            per_core: server.per_core,
+            workers: server.workers,
+        }
+    }
+
+    /// What differs from `new`, for the refusal.
+    fn differences(&self, new: &Shape) -> Vec<&'static str> {
+        let mut what = Vec::new();
+        if self.tls != new.tls {
+            what.push("TLS on or off");
+        }
+        if self.protocols != new.protocols {
+            what.push("protocols");
+        }
+        if self.limits != new.limits {
+            what.push("timeouts or limits");
+        }
+        if self.per_core != new.per_core || self.workers != new.workers {
+            what.push("threads");
+        }
+        what
+    }
 }
 
 /// What preparing the ready answers gave and cost.
@@ -242,8 +329,88 @@ pub struct Ready {
 }
 
 impl Running {
+    /// The site roots in memory (for loading a new configuration that takes them over).
+    pub fn stores(&self) -> Vec<Arc<crate::files::FileStore>> {
+        self.stores.clone()
+    }
+
+    /// Puts a new configuration in place without dropping a connection: each port's sites, trusted
+    /// proxies and client IP headers are replaced whole, its certificates read again, and the files
+    /// watched are the new configuration's. Requests under way finish with the configuration they
+    /// started with. The ports must stay as they are (`Shape`): what only a restart can change is
+    /// refused, and the running configuration stays — as it does when anything else fails.
+    pub async fn reload(&mut self, config: Config) -> Result<Ready> {
+        let Config {
+            servers,
+            stores,
+            watch,
+            max_memory,
+            ..
+        } = config;
+        let ports: Vec<u16> = self.ports.iter().map(|p| p.shape.port).collect();
+        let mut new_ports: Vec<u16> = servers.iter().map(|s| s.port).collect();
+        new_ports.sort_unstable();
+        let mut old_ports = ports.clone();
+        old_ports.sort_unstable();
+        if new_ports != old_ports {
+            anyhow::bail!("the ports changed ({old_ports:?} to {new_ports:?}); restart to listen on others");
+        }
+        let mut placed = Vec::new();
+        for server in servers {
+            let i = ports.iter().position(|p| *p == server.port).expect("the same ports");
+            let what = self.ports[i].shape.differences(&Shape::of(&server));
+            if !what.is_empty() {
+                anyhow::bail!("port {}: {} changed; restart to apply", server.port, what.join(", "));
+            }
+            // Read now, installed with the rest: a certificate that cannot be read stops the reload.
+            let certificates = match (&server.tls, &self.ports[i].resolver) {
+                (Some(specs), Some(_)) => Some(CertResolver::read(specs, &tls::provider())?),
+                _ => None,
+            };
+            placed.push((i, server, certificates));
+        }
+        // The ready answers of the new sites, worked out on every CPU before anything changes.
+        let tls_of: Vec<bool> = placed.iter().map(|(i, ..)| self.ports[*i].shape.tls).collect();
+        let (placed, ready) = tokio::task::spawn_blocking(move || {
+            let mut ready = Ready::default();
+            for ((_, server, _), tls) in placed.iter_mut().zip(tls_of) {
+                for site in &mut server.sites {
+                    prepare_answers(server.port, site, tls, &mut ready);
+                }
+            }
+            (placed, ready)
+        })
+        .await
+        .context("preparing the ready answers")?;
+        for (i, server, certificates) in placed {
+            let port = &self.ports[i];
+            port.state.routing.store(Arc::new(Routing {
+                sites: server.sites,
+                trusted: server.trusted_proxies,
+                strict: server.trusted_strict,
+                client_ip_headers: server.client_ip_headers,
+            }));
+            if let (Some(resolver), Some(certificates)) = (&port.resolver, certificates) {
+                resolver.install(certificates);
+            }
+        }
+        // The files watched are the new configuration's (the roots it kept are looked at again at
+        // once, as at startup).
+        if let Some(watcher) = self.watcher.take() {
+            watcher.stop();
+        }
+        let states: Vec<Arc<ServerState>> = self.ports.iter().map(|p| p.state.clone()).collect();
+        self.watcher = crate::watch::start(watch, &stores, &states, max_memory);
+        self.stores = stores;
+        self.ready = ready;
+        Ok(ready)
+    }
+
     /// Stops accepting, lets open requests finish (up to `grace`), then closes everything.
     pub async fn shutdown(self, grace: Duration) {
+        if let Some(watcher) = &self.watcher {
+            watcher.stop();
+        }
         let _ = self.stop.send(true);
         // The accept loops stop at once; open connections are asked to finish (GOAWAY).
         for task in self.tasks {
@@ -278,13 +445,46 @@ pub async fn start(config: Config) -> Result<Running> {
         admissions: Vec::new(),
         tasks: Vec::new(),
         quic: Vec::new(),
+        ports: Vec::new(),
+        stores: Vec::new(),
+        watcher: None,
     };
-    let mut states = Vec::new();
     for server in config.servers {
-        states.push(start_server(server, &mut running).await?);
+        start_server(server, &mut running).await?;
     }
-    crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
+    let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
+    running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
+    running.stores = config.stores;
     Ok(running)
+}
+
+/// Works out a site's ready answers (src/memo.rs; it blocks until done), counted in `ready`.
+fn prepare_answers(port: u16, site: &mut Site, tls: bool, ready: &mut Ready) {
+    let started = Instant::now();
+    if let Some(answers) = crate::memo::Answers::prepare(&site.routes, tls) {
+        let millis = started.elapsed().as_millis() as u64;
+        let bytes = answers.bytes();
+        tracing::info!(
+            port,
+            hosts = ?site.hosts,
+            paths = answers.paths(),
+            answers = answers.answers(),
+            memory_kib = bytes / 1024,
+            ms = millis,
+            "ready answers for the site's files"
+        );
+        ready.paths += answers.paths();
+        ready.answers += answers.answers();
+        ready.bytes += bytes;
+        ready.millis += millis;
+        site.answers.store(Some(Arc::new(answers)));
+    } else {
+        tracing::info!(
+            port,
+            hosts = ?site.hosts,
+            "no ready answers: the site's routes look at more than the path"
+        );
+    }
 }
 
 /// Listening sockets for a port: on Unix `workers` of them (`None`: one per CPU, at most 64) with
@@ -332,7 +532,8 @@ fn bind_quic(port: u16, config: quinn::ServerConfig) -> Result<quinn::Endpoint> 
     .with_context(|| format!("cannot serve HTTP/3 on UDP port {port}"))
 }
 
-async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc<ServerState>> {
+async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()> {
+    let shape = Shape::of(&server);
     let ServerConfig {
         port,
         tls,
@@ -347,31 +548,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc
     } = server;
     let admission = Admission::new(&limits);
     for site in &mut sites {
-        let started = Instant::now();
-        if let Some(answers) = crate::memo::Answers::prepare(&site.routes, tls.is_some()) {
-            let millis = started.elapsed().as_millis() as u64;
-            let bytes = answers.bytes();
-            tracing::info!(
-                port,
-                hosts = ?site.hosts,
-                paths = answers.paths(),
-                answers = answers.answers(),
-                memory_kib = bytes / 1024,
-                ms = millis,
-                "ready answers for the site's files"
-            );
-            running.ready.paths += answers.paths();
-            running.ready.answers += answers.answers();
-            running.ready.bytes += bytes;
-            running.ready.millis += millis;
-            site.answers.store(Some(Arc::new(answers)));
-        } else {
-            tracing::info!(
-                port,
-                hosts = ?site.hosts,
-                "no ready answers: the site's routes look at more than the path"
-            );
-        }
+        prepare_answers(port, site, tls.is_some(), &mut running.ready);
     }
     running.admissions.push(admission.clone());
     let (listeners, refused) = bind_tcp(port, &limits, workers)?;
@@ -383,9 +560,11 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc
 
     let mut acceptor = None;
     let mut quic_resolver = None;
+    let mut port_resolver = None;
     if let Some(specs) = tls {
         let resolver = Arc::new(CertResolver::new(specs, &tls::provider())?);
         tls::watch(resolver.clone());
+        port_resolver = Some(resolver.clone());
         let mut alpn: Vec<&[u8]> = Vec::new();
         if protocols.h2 {
             alpn.push(b"h2");
@@ -401,10 +580,12 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc
     }
     let state_tls = acceptor.is_some();
     let mut state = ServerState {
-        sites,
-        trusted: trusted_proxies,
-        strict: trusted_strict,
-        client_ip_headers,
+        routing: ArcSwap::from_pointee(Routing {
+            sites,
+            trusted: trusted_proxies,
+            strict: trusted_strict,
+            client_ip_headers,
+        }),
         tls: state_tls,
         alt_svc: None,
     };
@@ -497,7 +678,12 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<Arc
             .context("cannot start a connection thread")?;
     }
     running.bound.push((port, tcp_addr, quic_addr));
-    Ok(state)
+    running.ports.push(Port {
+        shape,
+        state,
+        resolver: port_resolver,
+    });
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -625,14 +811,12 @@ async fn serve_connection<I, S>(
 mod tests {
     use super::*;
 
-    fn state(strict: bool) -> ServerState {
-        ServerState {
+    fn routing(strict: bool) -> Routing {
+        Routing {
             sites: Vec::new(),
             trusted: vec!["10.0.0.0/8".parse().unwrap(), "172.16.0.0/12".parse().unwrap()],
             strict,
             client_ip_headers: vec![HeaderName::from_static("x-forwarded-for")],
-            tls: false,
-            alt_svc: None,
         }
     }
 
@@ -646,17 +830,17 @@ mod tests {
         );
         let peer: IpAddr = "172.18.0.3".parse().unwrap();
         assert_eq!(
-            state(true).client_ip(&headers, peer),
+            routing(true).client_ip(&headers, peer),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
         // Caddy's default: the left-most, whatever the client wrote there.
         assert_eq!(
-            state(false).client_ip(&headers, peer),
+            routing(false).client_ip(&headers, peer),
             "6.6.6.6".parse::<IpAddr>().unwrap()
         );
         // Every entry a proxy: the peer.
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.9"));
-        assert_eq!(state(true).client_ip(&headers, peer), peer);
+        assert_eq!(routing(true).client_ip(&headers, peer), peer);
     }
 
     #[cfg(unix)]

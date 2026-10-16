@@ -11,6 +11,7 @@ use crate::files::FileStore;
 use crate::server::ServerState;
 use rustc_hash::FxHashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -81,23 +82,45 @@ impl Watch {
     }
 }
 
-/// Starts the thread that keeps `stores` up to date for the servers' sites; it ends when the
-/// servers are gone. `max_memory`: what all the stores may take together.
-pub(crate) fn start(watch: Watch, stores: &[Arc<FileStore>], states: &[Arc<ServerState>], max_memory: u64) {
-    if !watch.is_on() || stores.is_empty() {
-        return;
-    }
-    let stores: Vec<Weak<FileStore>> = stores.iter().map(Arc::downgrade).collect();
-    let states: Vec<Weak<ServerState>> = states.iter().map(Arc::downgrade).collect();
-    let spawned = std::thread::Builder::new()
-        .name("web-watch".into())
-        .spawn(move || run(watch, &stores, &states, max_memory));
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "cannot start watching the site files; they stay as loaded");
+/// The thread that keeps the stores up to date; `stop` ends it (a reload starts another one for
+/// the new configuration's stores).
+pub(crate) struct Watcher {
+    stop: Arc<AtomicBool>,
+}
+
+impl Watcher {
+    /// Ends the thread at its next look (within `ALIVE`); a rescan under way finishes first.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
     }
 }
 
-fn run(watch: Watch, stores: &[Weak<FileStore>], states: &[Weak<ServerState>], max_memory: u64) {
+/// Starts the thread that keeps `stores` up to date for the servers' sites; it ends when the
+/// servers are gone, or when stopped. `max_memory`: what all the stores may take together.
+pub(crate) fn start(
+    watch: Watch,
+    stores: &[Arc<FileStore>],
+    states: &[Arc<ServerState>],
+    max_memory: u64,
+) -> Option<Watcher> {
+    if !watch.is_on() || stores.is_empty() {
+        return None;
+    }
+    let stores: Vec<Weak<FileStore>> = stores.iter().map(Arc::downgrade).collect();
+    let states: Vec<Weak<ServerState>> = states.iter().map(Arc::downgrade).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("web-watch".into())
+        .spawn(move || run(watch, &stores, &states, max_memory, &stopped));
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "cannot start watching the site files; they stay as loaded");
+        return None;
+    }
+    Some(Watcher { stop })
+}
+
+fn run(watch: Watch, stores: &[Weak<FileStore>], states: &[Weak<ServerState>], max_memory: u64, stop: &AtomicBool) {
     let mut inotify: Option<Inotify> = None;
     let mut polled: Vec<usize> = Vec::new();
     for (i, store) in stores.iter().enumerate() {
@@ -146,7 +169,7 @@ fn run(watch: Watch, stores: &[Weak<FileStore>], states: &[Weak<ServerState>], m
             due.extend(again_stores.drain());
             again = None;
         }
-        if states.iter().all(|state| state.strong_count() == 0) {
+        if stop.load(Ordering::Acquire) || states.iter().all(|state| state.strong_count() == 0) {
             return;
         }
         if due.is_empty() {
@@ -252,7 +275,8 @@ fn sites_reading(
     mut each: impl FnMut(&ServerState, &crate::config::Site),
 ) {
     for state in states.iter().filter_map(Weak::upgrade) {
-        for site in state.sites() {
+        let routing = state.routing();
+        for site in routing.sites() {
             let mut stores = Vec::new();
             crate::memo::collect_stores(&site.routes, &mut stores);
             if stores.iter().any(|s| changed.iter().any(|c| Arc::ptr_eq(s, c))) {

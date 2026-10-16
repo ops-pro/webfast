@@ -4,7 +4,9 @@
 # below 1024 and little else.
 #
 #   cp webfast.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now webfast
-#   systemctl restart webfast     # after changing the Caddyfile (the site's files are picked up by themselves)
+#   systemctl reload webfast      # after changing the Caddyfile: checked, then put in place (SIGHUP)
+#                                 # without dropping a connection; the site's files are picked up
+#                                 # by themselves
 
 [Unit]
 Description=webfast web server
@@ -15,6 +17,9 @@ Wants=network-online.target
 EnvironmentFile=-/etc/webfast/environment
 ExecStartPre=/usr/local/bin/webfast validate --config /etc/webfast/Caddyfile
 ExecStart=/usr/local/bin/webfast run --config /etc/webfast/Caddyfile
+# A Caddyfile that does not validate stops the reload here; the running configuration stays.
+ExecReload=/usr/local/bin/webfast validate --config /etc/webfast/Caddyfile
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 # SIGTERM: open requests finish within the Caddyfile's grace_period (30 s).
 KillSignal=SIGTERM

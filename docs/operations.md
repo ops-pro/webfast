@@ -13,6 +13,32 @@ SIGTERM or SIGINT stop it gracefully: no new connections, open ones are asked to
 and HTTP/3: GOAWAY), WebSocket tunnels are closed, and whatever is still open after
 `grace_period` (30 s) is closed.
 
+## Reloading
+
+SIGHUP reads the Caddyfile again and puts it in place without dropping a connection:
+
+```bash
+kill -HUP "$(pidof webfast)"
+docker kill --signal HUP web
+systemctl reload webfast          # recipes/systemd: validates first, then sends SIGHUP
+```
+
+- Each port's sites, `trusted_proxies`, `client_ip_headers` and `grace_period` are replaced whole;
+  the next request is answered by the new configuration, also on a connection that stays open,
+  and a request under way finishes with the one it started with. The certificates are read again,
+  and the ready answers are worked out for the new sites before anything changes.
+- Site roots that stay are taken over as they are, not read again (with `WEB_FILES_WATCH` on they
+  are looked at again at once, as at startup); new roots are loaded, and what all of them take
+  must fit `WEB_MAX_MEMORY`.
+- What only a restart can change is refused: other ports, TLS on or off on a port, `protocols`,
+  `timeouts`, and the `WEB_*` variables (read at startup). The `debug` option takes effect on a
+  restart.
+- A reload that fails — a syntax error, a root that is missing, a certificate that cannot be read,
+  one of the above — changes nothing: the log says `configuration not reloaded; the running one
+  stays` with the reason. A reload that succeeds says `configuration reloaded`.
+- With `WEB_FILES_WATCH=off` a root is held in one buffer for the life of the process: a root that
+  a reload drops keeps its memory until a restart.
+
 ## The Docker image
 
 [`Dockerfile`](../Dockerfile) builds webfast with profile-guided optimisation (`--build-arg

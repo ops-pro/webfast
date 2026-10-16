@@ -446,17 +446,19 @@ pub enum Value {
 }
 
 impl Value {
-    /// A value without placeholders is checked, then kept as a `'static` string for the life of the
-    /// process (the configuration is never reloaded), so cloning it costs no reference count.
+    /// A value without placeholders is checked, then kept as an interned `'static` string (once
+    /// however often the configuration is reloaded), so cloning it costs no reference count. One
+    /// with bytes outside visible ASCII (obs-text) cannot be `'static` and is kept as it is.
     pub fn new(template: Template) -> Result<Value, String> {
         match template.as_static() {
             Some(text) => {
-                if HeaderValue::from_str(&text).is_err() {
+                let Ok(value) = HeaderValue::from_str(&text) else {
                     return Err(format!("invalid header value {text:?}"));
+                };
+                if text.bytes().all(|b| b == b'\t' || (32..127).contains(&b)) {
+                    return Ok(Value::Static(HeaderValue::from_static(crate::files::intern(&text))));
                 }
-                Ok(Value::Static(HeaderValue::from_static(Box::leak(
-                    text.into_boxed_str(),
-                ))))
+                Ok(Value::Static(value))
             }
             None => Ok(Value::Dynamic(template)),
         }
