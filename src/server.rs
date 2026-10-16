@@ -10,7 +10,7 @@ use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ServerConfig, Site};
 use crate::guard::{Activity, Admission, Place, Tracked};
-use crate::handler::{ConnInfo, Ctx, Next, hostport_of, strip_port};
+use crate::handler::{ConnInfo, Ctx, Failed, Next, hostport_of, strip_port};
 use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
@@ -147,8 +147,17 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
     let mut response = match ready {
         Some(response) => response,
         None => {
-            let ctx = Ctx::new(conn, parts, body, client_ip);
-            Next::start(site.routes.clone()).run(ctx).await
+            // With `handle_errors`, the request as sent is kept for them.
+            let original = site.errors.as_ref().map(|_| request_head(&parts));
+            let ctx = Ctx::new(conn.clone(), parts, body, client_ip);
+            let response = Next::start(site.routes.clone()).run(ctx).await;
+            match (&site.errors, original, response.extensions().get::<Failed>()) {
+                (Some(errors), Some(original), Some(Failed(error))) => {
+                    let error = error.clone();
+                    crate::handler::handle_error(errors, conn, original, client_ip, error, response).await
+                }
+                _ => response,
+            }
         }
     };
     common_headers(&state, version, &mut response);
@@ -160,6 +169,17 @@ pub async fn handle(state: Arc<ServerState>, conn: Arc<ConnInfo>, request: Reque
         }
         _ => response,
     }
+}
+
+/// A copy of a request head without its extensions (the error routes get no upgrade, no ready
+/// answer's marks).
+fn request_head(parts: &http::request::Parts) -> http::request::Parts {
+    let (mut head, ()) = Request::new(()).into_parts();
+    head.method = parts.method.clone();
+    head.uri = parts.uri.clone();
+    head.version = parts.version;
+    head.headers = parts.headers.clone();
+    head
 }
 
 /// The request with its body under the stall limit: a client that stops sending it for `stall`

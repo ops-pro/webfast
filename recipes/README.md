@@ -6,7 +6,7 @@ served and asked a few requests, so they stay valid as webfast changes.
 
 | Recipe                       | For                                                                                               |
 | ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| [static-site](static-site)   | a site built ahead of time: clean URLs, precompressed siblings, long caching for hashed assets    |
+| [static-site](static-site)   | a site built ahead of time: clean URLs, precompressed siblings, hashed assets cached, 404.html    |
 | [spa](spa)                   | a single-page app: its files, and `index.html` for every other path                               |
 | [app-behind](app-behind)     | the site in front of an application (`/api`, and whatever is not a file), with docker-compose.yml |
 | [behind-proxy](behind-proxy) | behind nginx, Traefik or a load balancer: trusted proxies, the client's address; nginx.conf       |

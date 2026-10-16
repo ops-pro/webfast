@@ -5,6 +5,11 @@
 - WebSocket through `reverse_proxy`: a `Connection: upgrade` handshake over HTTP/1.1 goes to the
   upstream, and its 101 joins the two connections into a tunnel. Tunnels count against the
   connection limits and close when the server stops.
+- `handle_errors [<status codes>]` and `error`: error pages, as in Caddy. A failed request
+  (file_server's 404 and 405, the proxy's 502 and 504, `error`) is answered by the site's error
+  routes, with `{err.status_code}`, `{err.status_text}` and `{err.message}`; checked against Caddy
+  by a second compat scenario (`SCENARIO=errors`). The static-site recipe serves the build's
+  404.html.
 
 ## 0.1.0 — 2026-10-15
 

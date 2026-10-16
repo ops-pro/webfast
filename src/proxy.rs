@@ -226,7 +226,7 @@ impl ReverseProxy {
                 }
                 ctx.respond_appending(Response::from_parts(parts, boxed(incoming)))
             }
-            Err(status) => ctx.status(status),
+            Err(status) => ctx.fail(status, None),
         }
     }
 
@@ -284,7 +284,7 @@ impl ReverseProxy {
             Ok(response) => response,
             Err((status, error)) => {
                 tracing::warn!(upstream = %upstream, %error, "upstream WebSocket handshake failed");
-                return ctx.status(status);
+                return ctx.fail(status, None);
             }
         };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {

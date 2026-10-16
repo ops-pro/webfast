@@ -1,20 +1,42 @@
 // Differential check: sends the same requests to Caddy and to webfast (same Caddyfile, same site)
 // and reports every difference in status, headers and (decoded) body.
-//   node compare.mjs http://caddy:8080 http://ours:8080
-// Expected differences are listed, not failed: ETag values (ours hash the content), Last-Modified
-// (ours have none), Via on proxied responses (Caddy adds one), and the compressed bytes of on-the-fly
-// encoding (different compressors; the decoded bodies must match).
+//   node compare.mjs http://caddy:8080 http://ours:8080 [sample|errors]
+// The scenario picks the requests: `sample` for sample/Caddyfile, `errors` for
+// compat/errors.Caddyfile. Expected differences are listed, not failed: ETag values (ours hash the
+// content), Last-Modified (ours have none), Via on proxied responses (Caddy adds one), the
+// compressed bytes of on-the-fly encoding (different compressors; the decoded bodies must match),
+// and deferred site headers on failed requests (ours keep them).
 import http from 'node:http';
 import zlib from 'node:zlib';
 
-const [caddyBase, oursBase] = process.argv.slice(2);
-if (!caddyBase || !oursBase) {
-  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url>');
+const [caddyBase, oursBase, scenario = 'sample'] = process.argv.slice(2);
+if (!caddyBase || !oursBase || !['sample', 'errors'].includes(scenario)) {
+  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url> [sample|errors]');
   process.exit(2);
 }
 
 const BROWSER = 'gzip, deflate, br, zstd';
-const cases = [
+const errorCases = [
+  ['GET', '/healthz'],
+  ['GET', '/en/'],
+  ['GET', '/nope'],
+  ['GET', '/nope', { 'accept-encoding': BROWSER }],
+  ['GET', '/nope', { 'accept-encoding': 'gzip' }],
+  ['HEAD', '/nope'],
+  ['POST', '/nope'],
+  ['GET', '/moved'],
+  ['GET', '/en/missing.html'],
+  ['GET', '/gone/x'],
+  ['GET', '/private/x'],
+  ['GET', '/teapot'],
+  ['GET', '/boom'],
+  ['GET', '/down/x?q=1'],
+  ['POST', '/down/y'],
+  ['POST', '/en/contact.html'],
+  ['DELETE', '/sw.js'],
+  ['GET', '/api/forms/x'],
+];
+const sampleCases = [
   ['GET', '/healthz'],
   ['GET', '/_internal/notes.txt'],
   ['GET', '/.git/config'],
@@ -87,6 +109,7 @@ const cases = [
   ['GET', '/stream/card'],
   ['GET', '/missing'],
 ];
+const cases = scenario === 'errors' ? errorCases : sampleCases;
 
 function request(base, method, path, headers = {}, body) {
   const url = new URL(base);
@@ -152,8 +175,9 @@ function normalizeBody(text, clientAcceptEncoding) {
 }
 
 const KNOWN = new Set(['date', 'etag', 'last-modified', 'via']);
-// Caddy skips deferred `header` operations (here: the site's security headers and `-Server`) when a
-// handler returns an error such as file_server's 405; webfast keeps them.
+// Caddy skips deferred `header` operations (here: the site's security headers and `-Server`, or
+// X-Deferred) when a handler returns an error such as file_server's 405, also on the page its
+// handle_errors routes answer with; webfast keeps them.
 const DEFERRED_ON_ERRORS = new Set([
   'content-security-policy',
   'cross-origin-opener-policy',
@@ -162,9 +186,12 @@ const DEFERRED_ON_ERRORS = new Set([
   'server',
   'strict-transport-security',
   'x-content-type-options',
+  'x-deferred',
   'x-dns-prefetch-control',
   'x-frame-options',
 ]);
+// The statuses of failed requests in each scenario (handle_errors may answer with another).
+const FAILED = (status) => status === 405 || (scenario === 'errors' && status >= 400);
 
 let failures = 0;
 const known = new Map();
@@ -186,11 +213,9 @@ for (const [method, path, headers, body] of cases) {
     const va = norm((a.headers[name] ?? []).join(' | '));
     const vb = norm((b.headers[name] ?? []).join(' | '));
     if (va === vb) continue;
-    if (a.status === 405 && b.status === 405 && DEFERRED_ON_ERRORS.has(name)) {
-      known.set(
-        '405: site headers on handler errors (ours keep them)',
-        (known.get('405: site headers on handler errors (ours keep them)') ?? 0) + 1,
-      );
+    if (a.status === b.status && FAILED(a.status) && DEFERRED_ON_ERRORS.has(name)) {
+      const kind = 'deferred site headers on failed requests (ours keep them)';
+      known.set(kind, (known.get(kind) ?? 0) + 1);
       continue;
     }
     if (name === 'content-length' && sameBody && !a.headers['content-encoding']) {
@@ -238,11 +263,12 @@ for (const [method, path, headers, body] of cases) {
 }
 
 // Conditional requests with each server's own validator.
-for (const [path, enc] of [
+const conditional = scenario === 'sample' ? [
   ['/en/', undefined],
   ['/en/', 'br'],
   ['/assets/main-Sample.css', BROWSER],
-]) {
+] : [];
+for (const [path, enc] of conditional) {
   const headers = enc ? { 'accept-encoding': enc } : {};
   for (const [who, base] of [
     ['caddy', caddyBase],

@@ -38,12 +38,19 @@ enum Var {
     OrigUri,
     OrigPath,
     Header(HeaderName),
-    Regexp { name: String, group: String },
+    Regexp {
+        name: String,
+        group: String,
+    },
     FileRelative,
     FileAbsolute,
     FileType,
     FileRemainder,
     Env(String),
+    /// In `handle_errors` routes: the failure's status, its text, its message.
+    ErrorStatusCode,
+    ErrorStatusText,
+    ErrorMessage,
 }
 
 impl Template {
@@ -187,6 +194,8 @@ fn var_of(key: &str) -> Option<Var> {
                 format!("http.regexp.{rest}")
             } else if let Some(rest) = other.strip_prefix("file_match.") {
                 format!("http.matchers.file.{rest}")
+            } else if let Some(rest) = other.strip_prefix("err.") {
+                format!("http.error.{rest}")
             } else {
                 other.to_string()
             }
@@ -212,6 +221,9 @@ fn var_of(key: &str) -> Option<Var> {
         "http.matchers.file.absolute" => Var::FileAbsolute,
         "http.matchers.file.type" => Var::FileType,
         "http.matchers.file.remainder" => Var::FileRemainder,
+        "http.error.status_code" => Var::ErrorStatusCode,
+        "http.error.status_text" => Var::ErrorStatusText,
+        "http.error.message" => Var::ErrorMessage,
         other => {
             if let Some(name) = other.strip_prefix("http.request.header.") {
                 Var::Header(HeaderName::from_bytes(name.as_bytes()).ok()?)
@@ -282,6 +294,18 @@ fn value(var: &Var, ctx: &Ctx) -> String {
         Var::FileType => ctx.file_match.as_ref().map(|m| m.kind.to_string()).unwrap_or_default(),
         Var::FileRemainder => String::new(),
         Var::Env(name) => std::env::var(name).unwrap_or_default(),
+        Var::ErrorStatusCode => ctx
+            .error
+            .as_ref()
+            .map(|e| e.status.as_str().to_string())
+            .unwrap_or_default(),
+        Var::ErrorStatusText => ctx
+            .error
+            .as_ref()
+            .and_then(|e| e.status.canonical_reason())
+            .unwrap_or_default()
+            .to_string(),
+        Var::ErrorMessage => ctx.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
     }
 }
 
@@ -303,5 +327,7 @@ mod tests {
         assert_eq!(Template::parse("ok").unwrap().as_static().unwrap(), "ok");
         assert!(Template::parse("{nope}").unwrap_err().contains("unknown placeholder"));
         assert!(Template::parse("{re.onlyname}").is_err());
+        assert!(Template::parse("{err.status_code} {http.error.status_text} {err.message}").is_ok());
+        assert!(Template::parse("{err.trace}").is_err());
     }
 }

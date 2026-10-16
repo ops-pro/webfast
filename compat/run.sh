@@ -4,6 +4,7 @@
 # the same ~80 requests to both and reports every difference that is not an expected one.
 #
 #   WEBFAST_BIN=…/webfast TRAIN_BIN=…/examples/train compat/run.sh
+#   SCENARIO=errors … compat/run.sh      # handle_errors and error: compat/errors.Caddyfile
 #
 # The site and configuration: scripts/volumes.sh (SITE_DIR, CADDYFILE, HEADERS); compare.mjs's
 # requests are written for the sample site. Images can be overridden: CADDY_IMAGE (caddy:2-alpine),
@@ -11,6 +12,15 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
+scenario=${SCENARIO:-sample}
+case $scenario in
+  sample) ;;
+  errors) export CADDYFILE=${CADDYFILE:-$here/errors.Caddyfile} ;;
+  *)
+    echo "SCENARIO: sample or errors" >&2
+    exit 2
+    ;;
+esac
 # shellcheck source=../scripts/volumes.sh
 . "$here/../scripts/volumes.sh"
 bin=${WEBFAST_BIN:?set WEBFAST_BIN to a Linux webfast binary}
@@ -55,7 +65,7 @@ for _ in $(seq 1 50); do
 done
 
 docker run --rm --network "$net" -v "$here:/compat:ro" --entrypoint node "$node_image" /compat/compare.mjs \
-  http://compat-caddy:8080 http://compat-ours:8080 || status=$?
+  http://compat-caddy:8080 http://compat-ours:8080 "$scenario" || status=$?
 if [ "${status:-0}" != 0 ]; then
   echo "--- webfast log (last 20 lines)"
   docker logs --tail 20 compat-ours 2>&1 || true

@@ -41,6 +41,9 @@ pub enum Matcher {
     ClientIp(Vec<IpNet>),
     RemoteIp(Vec<IpNet>),
     Protocol(String),
+    /// `handle_errors <codes>`: the failure being handled has one of these statuses (inclusive
+    /// ranges; `4xx` is 400–499).
+    ErrorStatus(Vec<(u16, u16)>),
 }
 
 impl MatcherSet {
@@ -88,7 +91,8 @@ impl Matcher {
             | Matcher::Header(_)
             | Matcher::ClientIp(_)
             | Matcher::RemoteIp(_)
-            | Matcher::Protocol(_) => false,
+            | Matcher::Protocol(_)
+            | Matcher::ErrorStatus(_) => false,
         }
     }
 
@@ -156,6 +160,10 @@ impl Matcher {
                 "http/3" | "http/3+" => ctx.req.version == http::Version::HTTP_3,
                 _ => false,
             },
+            Matcher::ErrorStatus(ranges) => ctx.error.as_ref().is_some_and(|e| {
+                let status = e.status.as_u16();
+                ranges.iter().any(|(low, high)| (*low..=*high).contains(&status))
+            }),
         }
     }
 }

@@ -421,6 +421,7 @@ fn decided_by_path(routes: &[Route]) -> bool {
                 | Handler::Files(_)
                 | Handler::Redir { .. }
                 | Handler::Respond { .. }
+                | Handler::Error { .. }
                 | Handler::Proxy(_) => true,
             }
     })

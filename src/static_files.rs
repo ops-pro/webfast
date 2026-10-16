@@ -43,7 +43,7 @@ impl Default for FileServer {
 impl FileServer {
     pub async fn serve(&self, mut ctx: Ctx, next: Next) -> Response<Body> {
         let Some(store) = self.root.clone().or_else(|| ctx.root.clone()) else {
-            return ctx.status(StatusCode::NOT_FOUND);
+            return ctx.fail(StatusCode::NOT_FOUND, Some("filesystem not found".into()));
         };
         // One buffer for the file, directory and index lookups.
         let mut key = if needs_clean(ctx.path()) {
@@ -86,7 +86,7 @@ impl FileServer {
             if self.pass_thru {
                 return next.run(ctx).await;
             }
-            return ctx.status(StatusCode::NOT_FOUND);
+            return ctx.fail(StatusCode::NOT_FOUND, None);
         };
 
         if self.canonical_uris {
@@ -147,23 +147,30 @@ impl FileServer {
         let etag = chosen.etag.clone();
         let length = chosen.length.clone();
 
+        // In `handle_errors` routes the file is the error page: sent whole, with the failure's
+        // status, whatever the method, preconditions and ranges (Caddy keeps the status but lets
+        // them through: an error page cut to a range, or a bare 404 for a matching ETag).
+        let error_status = ctx.error.as_ref().map(|e| e.status);
         let method = ctx.req.method.clone();
-        if method != Method::GET && method != Method::HEAD {
+        if error_status.is_none() && method != Method::GET && method != Method::HEAD {
             response
                 .headers_mut()
                 .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
             *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-            return ctx.respond(response);
+            let response = ctx.respond(response);
+            return ctx.failed(response, None);
         }
 
         // Preconditions (RFC 9110 §13.2.2, as Go's http.ServeContent orders them). A 304 carries the
         // ETag but not Content-Type and Content-Encoding, so it is answered before they are set.
         let request = &ctx.req.headers;
-        let if_match_failed = request
-            .get(IF_MATCH)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|list| !etag_list_matches(list, &etag, true));
+        let if_match_failed = error_status.is_none()
+            && request
+                .get(IF_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|list| !etag_list_matches(list, &etag, true));
         if !if_match_failed
+            && error_status.is_none()
             && request
                 .get(IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok())
@@ -193,14 +200,15 @@ impl FileServer {
 
         // Ranges (Go's http.ServeContent: of the representation sent, also a compressed one).
         let total = chosen.len() as u64;
-        let mut status = StatusCode::OK;
-        let range_allowed = match request.get(IF_RANGE).and_then(|v| v.to_str().ok()) {
-            Some(if_range) => {
-                let if_range = if_range.trim();
-                if_range.starts_with('"') && if_range == etag.to_str().unwrap_or_default()
-            }
-            None => true,
-        };
+        let mut status = error_status.unwrap_or(StatusCode::OK);
+        let range_allowed = error_status.is_none()
+            && match request.get(IF_RANGE).and_then(|v| v.to_str().ok()) {
+                Some(if_range) => {
+                    let if_range = if_range.trim();
+                    if_range.starts_with('"') && if_range == etag.to_str().unwrap_or_default()
+                }
+                None => true,
+            };
         let range_header = request
             .get(RANGE)
             .and_then(|v| v.to_str().ok())

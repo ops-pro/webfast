@@ -4,9 +4,10 @@
 //!   global options  auto_https off|disable_redirects|disable_certs, admin off, http_port, https_port,
 //!                   grace_period, debug, order, servers { trusted_proxies static …,
 //!                   trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }
-//!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>, log
+//!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>, log,
+//!                   handle_errors [<status codes>]
 //!   directives      root, header, request_header, redir, rewrite, try_files, encode, route, handle,
-//!                   handle_path, respond, reverse_proxy, file_server
+//!                   handle_path, error, respond, reverse_proxy, file_server
 //!   matchers        path, path_regexp, file, not, host, method, header, client_ip, remote_ip, protocol
 //!
 //! Directives outside `route` blocks are sorted like Caddy does: by its directive order, then — for
@@ -135,6 +136,9 @@ pub struct Site {
     /// Lowercase host patterns; empty: any host.
     pub hosts: Vec<String>,
     pub routes: Arc<[Route]>,
+    /// `handle_errors`: one route per block, those with status codes first (src/handler.rs
+    /// `handle_error`); `None` without any.
+    pub errors: Option<Arc<[Route]>>,
     pub log: Option<Arc<AccessLog>>,
     /// Ready answers for its files, worked out when the server starts and again when its files
     /// change (src/memo.rs, src/watch.rs); empty meanwhile: requests take the chain.
@@ -274,8 +278,10 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         let mut tls: Option<(PathBuf, PathBuf)> = None;
         let mut log: Option<Arc<AccessLog>> = None;
         let mut body = Vec::new();
+        let mut error_blocks = Vec::new();
         for line in &block.body {
             match line.name() {
+                "handle_errors" => error_blocks.push(line),
                 "tls" => {
                     if line.block.is_some() || line.tokens.len() != 3 {
                         bail!(at_err(
@@ -296,7 +302,9 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
             has_root: false,
             needs_root: None,
         };
-        let routes = compile_block(&body, None, true, &mut cx, &mut site_cx)?;
+        let scope = scope_of(&body, None, &mut cx, &mut site_cx)?;
+        let routes = compile_lines(&body, &scope, true, &mut cx, &mut site_cx)?;
+        let errors = compile_error_blocks(&error_blocks, &scope, &mut cx, &mut site_cx)?;
         if let Some(at) = site_cx.needs_root
             && !site_cx.has_root
         {
@@ -350,6 +358,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                 site: Site {
                     hosts,
                     routes: routes.clone(),
+                    errors: errors.clone(),
                     log: log.clone(),
                     answers: arc_swap::ArcSwapOption::empty(),
                 },
@@ -805,6 +814,59 @@ fn compile_block(
     cx: &mut Cx,
     site: &mut SiteCx,
 ) -> Result<Vec<Route>> {
+    let scope = scope_of(lines, parent, cx, site)?;
+    compile_lines(lines, &scope, sort, cx, site)
+}
+
+/// A site's `handle_errors [<status codes>] { … }` blocks: each one a route, matched by the failure's
+/// status (`404`, or a class such as `5xx`; none: any), its block sorted like the site's. As Caddy
+/// does, the blocks with status codes come first and the others last, and a block that does not
+/// answer lets the next one that matches run.
+fn compile_error_blocks(
+    lines: &[&Line],
+    scope: &Scope,
+    cx: &mut Cx,
+    site: &mut SiteCx,
+) -> Result<Option<Arc<[Route]>>> {
+    let mut routes = Vec::new();
+    for line in lines {
+        let mut ranges = Vec::new();
+        for t in &line.tokens[1..] {
+            let text = t.text.as_str();
+            let class = text.strip_suffix("xx").filter(|d| d.len() == 1);
+            let range = match class {
+                Some(digit) => digit.parse::<u16>().ok().map(|d| (d * 100, d * 100 + 99)),
+                None if text.len() == 3 => text.parse::<u16>().ok().map(|code| (code, code)),
+                None => None,
+            };
+            match range {
+                Some(range) if (100..=599).contains(&range.0) => ranges.push(range),
+                _ => bail!(token_err(
+                    t,
+                    "handle_errors: a status code (404) or class (4xx) is expected"
+                )),
+            }
+        }
+        let block = line.block.as_deref().unwrap_or(&[]);
+        let inner = compile_block(block, Some(scope), true, cx, site)?;
+        let matcher = (!ranges.is_empty()).then(|| MatcherSet {
+            matchers: vec![Matcher::ErrorStatus(ranges)],
+        });
+        routes.push(Route {
+            matcher,
+            group: None,
+            handler: Handler::Subroute(inner.into()),
+        });
+    }
+    if routes.is_empty() {
+        return Ok(None);
+    }
+    routes.sort_by_key(|route| route.matcher.is_none());
+    Ok(Some(routes.into()))
+}
+
+/// The named matchers a block defines, over its parent's.
+fn scope_of<'p>(lines: &[Line], parent: Option<&'p Scope<'p>>, cx: &mut Cx, site: &mut SiteCx) -> Result<Scope<'p>> {
     let mut scope = Scope {
         defs: HashMap::new(),
         parent,
@@ -820,9 +882,14 @@ fn compile_block(
         let set = parse_matcher_def(line, &name, cx, site)?;
         scope.defs.insert(name, set);
     }
+    Ok(scope)
+}
+
+/// A block's directives as routes (sorted like Caddy unless it is a `route` block).
+fn compile_lines(lines: &[Line], scope: &Scope, sort: bool, cx: &mut Cx, site: &mut SiteCx) -> Result<Vec<Route>> {
     let mut entries = Vec::new();
     for line in lines.iter().filter(|l| !l.name().starts_with('@')) {
-        entries.extend(compile_directive(line, &scope, cx, site)?);
+        entries.extend(compile_directive(line, scope, cx, site)?);
     }
     if sort {
         let positions: HashMap<&str, usize> = cx
@@ -1172,16 +1239,16 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
                     .flatten()
                     .and_then(|c| StatusCode::from_u16(c).ok())
             };
-            let (mut body, mut status) = (Template::default(), StatusCode::OK);
+            let (mut body, mut status) = (Template::default(), None);
             match args {
                 [] => {}
                 [one] => match status_of(one) {
-                    Some(code) => status = code,
+                    Some(code) => status = Some(code),
                     None => body = template(one)?,
                 },
                 [text, code] => {
                     body = template(text)?;
-                    status = status_of(code).ok_or_else(|| token_err(code, "respond: invalid status code"))?;
+                    status = Some(status_of(code).ok_or_else(|| token_err(code, "respond: invalid status code"))?);
                 }
                 _ => bail!(at_err(&line.at, "respond: `respond [<matcher>] [<body>] [<status>]`")),
             }
@@ -1194,6 +1261,41 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
                 }
             }
             Ok(vec![entry(name, matcher, Handler::Respond { status, body, close })])
+        }
+        "error" => {
+            let (matcher, start) = matcher_token(line, scope)?;
+            let args = &line.tokens[start..];
+            let usage = "error: `error [<matcher>] <status>|<message> [<status>]`";
+            let status_of = |t: &Token| -> Result<StatusCode> {
+                (t.text.len() == 3)
+                    .then(|| t.text.parse::<u16>().ok())
+                    .flatten()
+                    .filter(|c| (400..=599).contains(c))
+                    .and_then(|c| StatusCode::from_u16(c).ok())
+                    .ok_or_else(|| token_err(t, "error: the status must be 4xx or 5xx"))
+            };
+            let (mut message, mut status) = (None, StatusCode::INTERNAL_SERVER_ERROR);
+            match args {
+                // One argument: a status when it is three digits, else the message (Caddy).
+                [one] if one.text.len() == 3 && one.text.parse::<u16>().is_ok_and(|c| c > 0) => {
+                    status = status_of(one)?
+                }
+                [one] => message = Some(template(one)?),
+                [text, code] => {
+                    message = Some(template(text)?);
+                    status = status_of(code)?;
+                }
+                _ => bail!(at_err(&line.at, usage)),
+            }
+            for sub in line.block.as_deref().unwrap_or(&[]) {
+                match (sub.name(), &sub.tokens[1..]) {
+                    ("message", [text]) if message.is_none() && sub.block.is_none() => message = Some(template(text)?),
+                    ("message", _) => bail!(at_err(&sub.at, "error: one message (`message <text>`)")),
+                    (other, _) => bail!(at_err(&sub.at, format!("error: unsupported option {other:?}"))),
+                }
+            }
+            let message = message.unwrap_or_default();
+            Ok(vec![entry(name, matcher, Handler::Error { status, message })])
         }
         "reverse_proxy" => {
             let (matcher, start) = matcher_token(line, scope)?;
@@ -1240,7 +1342,7 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
             }
             Ok(vec![entry(name, matcher, Handler::Files(Arc::new(fs)))])
         }
-        "tls" | "log" | "bind" => bail!(at_err(
+        "tls" | "log" | "bind" | "handle_errors" => bail!(at_err(
             &line.at,
             format!("{name} is only allowed at the top of a site block")
         )),
@@ -1847,6 +1949,23 @@ mod tests {
     }
 
     #[test]
+    fn error_blocks_with_status_codes_come_first_and_see_the_site_matchers() {
+        let config = compile_text(
+            ":8080 {\n\t@api path /api/*\n\thandle_errors {\n\t\trespond @api \"api\"\n\t}\n\thandle_errors 404 5xx {\n\t\trespond \"x\"\n\t}\n\trespond 1\n}\n",
+        )
+        .unwrap();
+        let site = &config.servers[0].sites[0];
+        let errors = site.errors.as_ref().expect("error routes");
+        assert_eq!(errors.len(), 2);
+        let Some(MatcherSet { matchers }) = &errors[0].matcher else {
+            panic!("the block with status codes first")
+        };
+        assert!(matches!(&matchers[..], [Matcher::ErrorStatus(r)] if r == &[(404, 404), (500, 599)]));
+        assert!(errors[1].matcher.is_none(), "the catch-all last");
+        assert_eq!(names(&site.routes), ["respond"], "error blocks are not in the chain");
+    }
+
+    #[test]
     fn addresses_and_servers() {
         let config = compile_text("{\n\tservers {\n\t\tprotocols h1 h2c\n\t}\n}\na.example:8080, b.example:8080 {\n\trespond a\n}\n:8080 {\n\trespond any\n}\n:9090 {\n\trespond z\n}\n").unwrap();
         assert_eq!(config.servers.len(), 2);
@@ -1873,6 +1992,16 @@ mod tests {
             (":80 {\n\theader X\n}\n", "a value is required"),
             (":80 {\n\trespond {nope}\n}\n", "unknown placeholder"),
             (":80 {\n}\n:80 {\n}\n", "more than once"),
+            (
+                ":80 {\n\troute {\n\t\thandle_errors {\n\t\t}\n\t}\n}\n",
+                "only allowed at the top",
+            ),
+            (
+                ":80 {\n\thandle_errors 4x5 {\n\t}\n}\n",
+                "a status code (404) or class (4xx)",
+            ),
+            (":80 {\n\terror 200\n}\n", "4xx or 5xx"),
+            (":80 {\n\terror\n}\n", "error [<matcher>]"),
         ] {
             let err = compile_text(text).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(err.contains(message), "{text:?}: {err}");

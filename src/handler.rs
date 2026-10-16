@@ -11,6 +11,8 @@
 //!   own value for the same field wins. Deferred operations apply to the final response.
 //! - `handle` blocks of one level are mutually exclusive: after one ran, the others are skipped.
 //! - The end of the chain answers 200 with an empty body.
+//! - A handler that fails (Caddy: returns an error) answers with the bare status, marked `Failed`;
+//!   the site's `handle_errors` routes then get their turn (`handle_error`).
 
 use crate::body::{Body, empty, full};
 use crate::encode::{AcceptEncoding, Encode, Encoding};
@@ -68,6 +70,24 @@ enum Derived {
     Own(String),
 }
 
+/// A handler's failure, as Caddy's handlers return errors: `file_server`'s 404 and 405, the proxy's
+/// 502, 504 and 408, the `error` directive. The failed handler answers with the bare status, marked
+/// with this (`Failed`), and a site's `handle_errors` routes may answer instead (`handle_error`).
+#[derive(Debug)]
+pub struct HandlerError {
+    pub status: StatusCode,
+    /// `{err.message}`: what `error` was given; otherwise the status text (Caddy has the error's own
+    /// text where there is one, such as a proxy's network error).
+    pub message: String,
+    /// The site root the request had when it failed: the error routes start with it (in Caddy
+    /// `root` is a request variable, which they see).
+    pub root: Option<Arc<FileStore>>,
+}
+
+/// The mark on the response of a handler that failed.
+#[derive(Debug, Clone)]
+pub struct Failed(pub Arc<HandlerError>);
+
 /// One request on its way through the chain.
 pub struct Ctx {
     pub conn: Arc<ConnInfo>,
@@ -92,6 +112,8 @@ pub struct Ctx {
     pub pre_headers: HeaderMap,
     /// What deferred `header` and `encode` will do to the response, outermost first.
     hooks: Vec<Hook>,
+    /// In `handle_errors` routes: the failure they answer for.
+    pub error: Option<Arc<HandlerError>>,
 }
 
 /// A change to the response recorded on the way down the chain.
@@ -150,6 +172,7 @@ impl Ctx {
             file_match: None,
             pre_headers: HeaderMap::new(),
             hooks: Vec::new(),
+            error: None,
         }
     }
 
@@ -291,6 +314,66 @@ impl Ctx {
         *response.status_mut() = status;
         self.respond(response)
     }
+
+    /// A handler failed: its bare status, marked for `handle_errors` (`message`: see
+    /// `HandlerError`).
+    pub fn fail(&mut self, status: StatusCode, message: Option<String>) -> Response<Body> {
+        let response = self.status(status);
+        self.failed(response, message)
+    }
+
+    /// Marks a response as a handler's failure with its own status (and headers, such as a 405's
+    /// `Allow`, which an error page keeps).
+    pub fn failed(&self, mut response: Response<Body>, message: Option<String>) -> Response<Body> {
+        let status = response.status();
+        let message = message.unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
+        let root = self.root.clone();
+        response
+            .extensions_mut()
+            .insert(Failed(Arc::new(HandlerError { status, message, root })));
+        response
+    }
+}
+
+/// A failed request's second chance: the site's `handle_errors` routes run on the request as the
+/// client sent it (its method and URI before any rewrite, without its body), with the failure in
+/// `{err.*}`. As in Caddy: with no block for the status, or when the error routes fail too, the
+/// bare failure is the answer; the headers set before the failure (`header`, a 405's `Allow`) stay
+/// unless the page sets its own — Caddy keeps only those set without `defer`, ours keep all, as on
+/// a bare failure.
+pub async fn handle_error(
+    routes: &Arc<[Route]>,
+    conn: Arc<ConnInfo>,
+    request: http::request::Parts,
+    client_ip: IpAddr,
+    error: Arc<HandlerError>,
+    bare: Response<Body>,
+) -> Response<Body> {
+    let mut ctx = Ctx::new(conn, request, empty(), client_ip);
+    ctx.root = error.root.clone();
+    ctx.error = Some(error);
+    if !routes
+        .iter()
+        .any(|r| r.matcher.as_ref().is_none_or(|m| m.matches(&mut ctx)))
+    {
+        return bare;
+    }
+    let mut page = Next::start(routes.clone()).run(ctx).await;
+    if page.extensions().get::<Failed>().is_some() {
+        return bare;
+    }
+    let headers = page.headers_mut();
+    let mut current: Option<(HeaderName, bool)> = None;
+    for (name, value) in bare.into_parts().0.headers {
+        if let Some(name) = name {
+            let take = !headers.contains_key(&name);
+            current = Some((name, take));
+        }
+        if let Some((name, true)) = &current {
+            headers.append(name.clone(), value);
+        }
+    }
+    page
 }
 
 /// The Host header of a request head, or its URI authority (HTTP/2, HTTP/3).
@@ -544,9 +627,15 @@ pub enum Handler {
     Encode(Arc<Encode>),
     Subroute(Arc<[Route]>),
     Respond {
-        status: StatusCode,
+        /// `None`: 200, or in `handle_errors` routes the failure's status.
+        status: Option<StatusCode>,
         body: Template,
         close: bool,
+    },
+    /// `error`: the request fails with this status (src/handler.rs `HandlerError`).
+    Error {
+        status: StatusCode,
+        message: Template,
     },
     Proxy(Arc<ReverseProxy>),
     Files(Arc<FileServer>),
@@ -775,7 +864,9 @@ impl Handler {
             Handler::Respond { status, body, close } => {
                 let text = body.render(&ctx);
                 let mut response = Response::new(if text.is_empty() { empty() } else { full(text.clone()) });
-                *response.status_mut() = *status;
+                *response.status_mut() = status
+                    .or(ctx.error.as_ref().map(|e| e.status))
+                    .unwrap_or(StatusCode::OK);
                 if !text.is_empty() && !ctx.pre_headers.contains_key(CONTENT_TYPE) {
                     let trimmed = text.trim();
                     let json = trimmed.len() > 2
@@ -797,6 +888,10 @@ impl Handler {
                         .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
                 }
                 ctx.respond(response)
+            }
+            Handler::Error { status, message } => {
+                let message = message.render(&ctx);
+                ctx.fail(*status, Some(message))
             }
             // The proxy's future is large: boxed on its own, so the chain's stays small.
             Handler::Proxy(proxy) => Box::pin(proxy.serve(ctx)).await,

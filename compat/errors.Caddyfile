@@ -1,0 +1,51 @@
+# compat/'s second scenario (SCENARIO=errors compat/run.sh): handle_errors and error on the sample
+# site. Not a configuration to copy: it fails on purpose in every way a request can.
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	root * /srv
+	header X-Site errors
+	header {
+		X-Deferred 1
+		-Server
+		defer
+	}
+	respond /healthz "ok" 200
+
+	@private path /private/*
+	error @private "Private area" 403
+	error /teapot 418
+	error /boom "boom"
+	error /gone/* 410
+	rewrite /moved /nowhere
+	reverse_proxy /api/* app:8787
+	# Nothing listens on port 1: 502.
+	reverse_proxy /down/* app:1
+	file_server {
+		precompressed br zstd gzip
+	}
+
+	handle_errors 404 410 {
+		header X-Error-Page 1
+		rewrite * /en/contact.html
+		file_server {
+			precompressed br zstd gzip
+		}
+	}
+	handle_errors 403 {
+		header @private X-Private 1
+	}
+	handle_errors 418 {
+		respond "teapot {err.status_code} [{err.message}] {uri}" 451
+	}
+	# Not {err.message}: Caddy's names the network error.
+	handle_errors 5xx {
+		respond "{err.status_code} {err.status_text} {uri} {method}"
+	}
+	handle_errors {
+		respond "{http.error.status_code} {err.status_text} [{err.message}] {uri}"
+	}
+}

@@ -28,6 +28,7 @@ fn site() -> tempfile::TempDir {
     write("index.html", b"<!doctype html><title>Home</title><div id=app></div>");
     write("about.html", b"<!doctype html><title>About</title>");
     write("docs/index.html", b"<!doctype html><title>Docs</title>");
+    write("404.html", b"<!doctype html><title>Not found</title>");
     let js = b"console.log('the app');".repeat(40);
     write("assets/app-1a2b3c.js", &js);
     let mut br = Vec::new();
@@ -132,7 +133,10 @@ async fn the_static_site_recipe_serves_clean_urls_and_siblings() {
     assert_eq!(header(&headers, "content-encoding"), "br");
     assert_eq!(header(&headers, "cache-control"), "public, max-age=31536000, immutable");
 
-    assert_eq!(served.get("/missing", None).await.0, StatusCode::NOT_FOUND);
+    let (status, headers, body) = served.get("/missing", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(&body[..], b"<!doctype html><title>Not found</title>");
+    assert_eq!(header(&headers, "x-content-type-options"), "nosniff");
     served.running.shutdown(Duration::from_secs(1)).await;
 }
 

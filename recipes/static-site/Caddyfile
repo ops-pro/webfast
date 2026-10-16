@@ -1,7 +1,7 @@
 # A site built ahead of time (Astro, Hugo, Eleventy, Vite, …) served from /srv: clean URLs
 # (/about serves about.html, /about.html redirects to /about), the build's precompressed
 # .br/.zst/.gz siblings for browsers, the rest compressed on the fly, hashed assets cached for a
-# year, and a few security headers.
+# year, a few security headers, and the build's 404.html for paths it has no page for.
 {
 	auto_https off
 	admin off
@@ -25,6 +25,15 @@
 	try_files {path} {path}.html {path}/index.html
 	file_server {
 		precompressed br zstd gzip
+	}
+
+	# A path with no file: 404.html, with the 404 status. Without a 404.html, the bare 404.
+	handle_errors 404 {
+		encode zstd br gzip
+		rewrite * /404.html
+		file_server {
+			precompressed br zstd gzip
+		}
 	}
 
 	log {

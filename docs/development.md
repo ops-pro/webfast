@@ -28,6 +28,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/serve.rs`                                 | end to end, against real HTTP/1.1, HTTP/2 and HTTP/3 clients                                        |
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
 | `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
+| `tests/errors.rs`                                | `handle_errors` and `error`, as Caddy answers them                                                  |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -67,7 +68,9 @@ connection limits; oversized HTTP/3 header frames; both runtimes and their shutd
 picked up by inotify and by polling. `tests/recipes.rs` loads every `recipes/*/Caddyfile` (a new
 recipe has to be added to its list) and serves the static site and the SPA. `tests/websocket.rs`
 sends handshakes through to an upstream written by hand: the tunnel both ways, what the upstream
-is sent, answers other than 101, the connection limits and the shutdown.
+is sent, answers other than 101, the connection limits and the shutdown. `tests/errors.rs` fails
+requests in each way a handler can and checks the `handle_errors` answers against what Caddy 2.11
+answers to the same Caddyfile.
 
 ## The PGO build
 
@@ -98,6 +101,7 @@ cargo build --release --example train --example bench --example rtt
 
 ```bash
 WEBFAST_BIN=target/release/webfast TRAIN_BIN=target/release/examples/train compat/run.sh
+SCENARIO=errors WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh   # handle_errors and error
 ```
 
 Caddy (`caddy:2-alpine`) and webfast serve the same Caddyfile and site from Docker volumes, stub
@@ -105,8 +109,11 @@ upstreams (`compat/upstream.mjs`) play `app` and `stream`, and `compat/compare.m
 both — pages, precompressed files, ranges, conditional requests, redirects, path tricks, methods,
 proxying, SSE — comparing status, headers and decoded bodies. Expected differences
 (docs/configuration.md) are counted, not failed. `SITE_DIR`, `CADDYFILE` and `HEADERS` serve
-something else; the request list is written for the sample site. Stock Caddy has no Brotli
-encoder, so both get the Caddyfile without `br` in `encode`.
+something else; the request list is written for the sample site. `SCENARIO=errors` serves
+`compat/errors.Caddyfile` instead, a configuration that fails requests in every way it can
+(file_server's 404 and 405, `error`, an upstream that cannot be reached) and answers them with
+`handle_errors` blocks. Stock Caddy has no Brotli encoder, so both get the Caddyfile without `br`
+in `encode`.
 
 ## Benchmarks
 
@@ -129,5 +136,5 @@ iterations under `perf record -e cpu-clock`.
 ## Releasing
 
 1. Update `version` in Cargo.toml and the [changelog](../CHANGELOG.md).
-2. `scripts/check.sh`, and `compat/run.sh` with a release build.
+2. `scripts/check.sh`, and `compat/run.sh` (both scenarios) with a release build.
 3. Commit, tag `vX.Y.Z`, push the tag: CI builds and pushes the image (`:X.Y.Z` and `:latest`).

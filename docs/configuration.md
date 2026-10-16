@@ -11,16 +11,16 @@ Docker image starts with it.
 
 ## The subset
 
-| Kind           | Supported                                                                                                                                                                                                                                                         |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                       |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                  |
-| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`                                                                                           |
-| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `respond`, `reverse_proxy`, `file_server` |
-| Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                              |
-| reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`         |
-| file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                   |
-| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}` and their `http.*` long forms                  |
+| Kind           | Supported                                                                                                                                                                                                                                                                                                   |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                 |
+| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                                                            |
+| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                             |
+| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`                                  |
+| Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                        |
+| reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                   |
+| file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                             |
+| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms |
 
 Semantics follow Caddy: the directive order and path-specificity sorting outside `route`, mutually
 exclusive `handle` blocks, deferred `header` operations, `try_files` matching directories only for
@@ -37,15 +37,53 @@ any request, and when the upstream answers 101 the two connections are joined an
 until either side closes. Any other answer reaches the client as it is. Browsers open WebSocket
 over HTTP/1.1 (webfast does not offer it over HTTP/2, RFC 8441), so keep `h1` in `protocols`.
 
+### Error pages
+
+A handler that fails — `file_server` with no file (404) or asked with a method other than GET and
+HEAD (405), `reverse_proxy` with no answer (502, 504), `error` — answers with the bare status. The
+site's `handle_errors` blocks can answer instead, as in Caddy:
+
+```caddyfile
+error /drafts/* 403
+file_server
+
+handle_errors 404 410 {
+	rewrite * /404.html
+	file_server
+}
+handle_errors 5xx {
+	respond "{err.status_code} {err.status_text}"
+}
+```
+
+- The blocks run on the request as the client sent it (its method and URI before any rewrite,
+  without its body), with the site root it had, and with `{err.status_code}`, `{err.status_text}`
+  and `{err.message}` (what `error` was given, otherwise the status text).
+- A block with status codes (`404`, a class such as `5xx`) is for those; blocks with codes are
+  tried before a block without, and one that does not answer (say, only `header`) lets the next
+  that matches run.
+- `respond` without a status, and `file_server`, answer with the failure's status.
+- With no block for the status, or when the block fails too (the page is missing), the answer is
+  the bare status.
+- The headers set before the failure (`header`, a 405's `Allow`) stay on the page unless it sets
+  its own.
+- `respond` with an error status is an answer, not a failure: `handle_errors` does not see it.
+
 ## Differences from Caddy
 
-All of them are checked by `compat/`:
+Those an answer shows are checked by `compat/`:
 
 - ETags are hashes of the content (BLAKE3, 80 bits), not modification time and size; there is no
   `Last-Modified`.
 - Proxied responses get no `Via`; the upstream gets the client's `Accept-Encoding` as it is (Caddy's
   transport asks for gzip when the client sent none).
-- Handler errors such as `file_server`'s 405 keep the site's deferred headers (Caddy drops them).
+- A failed request keeps the site's deferred headers, on the bare status and on the page
+  `handle_errors` answers with (Caddy drops them).
+- Error pages: `file_server` in `handle_errors` sends the page whole, never a 304 or a range (Caddy
+  answers a bare status for a matching ETag, and cuts the page to a range); `{err.message}` of a
+  proxy failure is the status text (Caddy's is the network error, with the upstream's address);
+  the blocks see the request's headers as the client sent them (Caddy: as `request_header` left
+  them); `{err.id}` and `{err.trace}` are not supported.
 - `text/event-stream` is never compressed.
 - Limits Caddy does not have (docs/operations.md, Limits): `response_header_timeout` 60 s by
   default (`0` restores Caddy's none), 408 for a request body the client stops sending, at most 64
