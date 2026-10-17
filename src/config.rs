@@ -4,7 +4,8 @@
 //!   global options  auto_https off|disable_redirects|disable_certs, admin off, http_port, https_port,
 //!                   grace_period, debug, order, servers { trusted_proxies static …,
 //!                   trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }
-//!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>, log,
+//!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>
+//!                   (repeatable: e.g. an ECDSA and an RSA certificate, chosen per client), log,
 //!                   handle_errors [<status codes>]
 //!   directives      root, header, request_header, redir, rewrite, try_files, encode, route, handle,
 //!                   handle_path, error, respond, reverse_proxy, file_server
@@ -295,7 +296,8 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
     };
     struct Placed {
         port: u16,
-        tls: Option<CertSpec>,
+        /// The site's certificates on this address, in Caddyfile order; empty: plain HTTP.
+        tls: Vec<CertSpec>,
         hosts: Vec<String>,
         site: Site,
         at: Location,
@@ -311,7 +313,9 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         if addresses.is_empty() {
             bail!(at_err(&block.at, "a site block needs an address"));
         }
-        let mut tls: Option<(PathBuf, PathBuf)> = None;
+        // Several `tls` lines: several certificates for the site's hosts (an ECDSA and an RSA one,
+        // say); a handshake gets the first the client can verify, as in Caddy (src/tls.rs).
+        let mut tls: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut log: Option<Arc<AccessLog>> = None;
         let mut body = Vec::new();
         let mut error_blocks = Vec::new();
@@ -325,9 +329,12 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                             "tls: only `tls <cert_file> <key_file>` is supported (no automatic certificates)"
                         ));
                     }
-                    let cert = static_text(&line.tokens[1])?;
-                    let key = static_text(&line.tokens[2])?;
-                    tls = Some((PathBuf::from(cert), PathBuf::from(key)));
+                    let cert = PathBuf::from(static_text(&line.tokens[1])?);
+                    let key = PathBuf::from(static_text(&line.tokens[2])?);
+                    if tls.iter().any(|(c, k)| *c == cert && *k == key) {
+                        bail!(at_err(&line.at, "tls: the same certificate is given twice"));
+                    }
+                    tls.push((cert, key));
                 }
                 "log" => log = Some(Arc::new(parse_log(line)?)),
                 "bind" => bail!(at_err(&line.at, "bind is not supported")),
@@ -360,15 +367,15 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
             };
             let secure = match address.scheme.as_deref() {
                 Some("http") => {
-                    if tls.is_some() {
+                    if !tls.is_empty() {
                         bail!(at_err(&block.at, "an http:// address cannot use tls"));
                     }
                     false
                 }
                 Some("https") => true,
-                _ => tls.is_some() || port == globals.https_port,
+                _ => !tls.is_empty() || port == globals.https_port,
             };
-            if secure && tls.is_none() {
+            if secure && tls.is_empty() {
                 bail!(at_err(
                     &block.at,
                     format!(
@@ -382,14 +389,20 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
             } else {
                 vec![address.host.clone()]
             };
-            let spec = tls.as_ref().filter(|_| secure).map(|(cert, key)| CertSpec {
-                hosts: hosts.clone(),
-                cert: cert.clone(),
-                key: key.clone(),
-            });
+            let specs: Vec<CertSpec> = if secure {
+                tls.iter()
+                    .map(|(cert, key)| CertSpec {
+                        hosts: hosts.clone(),
+                        cert: cert.clone(),
+                        key: key.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             placed.push(Placed {
                 port,
-                tls: spec,
+                tls: specs,
                 hosts: hosts.clone(),
                 site: Site {
                     hosts,
@@ -411,7 +424,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
             None => {
                 servers.push(ServerConfig {
                     port: p.port,
-                    tls: p.tls.as_ref().map(|_| Vec::new()),
+                    tls: (!p.tls.is_empty()).then(Vec::new),
                     protocols: opts.protocols.unwrap_or_default(),
                     trusted_proxies: opts.trusted.clone().unwrap_or_default(),
                     trusted_strict: opts.strict.unwrap_or(false),
@@ -432,7 +445,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                 servers.last_mut().expect("just pushed")
             }
         };
-        if server.tls.is_some() != p.tls.is_some() {
+        if server.tls.is_some() == p.tls.is_empty() {
             bail!(at_err(&p.at, format!("port {} mixes HTTP and HTTPS sites", p.port)));
         }
         let duplicate = server.sites.iter().any(|s| s.hosts == p.hosts);
@@ -447,8 +460,8 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                 format!("site {host} on port {} is defined more than once", p.port)
             ));
         }
-        if let (Some(list), Some(spec)) = (server.tls.as_mut(), p.tls) {
-            list.push(spec);
+        if let Some(list) = server.tls.as_mut() {
+            list.extend(p.tls);
         }
         server.sites.push(p.site);
     }

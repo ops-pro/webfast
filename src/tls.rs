@@ -1,7 +1,12 @@
 //! TLS with rustls on aws-lc-rs: TLS 1.3 and 1.2, the hybrid post-quantum key exchange
 //! X25519MLKEM768 preferred, ML-DSA certificates accepted. Certificates come from PEM files
-//! (`tls <cert> <key>`), are chosen by SNI and are re-read when the files change (renewals) and
-//! when the configuration is reloaded.
+//! (`tls <cert> <key>`) and are re-read when the files change (renewals) and when the configuration
+//! is reloaded.
+//!
+//! A site may have several (`tls` repeated: an ECDSA and an RSA certificate, say). A handshake gets
+//! one for its SNI name — the sites that name it exactly, else by a wildcard, else the site for any
+//! host — and of those the first, in Caddyfile order, whose key signs with a scheme the client
+//! offers; as Caddy chooses, so the same file serves the same certificates in both.
 //!
 //! Resumption, kept in this process (a restart or another replica means a full handshake):
 //!   - TCP: stateless session tickets for TLS 1.3 (keys rotated by the ticketer), the session cache
@@ -13,6 +18,7 @@
 use crate::config::CertSpec;
 use crate::matcher::host_matches;
 use anyhow::{Context, Result};
+use rustls::SignatureScheme;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -29,8 +35,7 @@ pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
-/// Picks the certificate for the SNI name: exact or wildcard host, else a certificate without
-/// hosts, else the first one.
+/// Picks the certificate for a handshake (see the module documentation).
 #[derive(Debug)]
 pub struct CertResolver {
     loaded: RwLock<Vec<LoadedEntry>>,
@@ -93,7 +98,16 @@ impl CertResolver {
     pub fn read(specs: &[CertSpec], provider: &CryptoProvider) -> Result<Certificates> {
         specs
             .iter()
-            .map(|spec| load(spec, provider))
+            .map(|spec| {
+                let entry = load(spec, provider)?;
+                tracing::info!(
+                    cert = %spec.cert.display(),
+                    hosts = ?spec.hosts,
+                    key = ?entry.key.key.algorithm(),
+                    "certificate loaded"
+                );
+                Ok(entry)
+            })
             .collect::<Result<_>>()
             .map(Certificates)
     }
@@ -138,21 +152,33 @@ impl CertResolver {
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let loaded = self.loaded.read().ok()?;
-        if let Some(name) = hello.server_name() {
-            let name = name.to_ascii_lowercase();
-            if let Some(e) = loaded
-                .iter()
-                .find(|e| e.spec.hosts.iter().any(|h| host_matches(h, &name)))
-            {
-                return Some(e.key.clone());
-            }
-        }
-        loaded
-            .iter()
-            .find(|e| e.spec.hosts.is_empty())
-            .or_else(|| loaded.first())
-            .map(|e| e.key.clone())
+        let name = hello.server_name().map(str::to_ascii_lowercase);
+        choose(&loaded, name.as_deref(), hello.signature_schemes()).map(|e| e.key.clone())
     }
+}
+
+/// The certificate for a handshake: of the entries that fit the SNI `name` best — exactly, else by
+/// a wildcard, else an entry for any host, else (none fits) all of them — the first whose key can
+/// sign with one of the client's `schemes`; when none can, the first of them (the handshake then
+/// fails as it would have).
+fn choose<'a>(loaded: &'a [LoadedEntry], name: Option<&str>, schemes: &[SignatureScheme]) -> Option<&'a LoadedEntry> {
+    // How well an entry fits the name: 0 exactly, 1 by a wildcard, 2 as an entry for any host.
+    let fit = |entry: &LoadedEntry| -> Option<u8> {
+        if entry.spec.hosts.is_empty() {
+            return Some(2);
+        }
+        let name = name?;
+        let mut by = entry.spec.hosts.iter().filter(|h| host_matches(h, name));
+        by.clone()
+            .any(|h| !h.starts_with("*."))
+            .then_some(0)
+            .or_else(|| by.next().map(|_| 1))
+    };
+    let best = loaded.iter().filter_map(fit).min();
+    let candidates = || loaded.iter().filter(move |e| best.is_none() || fit(e) == best);
+    candidates()
+        .find(|e| e.key.key.choose_scheme(schemes).is_some())
+        .or_else(|| candidates().next())
 }
 
 /// Server configuration for TCP (ALPN h2 / http/1.1) or QUIC (ALPN h3, TLS 1.3 only).
@@ -188,4 +214,101 @@ pub fn watch(resolver: Arc<CertResolver>) {
             let _ = tokio::task::spawn_blocking(move || r.reload_changed(&p)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::SignatureAlgorithm;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use std::path::PathBuf;
+
+    /// A certificate for `hosts` (empty: any host) with a new key of `algorithm`.
+    fn entry(hosts: &[&str], algorithm: &'static rcgen::SignatureAlgorithm) -> LoadedEntry {
+        let key_pair = rcgen::KeyPair::generate_for(algorithm).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let signing = provider().key_provider.load_private_key(key).unwrap();
+        LoadedEntry {
+            spec: CertSpec {
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                cert: PathBuf::new(),
+                key: PathBuf::new(),
+            },
+            key: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing)),
+            stamp: Vec::new(),
+        }
+    }
+
+    fn chosen(loaded: &[LoadedEntry], name: &str, schemes: &[SignatureScheme]) -> usize {
+        let entry = choose(loaded, Some(name), schemes).expect("a certificate");
+        loaded.iter().position(|e| std::ptr::eq(e, entry)).unwrap()
+    }
+
+    const EC: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+    const RSA: SignatureScheme = SignatureScheme::RSA_PSS_SHA256;
+
+    #[test]
+    fn the_first_certificate_the_client_can_verify_is_chosen() {
+        let loaded = [
+            entry(&["example.test"], &rcgen::PKCS_ECDSA_P256_SHA256),
+            entry(&["example.test"], &rcgen::PKCS_RSA_SHA256),
+        ];
+        assert_eq!(loaded[0].key.key.algorithm(), SignatureAlgorithm::ECDSA);
+        assert_eq!(loaded[1].key.key.algorithm(), SignatureAlgorithm::RSA);
+        assert_eq!(chosen(&loaded, "example.test", &[EC, RSA]), 0, "both: the first listed");
+        assert_eq!(
+            chosen(&loaded, "example.test", &[RSA, EC]),
+            0,
+            "the client's order does not matter"
+        );
+        assert_eq!(chosen(&loaded, "example.test", &[RSA]), 1, "RSA only");
+        assert_eq!(chosen(&loaded, "example.test", &[EC]), 0, "ECDSA only");
+        assert_eq!(
+            chosen(&loaded, "example.test", &[SignatureScheme::ED25519]),
+            0,
+            "none fits: the first, and the handshake fails"
+        );
+        // Listed the other way round, a client that takes both gets RSA (as from Caddy).
+        let reversed = [loaded[1].clone(), loaded[0].clone()];
+        assert_eq!(chosen(&reversed, "example.test", &[EC, RSA]), 0);
+        assert_eq!(chosen(&reversed, "example.test", &[EC]), 1);
+    }
+
+    #[test]
+    fn an_exact_name_comes_before_a_wildcard_and_the_site_for_any_host() {
+        let loaded = [
+            entry(&[], &rcgen::PKCS_ECDSA_P256_SHA256),
+            entry(&["*.example.test"], &rcgen::PKCS_ECDSA_P256_SHA256),
+            entry(&["www.example.test"], &rcgen::PKCS_RSA_SHA256),
+        ];
+        assert_eq!(
+            chosen(&loaded, "www.example.test", &[EC, RSA]),
+            2,
+            "exact, though listed last"
+        );
+        assert_eq!(
+            chosen(&loaded, "www.example.test", &[EC]),
+            2,
+            "the exact name's certificate, even when the client cannot verify it"
+        );
+        assert_eq!(chosen(&loaded, "api.example.test", &[EC]), 1, "by the wildcard");
+        assert_eq!(
+            chosen(&loaded, "a.b.example.test", &[EC]),
+            0,
+            "a wildcard covers one label"
+        );
+        assert_eq!(chosen(&loaded, "other.test", &[EC]), 0, "the site for any host");
+        assert!(
+            std::ptr::eq(choose(&loaded, None, &[EC]).unwrap(), &loaded[0]),
+            "no SNI"
+        );
+        // No site for any host and no name that fits: the first certificate the client can verify.
+        let named = [loaded[2].clone(), loaded[1].clone()];
+        assert_eq!(chosen(&named, "other.test", &[EC]), 1);
+        assert_eq!(chosen(&named, "other.test", &[RSA]), 0);
+    }
 }

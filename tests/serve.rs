@@ -628,6 +628,69 @@ async fn https_over_http2_and_http3() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+/// A client whose handshake offers only these signature schemes (it verifies nothing else).
+fn client_offering(roots: &[&rcgen::Certificate], schemes: &[rustls::SignatureScheme]) -> rustls::ClientConfig {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let all = provider.signature_verification_algorithms;
+    let mapping: Vec<_> = all
+        .mapping
+        .iter()
+        .filter(|(s, _)| schemes.contains(s))
+        .copied()
+        .collect();
+    provider.signature_verification_algorithms = rustls::crypto::WebPkiSupportedAlgorithms {
+        all: all.all,
+        mapping: Box::leak(mapping.into_boxed_slice()),
+    };
+    let mut store = rustls::RootCertStore::empty();
+    for cert in roots {
+        store.add(cert.der().clone()).unwrap();
+    }
+    rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(store)
+        .with_no_client_auth()
+}
+
+#[tokio::test]
+async fn a_site_with_several_certificates_gives_each_client_one_it_can_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut certs = Vec::new();
+    for (name, algorithm) in [("ec", &rcgen::PKCS_ECDSA_P256_SHA256), ("rsa", &rcgen::PKCS_RSA_SHA256)] {
+        let key = rcgen::KeyPair::generate_for(algorithm).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(dir.path().join(format!("{name}.pem")), cert.pem()).unwrap();
+        std::fs::write(dir.path().join(format!("{name}.key")), key.serialize_pem()).unwrap();
+        certs.push(cert);
+    }
+    let text = format!(
+        "localhost:0 {{\n\ttls {d}/ec.pem {d}/ec.key\n\ttls {d}/rsa.pem {d}/rsa.key\n\trespond \"ok\"\n}}\n",
+        d = dir.path().display()
+    );
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = webfast::load_parsed(&file, 1 << 20).unwrap();
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+
+    use rustls::SignatureScheme::{ECDSA_NISTP256_SHA256 as EC, RSA_PSS_SHA256 as RSA};
+    for (offered, expected) in [(vec![EC, RSA], 0), (vec![RSA], 1), (vec![EC], 0)] {
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_offering(&[&certs[0], &certs[1]], &offered)));
+        let tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tls_stream = connector
+            .connect("localhost".try_into().unwrap(), tcp_stream)
+            .await
+            .unwrap();
+        let peer = &tls_stream.get_ref().1.peer_certificates().unwrap()[0];
+        assert_eq!(peer, certs[expected].der(), "offered {offered:?}");
+    }
+
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
 /// One HTTP/3 request on a QUIC connection: status and body.
 async fn h3_request(conn: quinn::Connection, method: Method, port: u16) -> (StatusCode, String) {
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
