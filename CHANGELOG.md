@@ -18,6 +18,9 @@
   configuration for their next request; `lazy`, the one they were accepted with, for as long as
   they stay open; `drain`, as lazy, and each is closed gracefully at a moment drawn at random
   within `WEB_RELOAD_DRAIN` (60 s), so that clients reconnect spread over it.
+- Compression dictionaries (RFC 9842): a file marked with `Use-As-Dictionary` is a dictionary
+  for the files its pattern names, and a browser that holds it (or a version a deploy replaced)
+  gets them as `dcz` deltas — checked in Chromium. `dcb` is not offered.
 - Files over `WEB_MAX_FILE_IN_MEMORY` (16 MiB; `off`: all in memory) are streamed from disk,
   64 KiB at a time, instead of being held in memory: their ETag from size and modification time,
   checked on each response; conditional requests and one range; no ready answers; nothing of

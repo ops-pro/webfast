@@ -164,6 +164,9 @@ pub struct FileEntry {
     meta: Option<Meta>,
     /// The shared buffer its bytes are in (`None`: kept for good, or a buffer of its own).
     chunk: Option<Arc<Chunk>>,
+    /// SHA-256 of its bytes, for files in memory: a client that holds the file as a compression
+    /// dictionary names it by this (RFC 9842, src/static_files.rs).
+    pub sha256: Option<[u8; 32]>,
 }
 
 impl FileEntry {
@@ -194,6 +197,7 @@ impl FileEntry {
             content_type: content_type(key).map(HeaderValue::from_static),
             meta: Some(meta),
             chunk: None,
+            sha256: None,
         }
     }
 
@@ -216,6 +220,7 @@ impl FileEntry {
             content_type: self.content_type.clone(),
             meta: self.meta,
             chunk: Some(chunk),
+            sha256: self.sha256,
         }
     }
 
@@ -291,6 +296,7 @@ impl FileEntry {
             content_type,
             meta,
             chunk,
+            sha256: Some(prepared.sha256),
         }
     }
 }
@@ -343,11 +349,14 @@ struct Prepared {
     len: usize,
     lz4: bool,
     etag: String,
+    /// What a client names it by when it holds it as a compression dictionary (RFC 9842).
+    sha256: [u8; 32],
 }
 
 impl Prepared {
     fn new(bytes: Vec<u8>, lz4_min_saving: Option<u8>) -> Prepared {
         let etag = etag_of(&bytes);
+        let sha256 = sha256_of(&bytes);
         let len = bytes.len();
         if let Some(saving) = lz4_min_saving
             && (LZ4_MIN_SIZE..=LZ4_MAX_SIZE).contains(&len)
@@ -361,6 +370,7 @@ impl Prepared {
                     len,
                     lz4: true,
                     etag,
+                    sha256,
                 };
             }
         }
@@ -369,6 +379,7 @@ impl Prepared {
             len,
             lz4: false,
             etag,
+            sha256,
         }
     }
 }
@@ -404,6 +415,8 @@ pub struct Files {
     files: FxHashMap<String, Arc<FileEntry>>,
     /// "/", "/dir/", "/dir/sub/": every directory that holds a file.
     dirs: FxHashSet<String>,
+    /// SHA-256 → the file (its key), for compression dictionaries.
+    by_sha256: FxHashMap<[u8; 32], (String, Arc<FileEntry>)>,
     pub totals: Totals,
 }
 
@@ -412,8 +425,12 @@ impl Files {
         let mut dirs = FxHashSet::default();
         dirs.insert("/".to_string());
         let mut totals = Totals::default();
+        let mut by_sha256 = FxHashMap::default();
         for (key, file) in &files {
             totals.add(file);
+            if let Some(hash) = file.sha256 {
+                by_sha256.insert(hash, (key.clone(), file.clone()));
+            }
             let mut dir = key.as_str();
             while let Some(i) = dir[..dir.len().saturating_sub(1)].rfind('/') {
                 dir = &dir[..=i];
@@ -422,7 +439,12 @@ impl Files {
                 }
             }
         }
-        Files { files, dirs, totals }
+        Files {
+            files,
+            dirs,
+            by_sha256,
+            totals,
+        }
     }
 
     pub fn file(&self, path: &str) -> Option<&Arc<FileEntry>> {
@@ -486,6 +508,28 @@ pub struct FileStore {
     /// One rescan at a time (after a reload, the watcher that ends and the one that starts may
     /// overlap).
     rescanning: Mutex<()>,
+    /// Versions of files that a rescan replaced or removed, the latest first, at most
+    /// `PREVIOUS_VERSIONS` bytes: a browser that holds one as a compression dictionary gets the new
+    /// version as a delta to it, even when the deploy did not keep the old file.
+    previous: Mutex<std::collections::VecDeque<Previous>>,
+}
+
+/// A replaced version of a file, kept as a compression dictionary: its path, hash and bytes (a
+/// copy of its own, so it holds no shared buffer).
+#[derive(Debug)]
+struct Previous {
+    key: String,
+    sha256: [u8; 32],
+    bytes: Bytes,
+}
+
+/// What the replaced versions kept as dictionaries may take, per store.
+pub const PREVIOUS_VERSIONS: usize = 16 << 20;
+
+/// A file a client may use as a compression dictionary: its path and bytes.
+pub struct Dictionary {
+    pub key: String,
+    pub bytes: Bytes,
 }
 
 impl FileStore {
@@ -517,6 +561,51 @@ impl FileStore {
 
     pub fn configured(&self) -> &Path {
         &self.configured
+    }
+
+    /// The file whose SHA-256 is `hash`: one of the store's files now, or a version a rescan
+    /// replaced (RFC 9842 compression dictionaries).
+    pub fn dictionary(&self, hash: &[u8; 32]) -> Option<Dictionary> {
+        if let Some((key, file)) = self.files().by_sha256.get(hash) {
+            return Some(Dictionary {
+                key: key.clone(),
+                bytes: file.body(),
+            });
+        }
+        let previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
+        previous.iter().find(|p| &p.sha256 == hash).map(|p| Dictionary {
+            key: p.key.clone(),
+            bytes: p.bytes.clone(),
+        })
+    }
+
+    /// Keeps `replaced` (files a rescan replaced or removed) as dictionaries, the oldest going when
+    /// there is no room.
+    fn keep_previous(&self, replaced: Vec<(String, Arc<FileEntry>)>) {
+        let mut previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
+        for (key, file) in replaced {
+            let Some(sha256) = file.sha256 else { continue };
+            // Only what compresses: scripts, styles, pages, data (the types `encode` takes).
+            let compressible = file
+                .content_type
+                .as_ref()
+                .and_then(|t| t.to_str().ok())
+                .is_some_and(|t| {
+                    crate::encode::DEFAULT_TYPES
+                        .iter()
+                        .any(|p| crate::encode::type_matches(p, t))
+                });
+            if !compressible || file.len() > PREVIOUS_VERSIONS / 4 || previous.iter().any(|p| p.sha256 == sha256) {
+                continue;
+            }
+            let bytes = Bytes::copy_from_slice(&file.body());
+            previous.push_front(Previous { key, sha256, bytes });
+        }
+        let mut total = 0;
+        previous.retain(|p| {
+            total += p.bytes.len();
+            total <= PREVIOUS_VERSIONS
+        });
     }
 
     /// Reads every regular file under `root` (symlinks followed), charging `budget` with what they
@@ -597,6 +686,7 @@ impl FileStore {
             lz4_min_saving,
             max_in_memory,
             rescanning: Mutex::new(()),
+            previous: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -710,7 +800,14 @@ impl FileStore {
         }
         out.totals = files.totals;
         if out.replaced() {
+            let replaced: Vec<(String, Arc<FileEntry>)> = old
+                .files
+                .iter()
+                .filter(|(key, file)| files.file(key).is_none_or(|now| !Arc::ptr_eq(now, file)))
+                .map(|(key, file)| (key.clone(), file.clone()))
+                .collect();
             self.current.store(Arc::new(files));
+            self.keep_previous(replaced);
         }
         out.millis = started.elapsed().as_millis() as u64;
         Ok(out)
@@ -824,6 +921,11 @@ fn key_of(relative: &Path) -> Option<String> {
         key.push_str(part.as_os_str().to_str()?);
     }
     Some(key)
+}
+
+fn sha256_of(body: &[u8]) -> [u8; 32] {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body);
+    digest.as_ref().try_into().expect("32 bytes")
 }
 
 /// Strong ETag from the content: 80 bits of BLAKE3 in hex.

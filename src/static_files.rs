@@ -13,7 +13,7 @@ use http::header::{
     ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH,
     IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, VARY, X_CONTENT_TYPE_OPTIONS,
 };
-use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ impl FileServer {
         let mut implicit_index = false;
         let mut found: Option<(String, Arc<FileEntry>)> = None;
         // The files as they are now: the same for every lookup of this request.
-        let files = store.files();
+        let mut files = store.files();
         if !key.ends_with('/')
             && let Some(entry) = files.file(&key)
         {
@@ -125,6 +125,20 @@ impl FileServer {
             }
         }
 
+        // Compression dictionaries (RFC 9842): the client holds an earlier version of this file, or
+        // another of the site's, and takes `dcz`: the file as a delta to it, worked out once.
+        let mut delta = None;
+        if ctx.error.is_none()
+            && entry.sha256.is_some()
+            && let Some(hash) = offered_dictionary(&ctx.req)
+            && let Some(dictionary) = store.dictionary(&hash)
+            && !self.hidden(&dictionary.key)
+        {
+            drop(files);
+            delta = self::delta(&entry, dictionary.bytes, hash).await;
+            files = store.files();
+        }
+
         let mut response = Response::new(empty());
         // Sized for this response and the site's headers added later: no regrowing.
         *response.headers_mut() = HeaderMap::with_capacity(24);
@@ -144,6 +158,14 @@ impl FileServer {
                 chosen_encoding = Some(encoding);
                 break;
             }
+        }
+        // The delta, when it is smaller than the best the client could get otherwise.
+        if let Some((delta, etag)) = delta
+            && delta.len() < chosen.len()
+        {
+            let content_type = entry.content_type.clone();
+            drop(files);
+            return serve_delta(ctx, response, delta, etag, content_type);
         }
         // Too large for memory (WEB_MAX_FILE_IN_MEMORY): opened now, sent as it is read.
         if let Some(path) = chosen.on_disk() {
@@ -533,6 +555,184 @@ impl http_body::Body for DiskBody {
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::SizeHint::with_exact(self.remaining)
     }
+}
+
+/// RFC 9842 (Compression Dictionary Transport): the SHA-256 of a dictionary the client holds.
+pub const AVAILABLE_DICTIONARY: HeaderName = HeaderName::from_static("available-dictionary");
+
+/// The dictionary a request offers for a delta (RFC 9842): the SHA-256 in `Available-Dictionary`,
+/// when `Accept-Encoding` takes `dcz`, the request is for the whole file, and — as §9.3.3 asks —
+/// its response is readable by the page that asked: same-origin, or a navigation (a cross-origin
+/// request gets no delta; with CORS the answer's `Access-Control-Allow-Origin` is not known here).
+fn offered_dictionary(request: &http::request::Parts) -> Option<[u8; 32]> {
+    if (request.method != Method::GET && request.method != Method::HEAD) || request.headers.contains_key(RANGE) {
+        return None;
+    }
+    let headers = &request.headers;
+    let value = headers.get(AVAILABLE_DICTIONARY)?.to_str().ok()?.trim();
+    let hash: [u8; 32] = base64_decode(value.strip_prefix(':')?.strip_suffix(':')?)?
+        .try_into()
+        .ok()?;
+    let takes_dcz = headers
+        .get_all(http::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| {
+            let mut parts = item.split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            let refused = parts.any(|p| {
+                let p = p.trim();
+                p.strip_prefix("q=")
+                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+            });
+            coding.eq_ignore_ascii_case("dcz") && !refused
+        });
+    let named = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let readable = matches!(
+        (named("sec-fetch-site"), named("sec-fetch-mode")),
+        (None, _) | (Some("same-origin"), _) | (_, Some("navigate"))
+    );
+    (takes_dcz && readable).then_some(hash)
+}
+
+/// Standard base64 with padding (RFC 4648), as in a structured field byte sequence.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for quad in text.chunks(4) {
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &quad[..4 - pad] {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    Some(out)
+}
+
+/// Deltas worked out, by file (its ETag) and dictionary: shared by every client that holds that
+/// dictionary — after a deploy, all those that had the version before.
+struct Deltas {
+    by: rustc_hash::FxHashMap<(String, [u8; 32]), bytes::Bytes>,
+    /// Oldest first, for making room.
+    order: std::collections::VecDeque<(String, [u8; 32])>,
+    bytes: usize,
+}
+
+/// What the deltas kept may take, over all sites.
+const DELTAS: usize = 32 << 20;
+
+static KEPT_DELTAS: std::sync::LazyLock<std::sync::Mutex<Deltas>> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(Deltas {
+        by: Default::default(),
+        order: Default::default(),
+        bytes: 0,
+    })
+});
+
+/// `entry` as a `dcz` delta to `dictionary` (whose hash is `hash`), with its ETag: from those kept,
+/// or worked out on the blocking pool (once per file and dictionary, whoever asks first waits).
+async fn delta(entry: &FileEntry, dictionary: bytes::Bytes, hash: [u8; 32]) -> Option<(bytes::Bytes, HeaderValue)> {
+    let file_etag = entry.etag.to_str().ok()?;
+    let short: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
+    let etag = HeaderValue::from_str(&format!("{}-dcz-{short}\"", file_etag.trim_end_matches('"'))).ok()?;
+    let key = (file_etag.to_string(), hash);
+    let kept = |deltas: &Deltas| deltas.by.get(&key).cloned();
+    if let Some(found) = kept(&KEPT_DELTAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        return Some((found, etag));
+    }
+    let content = entry.body();
+    let made = tokio::task::spawn_blocking(move || dcz(&content, &dictionary, &hash))
+        .await
+        .ok()??;
+    let mut deltas = KEPT_DELTAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if made.len() <= DELTAS / 8 && !deltas.by.contains_key(&key) {
+        deltas.bytes += made.len();
+        deltas.by.insert(key.clone(), made.clone());
+        deltas.order.push_back(key);
+        while deltas.bytes > DELTAS {
+            let Some(oldest) = deltas.order.pop_front() else { break };
+            if let Some(gone) = deltas.by.remove(&oldest) {
+                deltas.bytes -= gone.len();
+            }
+        }
+    }
+    Some((made, etag))
+}
+
+/// The `dcz` encoding (RFC 9842 §5): a Zstandard skippable frame holding the dictionary's SHA-256,
+/// then a Zstandard frame that uses the dictionary as a raw prefix, its window no larger than a
+/// client must decode: the greater of 8 MB and 1.25 times the dictionary, at most 128 MB.
+fn dcz(content: &[u8], dictionary: &[u8], hash: &[u8; 32]) -> Option<bytes::Bytes> {
+    use zstd::zstd_safe::{CCtx, CParameter};
+    let limit = (8u64 << 20).max(dictionary.len() as u64 * 5 / 4).min(128 << 20);
+    let window_log = 63 - limit.leading_zeros();
+    // Worked out once and kept: the strongest level for what a page loads, a little less beyond.
+    let level = if content.len() <= 1 << 20 { 19 } else { 15 };
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
+    cctx.set_parameter(CParameter::WindowLog(window_log)).ok()?;
+    cctx.ref_prefix(dictionary).ok()?;
+    let mut frame = Vec::with_capacity(zstd::zstd_safe::compress_bound(content.len()));
+    cctx.compress2(&mut frame, content).ok()?;
+    let mut out = Vec::with_capacity(40 + frame.len());
+    out.extend_from_slice(&[0x5e, 0x2a, 0x4d, 0x18, 0x20, 0x00, 0x00, 0x00]);
+    out.extend_from_slice(hash);
+    out.extend_from_slice(&frame);
+    Some(bytes::Bytes::from(out))
+}
+
+/// A file as a `dcz` delta: its own ETag, `Vary` on the dictionary too, no ranges.
+fn serve_delta(
+    mut ctx: Ctx,
+    mut response: Response<Body>,
+    delta: bytes::Bytes,
+    etag: HeaderValue,
+    content_type: Option<HeaderValue>,
+) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(VARY, HeaderValue::from_static("Accept-Encoding, Available-Dictionary"));
+    let fresh = ctx
+        .req
+        .headers
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|list| etag_list_matches(list, &etag, false));
+    headers.insert(ETAG, etag);
+    if fresh {
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        return ctx.respond(response);
+    }
+    headers.insert(CONTENT_ENCODING, HeaderValue::from_static("dcz"));
+    if !ctx.pre_headers.contains_key(CONTENT_TYPE)
+        && let Some(kind) = content_type
+    {
+        headers.insert(CONTENT_TYPE, kind);
+    }
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(delta.len() as u64));
+    if ctx.req.method != Method::HEAD {
+        *response.body_mut() = full(delta);
+    }
+    ctx.respond(response)
 }
 
 pub fn html_escape(text: &str) -> String {

@@ -120,6 +120,14 @@ higher (it keeps freed memory for reuse; no growth). One changed page: 3–12 ms
 thousand requests/s, the page rewritten every 100 ms, every asset once): all 1.3 million responses
 200, the 100 changes looked at 6 times.
 
+## Compression dictionaries
+
+A 229 KB script whose new version changes 31 of its 3000 lines, in Chromium 152 with the old
+version stored as a dictionary (2026-10-17): the response came as `dcz`, 170 bytes of body (470
+transferred), and the page read the new version whole. Without a dictionary it takes 4.9 KB as
+zstd at level 19, 6.0 KB as Brotli 11, 15.7 KB as gzip 9. A delta is worked out once per file and
+dictionary on the blocking pool and kept.
+
 ## Large files from disk
 
 A 300 MB file over `WEB_MAX_FILE_IN_MEMORY`, from the page cache, plain release build, loopback

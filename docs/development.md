@@ -29,6 +29,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
 | `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
 | `tests/errors.rs`                                | `handle_errors` and `error`, as Caddy answers them                                                  |
+| `tests/dictionaries.rs`                          | compression dictionaries: `dcz` deltas to a file or to a replaced version                           |
 | `tests/disk.rs`                                  | files over `WEB_MAX_FILE_IN_MEMORY`, streamed from disk                                             |
 | `tests/early_hints.rs`                           | `respond 103`: Early Hints over HTTP/3, the headers with the final response elsewhere               |
 | `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |

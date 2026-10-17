@@ -51,6 +51,35 @@ reverse_proxy app:8080
 Early Hints go out over HTTP/3. Over HTTP/1.1 and HTTP/2 hyper sends no interim responses, so
 there the same headers come only with the final response (where browsers use them too).
 
+### Compression dictionaries
+
+A browser that has an earlier version of a script or stylesheet can get the new one as a delta to
+it (RFC 9842, Compression Dictionary Transport; Chrome and Edge 130 and later): after a deploy a
+returning visitor downloads kilobytes instead of the whole bundle. Mark what may serve as a
+dictionary with a header — the pattern names the URLs it is a dictionary for:
+
+```caddyfile
+header /assets/*.js Use-As-Dictionary "match=\"/assets/app-*.js\""
+header /assets/*.css Use-As-Dictionary "match=\"/assets/app-*.css\""
+```
+
+A browser that stored `/assets/app-1a2b.js` with that header asks for `/assets/app-3c4d.js` with
+`Available-Dictionary` (the old file's SHA-256) and `dcz` in `Accept-Encoding`; webfast answers
+with the new file compressed by Zstandard against the old one (`Content-Encoding: dcz`, `Vary:
+Accept-Encoding, Available-Dictionary`), when it is smaller than the best other answer.
+
+- The dictionary must be a file webfast has: one of the site's files now, or a version it
+  replaced since it started (a deploy that rewrote or removed it: the last 16 MiB per root of
+  scripts, styles, pages and data are kept). Hidden files are not used.
+- Each delta is worked out once (Zstandard level 19) and kept, at most 32 MiB of them; whoever
+  asks for it first waits for it.
+- Only for requests that read their answer themselves: same-origin, or a navigation (RFC 9842
+  §9.3.3); a cross-origin request gets the usual answer. Not for ranges, nor in `handle_errors`.
+- Only `dcz`: `dcb` (Brotli with a dictionary) is not offered, the Rust Brotli encoder has no
+  shared dictionaries. Browsers asking for `dcb` and `dcz` get `dcz`.
+- Without the header nothing changes; Caddy reads the same lines and sends the header, but no
+  deltas.
+
 ### Error pages
 
 A handler that fails — `file_server` with no file (404) or asked with a method other than GET and
@@ -111,6 +140,8 @@ Those an answer shows are checked by `compat/`:
   multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
+- Compression dictionaries (`dcz`): Caddy has none; the `Use-As-Dictionary` header is just a
+  header to it.
 - Early Hints (`respond 103`) go out over HTTP/3 only (Caddy: over every protocol); a file's ready
   answer is not preceded by them (it is as quick as they would be). Of the 1xx statuses `respond`
   takes only 103.

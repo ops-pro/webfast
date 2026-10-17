@@ -16,6 +16,7 @@ use crate::encode::AcceptEncoding;
 use crate::files::{FileEntry, FileStore};
 use crate::handler::{ConnInfo, Ctx, Handler, HeaderOp, Next, Route, encode_path};
 use crate::matcher::{Matcher, MatcherSet};
+use crate::static_files::AVAILABLE_DICTIONARY;
 use http::header::{ACCEPT_ENCODING, ETAG, IF_MATCH, IF_NONE_MATCH, RANGE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -105,7 +106,8 @@ impl Answers {
         };
         let answers = self.paths.get(request.uri.path())?;
         let headers = &request.headers;
-        if headers.contains_key(RANGE) || headers.contains_key(IF_MATCH) {
+        // A client offering a compression dictionary (RFC 9842) may get a delta: the chain decides.
+        if headers.contains_key(RANGE) || headers.contains_key(IF_MATCH) || headers.contains_key(AVAILABLE_DICTIONARY) {
             return None;
         }
         let signature = AcceptEncoding::parse(headers).signature();

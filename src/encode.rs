@@ -351,7 +351,7 @@ impl Encode {
     }
 }
 
-fn type_matches(pattern: &str, content_type: &str) -> bool {
+pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => content_type.starts_with(prefix),
         None => content_type == pattern || content_type.starts_with(&format!("{pattern};")),

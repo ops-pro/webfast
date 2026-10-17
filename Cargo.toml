@@ -29,6 +29,9 @@ anyhow = "1"
 # The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
 # requests load them without counting references.
 arc-swap = "1"
+# SHA-256 of the files that may be compression dictionaries (src/files.rs); already the TLS
+# backend, with the same features as rustls asks for.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 blake3 = "1"
 brotli = "8"
 bytes = "1"

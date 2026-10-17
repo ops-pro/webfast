@@ -36,6 +36,9 @@ compared request by request ([`compat/`](compat)).
   idle and stall timeouts, a timeout for hung upstreams, bounded ranges, HTTP/3 frame limits.
 - **TLS** with rustls on aws-lc-rs (post-quantum key exchange preferred), certificates re-read when
   renewed; **HTTP/3** with 0-RTT for safe methods.
+- **Deltas after a deploy** (RFC 9842 compression dictionaries, `dcz`): a browser that has the
+  previous version of a bundle gets the new one as a delta to it — 170 bytes instead of 229 KB in
+  Chrome for a script with a few changed lines — also when the deploy replaced the old file.
 - **Proxying** with streaming (server-sent events reach the client as they come) and WebSocket;
   **error pages** with `handle_errors`.
 - Unknown directives, options and placeholders stop the server at startup with the file and line,
