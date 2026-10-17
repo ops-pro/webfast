@@ -344,7 +344,9 @@ fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
             let sibling = [".br", ".zst", ".gz"]
                 .iter()
                 .any(|suffix| file.strip_suffix(suffix).is_some_and(|base| files.contains(base)));
-            if sibling {
+            // Files served from disk have no ready answer: each response opens the file.
+            let on_disk = files.file(file).is_some_and(|entry| entry.on_disk().is_some());
+            if sibling || on_disk {
                 continue;
             }
             paths.insert(encode_path(file));

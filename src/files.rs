@@ -3,6 +3,10 @@
 //! `.br` / `.zst` / `.gz` siblings are ordinary entries with their own ETags. The header values a
 //! response needs (ETag, Content-Length, Content-Type) are built when a file is read.
 //!
+//! A file larger than WEB_MAX_FILE_IN_MEMORY (16 MiB) — a video, an archive — is not read: only
+//! that it exists is recorded, and each response opens it and streams it from disk
+//! (src/static_files.rs), its ETag from its size and modification time at that moment.
+//!
 //! A store holds its files as a snapshot (`Files`) that a rescan replaces whole when files change on
 //! disk (src/watch.rs): unchanged files are taken over as they are, only new and changed ones are
 //! read, and a request keeps the snapshot it found. Files that may be replaced each have a buffer of
@@ -101,6 +105,40 @@ enum Stored {
         block: Bytes,
         len: usize,
     },
+    /// Not in memory: larger than WEB_MAX_FILE_IN_MEMORY, read from here for each response
+    /// (src/static_files.rs `DiskBody`); `len` as found.
+    Disk {
+        path: PathBuf,
+        len: u64,
+    },
+}
+
+/// The default of WEB_MAX_FILE_IN_MEMORY: larger files are served from disk.
+pub const DEFAULT_MAX_FILE_IN_MEMORY: u64 = 16 << 20;
+
+/// `WEB_MAX_FILE_IN_MEMORY`: the largest file kept in memory (`512MiB`, `1G` or bytes); larger
+/// ones are served from disk. `off`: every file in memory.
+pub fn max_file_in_memory_from_env() -> Result<Option<u64>, String> {
+    match std::env::var("WEB_MAX_FILE_IN_MEMORY") {
+        Err(_) => Ok(Some(DEFAULT_MAX_FILE_IN_MEMORY)),
+        Ok(value) if value.trim().eq_ignore_ascii_case("off") => Ok(None),
+        Ok(value) => crate::parse_size(&value)
+            .map(Some)
+            .ok_or_else(|| format!("WEB_MAX_FILE_IN_MEMORY: a size (e.g. 16MiB) or off, not {value:?}")),
+    }
+}
+
+/// A strong ETag for a file served from disk, from its size and modification time (as Caddy's and
+/// nginx's): hashing its content would mean reading it all at startup.
+pub fn disk_etag(metadata: &std::fs::Metadata) -> String {
+    etag_from_version(metadata.len(), metadata.modified().ok())
+}
+
+fn etag_from_version(len: u64, modified: Option<SystemTime>) -> String {
+    let nanos = modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    format!("\"{len:x}-{nanos:x}\"")
 }
 
 /// Files read together are copied into shared buffers of about this size: few allocations — a
@@ -130,9 +168,32 @@ pub struct FileEntry {
 
 impl FileEntry {
     fn stored_bytes(&self) -> &Bytes {
+        static NONE: Bytes = Bytes::new();
         match &self.stored {
             Stored::Plain(bytes) => bytes,
             Stored::Lz4 { block, .. } => block,
+            Stored::Disk { .. } => &NONE,
+        }
+    }
+
+    /// Where the file is read from for each response, when it is not kept in memory.
+    pub fn on_disk(&self) -> Option<&Path> {
+        match &self.stored {
+            Stored::Disk { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// A file served from disk, as found (`meta`); its headers are worked out again for each
+    /// response from the file as it is then.
+    fn disk(key: &str, path: PathBuf, meta: Meta) -> FileEntry {
+        FileEntry {
+            stored: Stored::Disk { path, len: meta.len },
+            etag: HeaderValue::from_static(intern(&etag_from_version(meta.len, meta.modified))),
+            length: HeaderValue::from(meta.len),
+            content_type: content_type(key).map(HeaderValue::from_static),
+            meta: Some(meta),
+            chunk: None,
         }
     }
 
@@ -145,6 +206,10 @@ impl FileEntry {
                     block: stored,
                     len: *len,
                 },
+                Stored::Disk { path, len } => Stored::Disk {
+                    path: path.clone(),
+                    len: *len,
+                },
             },
             etag: self.etag.clone(),
             length: self.length.clone(),
@@ -155,20 +220,23 @@ impl FileEntry {
     }
 
     /// The file's bytes: a reference to them, or — kept in LZ4 — a new buffer decompressed now.
+    /// None for a file on disk, which a response reads itself (`on_disk`).
     pub fn body(&self) -> Bytes {
         match &self.stored {
             Stored::Plain(bytes) => bytes.clone(),
             Stored::Lz4 { block, len } => {
                 Bytes::from(lz4_flex::block::decompress(block, *len).expect("a block checked when it was made"))
             }
+            Stored::Disk { .. } => Bytes::new(),
         }
     }
 
-    /// The file's size.
+    /// The file's size (on disk: as found).
     pub fn len(&self) -> usize {
         match &self.stored {
             Stored::Plain(bytes) => bytes.len(),
             Stored::Lz4 { len, .. } => *len,
+            Stored::Disk { len, .. } => *len as usize,
         }
     }
 
@@ -181,6 +249,7 @@ impl FileEntry {
         match &self.stored {
             Stored::Plain(bytes) => bytes.len(),
             Stored::Lz4 { block, .. } => block.len(),
+            Stored::Disk { .. } => 0,
         }
     }
 
@@ -313,6 +382,8 @@ pub struct Totals {
     pub stored: u64,
     /// Files kept in LZ4.
     pub lz4: usize,
+    /// Files served from disk (WEB_MAX_FILE_IN_MEMORY).
+    pub disk: usize,
 }
 
 impl Totals {
@@ -321,6 +392,7 @@ impl Totals {
         self.bytes += file.len() as u64;
         self.stored += file.stored_len() as u64;
         self.lz4 += usize::from(file.is_lz4());
+        self.disk += usize::from(file.on_disk().is_some());
     }
 }
 
@@ -409,6 +481,8 @@ pub struct FileStore {
     configured: PathBuf,
     current: ArcSwap<Files>,
     lz4_min_saving: Option<u8>,
+    /// Larger files are served from disk (WEB_MAX_FILE_IN_MEMORY).
+    max_in_memory: Option<u64>,
     /// One rescan at a time (after a reload, the watcher that ends and the one that starts may
     /// overlap).
     rescanning: Mutex<()>,
@@ -451,16 +525,18 @@ impl FileStore {
     /// kept goes into one buffer allocated here, for good: the files lie together, and the loading
     /// threads' memory is all given back.
     pub fn load(root: &Path, budget: &mut u64, lz4_min_saving: Option<u8>) -> anyhow::Result<FileStore> {
-        FileStore::load_with(root, budget, lz4_min_saving, false)
+        FileStore::load_with(root, budget, lz4_min_saving, false, Some(DEFAULT_MAX_FILE_IN_MEMORY))
     }
 
     /// `reloadable`: each file in a buffer of its own allocated here, so that a rescan can replace
     /// it and its memory goes when the last snapshot and response that hold it do.
+    /// `max_in_memory`: larger files are not read, but served from disk (`None`: all in memory).
     pub fn load_with(
         root: &Path,
         budget: &mut u64,
         lz4_min_saving: Option<u8>,
         reloadable: bool,
+        max_in_memory: Option<u64>,
     ) -> anyhow::Result<FileStore> {
         let canonical = root
             .canonicalize()
@@ -468,7 +544,15 @@ impl FileStore {
         if !canonical.is_dir() {
             anyhow::bail!("site root {} is not a directory", root.display());
         }
-        let (found, _) = scan(root, false)?;
+        let (mut found, _) = scan(root, false)?;
+        let mut files = FxHashMap::default();
+        found.retain(|(key, path, meta)| {
+            let on_disk = max_in_memory.is_some_and(|max| meta.len > max);
+            if on_disk {
+                files.insert(key.clone(), Arc::new(FileEntry::disk(key, path.clone(), *meta)));
+            }
+            !on_disk
+        });
         let loaded = on_every_cpu(&found, |(_, path, _)| {
             std::fs::read(path).map(|bytes| Prepared::new(bytes, lz4_min_saving))
         });
@@ -485,7 +569,6 @@ impl FileStore {
             *budget -= size;
             prepared.push((key, file, meta));
         }
-        let mut files = FxHashMap::default();
         if reloadable {
             let parts: Vec<&[u8]> = prepared.iter().map(|(_, p, _)| p.stored.as_slice()).collect();
             let packed = pack(&parts);
@@ -512,6 +595,7 @@ impl FileStore {
             configured: root.to_path_buf(),
             current: ArcSwap::from_pointee(Files::new(files)),
             lz4_min_saving,
+            max_in_memory,
             rescanning: Mutex::new(()),
         })
     }
@@ -535,17 +619,29 @@ impl FileStore {
         };
         let mut files: FxHashMap<String, Arc<FileEntry>> = FxHashMap::default();
         let mut to_read = Vec::new();
+        let mut disk = (0, 0);
         for (key, path, meta) in found {
             match old.files.get(&key) {
                 Some(file) if file.meta == Some(meta) => {
                     files.insert(key, file.clone());
                 }
+                previous if self.max_in_memory.is_some_and(|max| meta.len > max) => {
+                    if previous.is_some() {
+                        disk.1 += 1;
+                    } else {
+                        disk.0 += 1;
+                    }
+                    files.insert(key.clone(), Arc::new(FileEntry::disk(&key, path, meta)));
+                }
                 _ => to_read.push((key, path, meta)),
             }
         }
+        // Files on disk that changed or came: counted as such, whatever the old entry was.
+        out.added += disk.0;
+        out.changed += disk.1;
         out.removed = old.files.keys().filter(|key| !files.contains_key(*key)).count();
         out.removed -= to_read.iter().filter(|(key, _, _)| old.files.contains_key(key)).count();
-        if to_read.is_empty() && out.removed == 0 {
+        if to_read.is_empty() && out.removed == 0 && disk == (0, 0) {
             out.totals = old.totals;
             out.millis = started.elapsed().as_millis() as u64;
             return Ok(out);
@@ -591,13 +687,17 @@ impl FileStore {
         // more than a quarter again of what is live, every file is copied into new ones.
         let (waste, live) = chunk_waste(&files);
         if waste > live / 4 && waste > CHUNK {
-            let entries: Vec<(&String, &Arc<FileEntry>)> = files.iter().collect();
+            let entries: Vec<(&String, &Arc<FileEntry>)> =
+                files.iter().filter(|(_, file)| file.on_disk().is_none()).collect();
             let parts: Vec<&[u8]> = entries.iter().map(|(_, file)| &file.stored_bytes()[..]).collect();
-            let repacked: FxHashMap<String, Arc<FileEntry>> = entries
+            let mut repacked: FxHashMap<String, Arc<FileEntry>> = entries
                 .iter()
                 .zip(pack(&parts))
                 .map(|((key, file), (stored, chunk))| ((*key).clone(), Arc::new(file.repacked(stored, chunk))))
                 .collect();
+            for (key, file) in files.iter().filter(|(_, file)| file.on_disk().is_some()) {
+                repacked.insert(key.clone(), file.clone());
+            }
             tracing::debug!(root = %self.configured.display(), waste, live, "site files copied into new buffers");
             files = repacked;
         }
@@ -778,6 +878,8 @@ pub struct Loader {
     budget: u64,
     lz4_min_saving: Option<u8>,
     reloadable: bool,
+    /// WEB_MAX_FILE_IN_MEMORY.
+    max_in_memory: Option<u64>,
 }
 
 impl Loader {
@@ -790,6 +892,7 @@ impl Loader {
                 bytes: sum.bytes + totals.bytes,
                 stored: sum.stored + totals.stored,
                 lz4: sum.lz4 + totals.lz4,
+                disk: sum.disk + totals.disk,
             }
         })
     }
@@ -817,7 +920,14 @@ impl Loader {
             budget: max_bytes,
             lz4_min_saving,
             reloadable: false,
+            max_in_memory: Some(DEFAULT_MAX_FILE_IN_MEMORY),
         }
+    }
+
+    /// Files larger than `max` are served from disk (`None`: every file in memory).
+    pub fn max_in_memory(mut self, max: Option<u64>) -> Loader {
+        self.max_in_memory = max;
+        self
     }
 
     /// Stores whose files a rescan may replace (`FileStore::load_with`).
@@ -866,6 +976,7 @@ impl Loader {
             &mut self.budget,
             self.lz4_min_saving,
             self.reloadable,
+            self.max_in_memory,
         )?);
         let totals = store.totals();
         tracing::info!(
@@ -874,6 +985,7 @@ impl Loader {
             bytes = totals.bytes,
             in_memory = totals.stored,
             lz4_files = totals.lz4,
+            disk_files = totals.disk,
             ms = started.elapsed().as_millis() as u64,
             "site files loaded"
         );
@@ -926,7 +1038,7 @@ mod tests {
         std::fs::write(dir.path().join("keep.txt"), "kept").unwrap();
         std::fs::write(dir.path().join("gone.txt"), "gone").unwrap();
         let mut budget = 1 << 20;
-        let store = FileStore::load_with(dir.path(), &mut budget, None, true).unwrap();
+        let store = FileStore::load_with(dir.path(), &mut budget, None, true, None).unwrap();
         let kept = store.file("/keep.txt").unwrap();
         let before = store.files();
 
@@ -962,6 +1074,37 @@ mod tests {
     }
 
     #[test]
+    fn files_over_the_limit_stay_on_disk_through_rescans() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.bin"), vec![1u8; 500]).unwrap();
+        std::fs::write(dir.path().join("large.bin"), vec![2u8; 2000]).unwrap();
+        let mut budget = 1 << 20;
+        let store = FileStore::load_with(dir.path(), &mut budget, None, true, Some(1000)).unwrap();
+        let totals = store.totals();
+        assert_eq!((totals.files, totals.disk, totals.stored), (2, 1, 500));
+        assert_eq!(
+            store.file("/large.bin").unwrap().on_disk(),
+            Some(dir.path().join("large.bin").as_path())
+        );
+        assert_eq!(budget, (1 << 20) - 500, "a file on disk takes nothing of the budget");
+
+        // Grown past the limit: on disk, not read; shrunk under it: read into memory.
+        std::fs::write(dir.path().join("small.bin"), vec![3u8; 1500]).unwrap();
+        std::fs::write(dir.path().join("large.bin"), vec![4u8; 100]).unwrap();
+        let found = store.rescan(1 << 20).unwrap();
+        assert_eq!((found.changed, found.totals.disk, found.totals.stored), (2, 1, 100));
+        assert!(store.file("/small.bin").unwrap().on_disk().is_some());
+        assert_eq!(&store.file("/large.bin").unwrap().body()[..], &[4u8; 100][..]);
+
+        // A new large file is recorded as found; an unchanged one is kept as it was.
+        let kept = store.file("/small.bin").unwrap();
+        std::fs::write(dir.path().join("new.bin"), vec![5u8; 5000]).unwrap();
+        let found = store.rescan(1 << 20).unwrap();
+        assert_eq!((found.added, found.changed, found.totals.disk), (1, 0, 2));
+        assert!(Arc::ptr_eq(&kept, &store.file("/small.bin").unwrap()));
+    }
+
+    #[test]
     fn buffers_mostly_of_replaced_files_are_copied_into_new_ones() {
         let dir = tempfile::tempdir().unwrap();
         let file = |i: usize, version: u8| vec![version; 64 * 1024 + i];
@@ -969,7 +1112,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("{i}.bin")), file(i, 0)).unwrap();
         }
         let mut budget = 1 << 30;
-        let store = FileStore::load_with(dir.path(), &mut budget, None, true).unwrap();
+        let store = FileStore::load_with(dir.path(), &mut budget, None, true, None).unwrap();
         assert_eq!(chunk_waste(&store.files().files).0, 0);
         assert!(store.files().files.len() > CHUNK / (64 * 1024), "several buffers");
 

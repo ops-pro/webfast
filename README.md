@@ -20,7 +20,7 @@ compared request by request ([`compat/`](compat)).
 ## What it does differently
 
 - **Files from memory, answers ready in advance.** Every site root is read at startup; requests
-  never touch the disk. For each path that serves a file the full answer — the 200 with all its
+  never touch the disk (but for files over `WEB_MAX_FILE_IN_MEMORY`, 16 MiB, streamed from it). For each path that serves a file the full answer — the 200 with all its
   headers and the 304 for its ETag, for every way a browser can rank zstd, br and gzip — is worked
   out once by the real handler chain; a request is then a lookup (0.8–0.9 µs in process).
 - **Changes picked up while running.** inotify on local filesystems, polling where events do not

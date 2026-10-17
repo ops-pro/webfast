@@ -21,7 +21,14 @@ fn load_watching(
 ) -> anyhow::Result<webfast::config::Config> {
     let file = webfast::caddyfile::parse_str(text, Path::new("Caddyfile"))?;
     let stores = running.map(Running::stores).unwrap_or_default();
-    webfast::load_parsed_reusing(&file, 1 << 24, None, watch, &stores)
+    webfast::load_parsed_reusing(
+        &file,
+        1 << 24,
+        None,
+        Some(webfast::files::DEFAULT_MAX_FILE_IN_MEMORY),
+        watch,
+        &stores,
+    )
 }
 
 /// One request on an open connection; the head and body as text.

@@ -106,6 +106,9 @@ Those an answer shows are checked by `compat/`:
 - A WebSocket tunnel keeps the place of the connection it came from, so it counts against the
   connection limits; it has no idle limit, and closes when the server stops (Caddy's default,
   `stream_close_delay 0`). `stream_timeout` and `stream_close_delay` are not supported.
+- A file larger than `WEB_MAX_FILE_IN_MEMORY` is streamed from disk with an ETag from its size and
+  modification time (as Caddy's), and answers at most one range: several get the whole file (Caddy:
+  multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
 - Early Hints (`respond 103`) go out over HTTP/3 only (Caddy: over every protocol); a file's ready
@@ -120,6 +123,7 @@ Those an answer shows are checked by `compat/`:
 | ---------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `LOG_LEVEL`                  | `info`      | the server's own log (JSON on stderr); `debug` also via the `debug` global option                                                                                                                                                                                  |
 | `WEB_MAX_MEMORY`             | `512MiB`    | what the site files may take in memory, over all roots; a site that does not fit stops the startup, a change that does not fit is not taken                                                                                                                        |
+| `WEB_MAX_FILE_IN_MEMORY`     | `16MiB`     | a larger file (a video, an archive) is not held in memory but streamed from disk for each response; `off`: every file in memory (docs/operations.md, Files and memory)                                                                                             |
 | `WEB_LZ4_MIN_SAVING`         | `25`        | a file of up to 1 MiB is kept as an LZ4 block when that saves at least this many percent; `off`: never                                                                                                                                                             |
 | `WEB_FILES_WATCH`            | `auto`      | changed files picked up: `auto` (inotify on a local filesystem, polling elsewhere), `inotify`, `poll`, `off` (the files as loaded at startup)                                                                                                                      |
 | `WEB_FILES_POLL`             | `30s`       | how often a polled root is looked at again                                                                                                                                                                                                                         |

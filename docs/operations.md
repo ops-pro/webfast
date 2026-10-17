@@ -194,6 +194,17 @@ A changed page is served about 0.6 s after it was written. Each new version of a
 30 bytes (its ETag and length) for the life of the process. `WEB_FILES_WATCH=off` keeps the files as
 loaded and holds them in one buffer, with a little less memory (2–3 MiB).
 
+A file larger than `WEB_MAX_FILE_IN_MEMORY` (16 MiB) — a video, an archive, a disk image — is not
+read at startup and takes nothing of `WEB_MAX_MEMORY`: only that it exists is recorded. Each
+response opens it and streams it, 64 KiB at a time read on the blocking pool while the previous
+piece is sent; its ETag and length come from the file as it is at that moment (size and
+modification time), so a file replaced on disk is answered right even before a rescan, and one
+that is gone gets a 404. Conditional requests and one range are answered as for files in memory
+(resuming a download, seeking in a video); a request for several ranges gets the whole file.
+Precompressed siblings work alike, each from memory or disk by its own size. These files have no
+ready answers. Measured (docs/performance.md): about 0.5 GB/s per download from the page cache,
+and 1–2 MB of memory per download under way.
+
 ## Logs
 
 The server's own log is JSON lines on stderr (`LOG_LEVEL`). At startup it says what was loaded and

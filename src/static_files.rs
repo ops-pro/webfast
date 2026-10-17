@@ -14,6 +14,7 @@ use http::header::{
     IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -143,6 +144,13 @@ impl FileServer {
                 chosen_encoding = Some(encoding);
                 break;
             }
+        }
+        // Too large for memory (WEB_MAX_FILE_IN_MEMORY): opened now, sent as it is read.
+        if let Some(path) = chosen.on_disk() {
+            let path = path.to_path_buf();
+            let content_type = entry.content_type.clone();
+            drop(files);
+            return serve_disk(ctx, response, path, chosen_encoding, content_type).await;
         }
         let etag = chosen.etag.clone();
         let length = chosen.length.clone();
@@ -314,6 +322,216 @@ impl FileServer {
                     .any(|element| crate::caddyfile::wildcard(pattern, element))
             }
         })
+    }
+}
+
+/// A file served from disk (WEB_MAX_FILE_IN_MEMORY): opened for this response, its ETag and length
+/// from the file as it is now (so a file changed since it was found is still answered right), its
+/// bytes read as they are sent (`DiskBody`). The preconditions are those of a file in memory; of
+/// ranges at most one is served — a request for several gets the whole file, which RFC 9110
+/// allows — so nothing is built in memory.
+async fn serve_disk(
+    mut ctx: Ctx,
+    mut response: Response<Body>,
+    path: PathBuf,
+    encoding: Option<Encoding>,
+    content_type: Option<HeaderValue>,
+) -> Response<Body> {
+    let error_status = ctx.error.as_ref().map(|e| e.status);
+    let method = ctx.req.method.clone();
+    if error_status.is_none() && method != Method::GET && method != Method::HEAD {
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        let response = ctx.respond(response);
+        return ctx.failed(response, None);
+    }
+    let opening = path.clone();
+    let opened = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        let file = std::fs::File::open(&opening)?;
+        let metadata = file.metadata()?;
+        Ok((file, metadata))
+    })
+    .await;
+    let (mut file, metadata) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return ctx.fail(StatusCode::NOT_FOUND, None),
+        Ok(Err(e)) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot open a site file");
+            return ctx.fail(StatusCode::INTERNAL_SERVER_ERROR, None);
+        }
+        Err(_) => return ctx.fail(StatusCode::INTERNAL_SERVER_ERROR, None),
+    };
+    let etag = HeaderValue::from_str(&crate::files::disk_etag(&metadata)).expect("ascii");
+    let total = metadata.len();
+
+    let request = &ctx.req.headers;
+    let if_match_failed = error_status.is_none()
+        && request
+            .get(IF_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|list| !etag_list_matches(list, &etag, true));
+    if !if_match_failed
+        && error_status.is_none()
+        && request
+            .get(IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|list| etag_list_matches(list, &etag, false))
+    {
+        response.headers_mut().insert(ETAG, etag);
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        return ctx.respond(response);
+    }
+    let headers = response.headers_mut();
+    headers.insert(ETAG, etag.clone());
+    if let Some(encoding) = encoding {
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
+    }
+    if !ctx.pre_headers.contains_key(CONTENT_TYPE)
+        && let Some(kind) = content_type
+    {
+        headers.insert(CONTENT_TYPE, kind);
+    }
+    if if_match_failed {
+        *response.status_mut() = StatusCode::PRECONDITION_FAILED;
+        return ctx.respond(response);
+    }
+
+    let range_allowed = error_status.is_none()
+        && match request.get(IF_RANGE).and_then(|v| v.to_str().ok()) {
+            Some(if_range) => {
+                let if_range = if_range.trim();
+                if_range.starts_with('"') && if_range == etag.to_str().unwrap_or_default()
+            }
+            None => true,
+        };
+    let range_header = request
+        .get(RANGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| range_allowed);
+    let ranges = match range_header.map(|h| parse_ranges(h, total)) {
+        None => Vec::new(),
+        Some(Ok(ranges)) => ranges,
+        Some(Err(RangeError::NoOverlap)) if total == 0 => Vec::new(),
+        Some(Err(RangeError::NoOverlap)) => {
+            let value = format!("bytes */{total}");
+            response
+                .headers_mut()
+                .insert(CONTENT_RANGE, HeaderValue::from_str(&value).expect("ascii"));
+            return serve_error(&mut ctx, response, "invalid range: failed to overlap");
+        }
+        Some(Err(RangeError::Invalid)) => return serve_error(&mut ctx, response, "invalid range"),
+    };
+    let (start, length, status) = match ranges[..] {
+        [(start, length)] if start + length <= total => {
+            let value = content_range(start, length, total);
+            response
+                .headers_mut()
+                .insert(CONTENT_RANGE, HeaderValue::from_str(&value).expect("ascii"));
+            (start, length, StatusCode::PARTIAL_CONTENT)
+        }
+        _ => (0, total, error_status.unwrap_or(StatusCode::OK)),
+    };
+    let headers = response.headers_mut();
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    *response.status_mut() = status;
+    if method != Method::HEAD && length > 0 {
+        if start > 0 {
+            use std::io::Seek;
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read a site file");
+                return ctx.fail(StatusCode::INTERNAL_SERVER_ERROR, None);
+            }
+        }
+        *response.body_mut() = crate::body::boxed(DiskBody::new(file, length));
+    }
+    ctx.respond(response)
+}
+
+/// A piece of a file being read on the blocking pool: the file back, and the bytes.
+type Reading = tokio::task::JoinHandle<std::io::Result<(std::fs::File, Vec<u8>)>>;
+
+/// How much of a file on disk is read at a time.
+const PIECE: usize = 64 << 10;
+
+/// `remaining` bytes of a file, read on the blocking pool a piece at a time — the next piece is
+/// being read while the last one is sent.
+struct DiskBody {
+    remaining: u64,
+    reading: Option<Reading>,
+}
+
+impl DiskBody {
+    fn new(file: std::fs::File, remaining: u64) -> DiskBody {
+        let mut body = DiskBody {
+            remaining,
+            reading: None,
+        };
+        body.read_next(file);
+        body
+    }
+
+    /// Starts reading the next piece (none when everything has been read). The piece's buffer is
+    /// allocated here, on the connection's thread, which also frees it once sent: allocated on the
+    /// blocking pool's threads instead, each with a heap of its own, the pieces stayed in those
+    /// heaps (16 downloads at once kept over 200 MB resident).
+    fn read_next(&mut self, mut file: std::fs::File) {
+        let want = (self.remaining.min(PIECE as u64)) as usize;
+        if want == 0 {
+            return;
+        }
+        let mut piece = vec![0u8; want];
+        self.reading = Some(tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut filled = 0;
+            while filled < want {
+                match file.read(&mut piece[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            piece.truncate(filled);
+            Ok((file, piece))
+        }));
+    }
+}
+
+impl http_body::Body for DiskBody {
+    type Data = bytes::Bytes;
+    type Error = crate::body::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        let Some(reading) = self.reading.as_mut() else {
+            return Poll::Ready(None);
+        };
+        use std::future::Future;
+        let read = std::task::ready!(std::pin::Pin::new(reading).poll(cx));
+        self.reading = None;
+        let (file, piece) = match read {
+            Ok(Ok(read)) => read,
+            Ok(Err(e)) => return Poll::Ready(Some(Err(Box::new(e)))),
+            Err(e) => return Poll::Ready(Some(Err(Box::new(e)))),
+        };
+        if piece.is_empty() {
+            return Poll::Ready(Some(Err("the file got shorter while it was being sent".into())));
+        }
+        self.remaining -= piece.len() as u64;
+        self.read_next(file);
+        Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from(piece)))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0 && self.reading.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
     }
 }
 

@@ -18,6 +18,10 @@
   configuration for their next request; `lazy`, the one they were accepted with, for as long as
   they stay open; `drain`, as lazy, and each is closed gracefully at a moment drawn at random
   within `WEB_RELOAD_DRAIN` (60 s), so that clients reconnect spread over it.
+- Files over `WEB_MAX_FILE_IN_MEMORY` (16 MiB; `off`: all in memory) are streamed from disk,
+  64 KiB at a time, instead of being held in memory: their ETag from size and modification time,
+  checked on each response; conditional requests and one range; no ready answers; nothing of
+  `WEB_MAX_MEMORY`.
 - `respond 103`: Early Hints, as in Caddy — the headers set so far go out as an interim response
   and the chain goes on. Sent over HTTP/3; over HTTP/1.1 and HTTP/2 (hyper sends no interim
   responses) the headers come with the final response.

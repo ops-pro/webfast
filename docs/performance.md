@@ -120,6 +120,16 @@ higher (it keeps freed memory for reuse; no growth). One changed page: 3–12 ms
 thousand requests/s, the page rewritten every 100 ms, every asset once): all 1.3 million responses
 200, the 100 changes looked at 6 times.
 
+## Large files from disk
+
+A 300 MB file over `WEB_MAX_FILE_IN_MEMORY`, from the page cache, plain release build, loopback
+(2026-10-17): four downloads at once took 0.68 s, about 0.5 GB/s each, every byte as on disk.
+Resident memory over rounds of 16 downloads at once: 24 MB idle, 47–55 MB after each round,
+with no growth over 8 rounds. Two things decided that: the 64 KiB pieces (256 KiB ones went
+0.9–1.7 GB/s per download but held 85–100 MB), and allocating each piece on the connection's
+thread — allocated on the blocking pool's threads, the pieces stayed in those threads' heaps,
+240 MB after one round and growing.
+
 ## Reloading
 
 What a request pays for the configuration to be replaceable (SIGHUP; docs/operations.md,

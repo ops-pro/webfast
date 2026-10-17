@@ -5,6 +5,7 @@
 //! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches;
 //! WEB_LZ4_MIN_SAVING (25): files are kept in memory as LZ4 when that saves at least this many
 //! percent (`off`: never; src/files.rs);
+//! WEB_MAX_FILE_IN_MEMORY (16MiB): larger files are served from disk (`off`: all in memory);
 //! WEB_MAX_CONNECTIONS (16384) and WEB_MAX_CONNECTIONS_PER_IP (256) open connections (0: no
 //! limit), WEB_STALL_TIMEOUT (30s): a response the client stops taking for that long ends its
 //! connection (src/guard.rs); WEB_TCP_CONGESTION (bbr; `system`: the kernel's default) for the
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_reusing, load_parsed_watching, parse_size, server};
+use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_reusing, parse_size, server};
 
 /// mimalloc: the requests' many small, short-lived allocations are cheaper than with glibc malloc.
 #[cfg(feature = "mimalloc")]
@@ -118,6 +119,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let max_in_memory = match webfast::files::max_file_in_memory_from_env() {
+        Ok(setting) => setting,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     let watch = match webfast::watch::Watch::from_env() {
         Ok(watch) => watch,
         Err(e) => {
@@ -131,7 +139,8 @@ fn main() -> ExitCode {
     } else {
         watch
     };
-    let loaded = runtime.block_on(async { load_parsed_watching(&file, max_memory, lz4_min_saving, watch) });
+    let loaded =
+        runtime.block_on(async { load_parsed_reusing(&file, max_memory, lz4_min_saving, max_in_memory, watch, &[]) });
     let mut config = match loaded {
         Ok(config) => config,
         Err(e) => {
@@ -148,12 +157,13 @@ fn main() -> ExitCode {
         let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
         let files = config.files;
         println!(
-            "valid configuration: {} port(s), {sites} site(s), {} files ({:.1} MiB; {:.1} MiB in memory, {} in LZ4), loaded in {} ms",
+            "valid configuration: {} port(s), {sites} site(s), {} files ({:.1} MiB; {:.1} MiB in memory, {} in LZ4, {} from disk), loaded in {} ms",
             config.servers.len(),
             files.files,
             files.bytes as f64 / 1048576.0,
             files.stored as f64 / 1048576.0,
             files.lz4,
+            files.disk,
             started.elapsed().as_millis()
         );
         return ExitCode::SUCCESS;
@@ -162,6 +172,7 @@ fn main() -> ExitCode {
         path: config_path,
         max_memory,
         lz4_min_saving,
+        max_in_memory,
         watch,
         workers,
         debug: config.debug,
@@ -286,6 +297,7 @@ struct Reload {
     path: PathBuf,
     max_memory: u64,
     lz4_min_saving: Option<u8>,
+    max_in_memory: Option<u64>,
     watch: webfast::watch::Watch,
     workers: Option<usize>,
     /// The `debug` option as started (logging is set up once).
@@ -307,6 +319,7 @@ async fn run(config: config::Config, started: std::time::Instant, reload: Reload
         files_mib = mib(files.bytes),
         files_in_memory_mib = mib(files.stored),
         lz4_files = files.lz4,
+        disk_files = files.disk,
         ready_paths = running.ready.paths,
         ready_answers = running.ready.answers,
         ready_mib = mib(running.ready.bytes),
@@ -343,10 +356,16 @@ async fn reload_config(running: &mut server::Running, reload: &Reload) -> anyhow
         tracing::warn!("the debug option takes effect on a restart");
     }
     let stores = running.stores();
-    let (max_memory, lz4_min_saving, watch) = (reload.max_memory, reload.lz4_min_saving, reload.watch);
-    let mut config =
-        tokio::task::spawn_blocking(move || load_parsed_reusing(&file, max_memory, lz4_min_saving, watch, &stores))
-            .await??;
+    let (max_memory, lz4_min_saving, max_in_memory, watch) = (
+        reload.max_memory,
+        reload.lz4_min_saving,
+        reload.max_in_memory,
+        reload.watch,
+    );
+    let mut config = tokio::task::spawn_blocking(move || {
+        load_parsed_reusing(&file, max_memory, lz4_min_saving, max_in_memory, watch, &stores)
+    })
+    .await??;
     limits_from_env(&mut config, reload.workers).map_err(anyhow::Error::msg)?;
     let grace = config.grace_period;
     let ports = config.servers.len();
