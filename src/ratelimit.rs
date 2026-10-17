@@ -29,6 +29,11 @@
 //! WEB_RATE_LIMIT_KEYS bounds the keys of a zone (when full, new keys are limited, as nginx does),
 //! WEB_RATE_LIMIT_DRY_RUN only logs. The state of a zone outlives a reload when its name, limits
 //! and key stay.
+//!
+//! WEB_MAX_UPSTREAM_REQUESTS_PER_IP (256) is the other limit here: how many requests a client may
+//! have at the upstreams at once (`reverse_proxy`, src/proxy.rs; a response counts until its body
+//! ends). One client cannot take all of an application's workers with slow requests, which a
+//! rate cannot express. A trusted proxy's own requests are not counted, the clients it names are.
 
 use crate::handler::Ctx;
 use crate::matcher::{Matcher, MatcherSet};
@@ -51,7 +56,13 @@ static MAX_KEYS: AtomicUsize = AtomicUsize::new(DEFAULT_KEYS);
 /// WEB_RATE_LIMIT_DRY_RUN: limited requests are only counted and logged.
 static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
-/// WEB_RATE_LIMIT_KEYS (a count) and WEB_RATE_LIMIT_DRY_RUN (`on` / `off`).
+/// The default of WEB_MAX_UPSTREAM_REQUESTS_PER_IP.
+pub const DEFAULT_UPSTREAM_PER_IP: usize = 256;
+/// WEB_MAX_UPSTREAM_REQUESTS_PER_IP: a client's requests at the upstreams at once; 0: no limit.
+static MAX_UPSTREAM: AtomicUsize = AtomicUsize::new(DEFAULT_UPSTREAM_PER_IP);
+
+/// WEB_RATE_LIMIT_KEYS (a count), WEB_RATE_LIMIT_DRY_RUN (`on` / `off`) and
+/// WEB_MAX_UPSTREAM_REQUESTS_PER_IP (a count, 0: no limit).
 pub fn configure_from_env() -> Result<(), String> {
     if let Ok(value) = std::env::var("WEB_RATE_LIMIT_KEYS") {
         match value.trim().parse::<usize>() {
@@ -71,7 +82,81 @@ pub fn configure_from_env() -> Result<(), String> {
         };
         DRY_RUN.store(on, Ordering::Relaxed);
     }
+    if let Ok(value) = std::env::var("WEB_MAX_UPSTREAM_REQUESTS_PER_IP") {
+        let n = value.trim().parse::<usize>().map_err(|_| {
+            format!("WEB_MAX_UPSTREAM_REQUESTS_PER_IP: a number of requests (0: no limit), not {value:?}")
+        })?;
+        set_max_upstream_requests_per_ip(n);
+    }
     Ok(())
+}
+
+/// WEB_MAX_UPSTREAM_REQUESTS_PER_IP, as configure_from_env sets it (0: no limit).
+pub fn set_max_upstream_requests_per_ip(n: usize) {
+    MAX_UPSTREAM.store(n, Ordering::Relaxed);
+}
+
+/// The requests at the upstreams per client: the client's address (an IPv6 /64 is one, as for
+/// connections, src/guard.rs), hashed with the process's key, → how many.
+struct InFlight {
+    hasher: std::hash::RandomState,
+    shards: Vec<Mutex<FxHashMap<u64, usize>>>,
+    /// Requests refused since the last summary.
+    refused: AtomicU64,
+}
+
+static IN_FLIGHT: LazyLock<InFlight> = LazyLock::new(|| InFlight {
+    hasher: std::hash::RandomState::new(),
+    shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
+    refused: AtomicU64::new(0),
+});
+
+/// A request's slot at the upstreams, given back when dropped: src/proxy.rs keeps it with the
+/// response's body, so that a response counts until it ends.
+pub struct UpstreamSlot {
+    key: u64,
+}
+
+/// A client that has all its slots at the upstreams (the request is refused with 429).
+pub struct Refused;
+
+/// A slot at the upstreams for the request's client: `Ok(None)` when it is not limited (no
+/// limit, or a trusted proxy that names no client), `Refused` when the client has all its slots.
+/// With WEB_RATE_LIMIT_DRY_RUN a client over its limit is counted and logged, and goes on.
+pub fn upstream_slot(ctx: &Ctx) -> Result<Option<UpstreamSlot>, Refused> {
+    let max = MAX_UPSTREAM.load(Ordering::Relaxed);
+    if max == 0 || (ctx.conn.trusted && ctx.client_ip == ctx.conn.remote.ip()) {
+        return Ok(None);
+    }
+    let in_flight = &*IN_FLIGHT;
+    let key = in_flight.hasher.hash_one(crate::guard::address_key(ctx.client_ip));
+    let mut shard = in_flight.shards[(key as usize) % SHARDS]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let count = shard.entry(key).or_insert(0);
+    if *count >= max {
+        in_flight.refused.fetch_add(1, Ordering::Relaxed);
+        start_sweeper();
+        if !DRY_RUN.load(Ordering::Relaxed) {
+            return Err(Refused);
+        }
+    }
+    *count += 1;
+    Ok(Some(UpstreamSlot { key }))
+}
+
+impl Drop for UpstreamSlot {
+    fn drop(&mut self) {
+        let mut shard = IN_FLIGHT.shards[(self.key as usize) % SHARDS]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = shard.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                shard.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Monotonic nanoseconds since the first use (the zones' clock).
@@ -379,14 +464,28 @@ impl ZoneState {
     }
 }
 
-/// The thread that sweeps the zones and logs what they limited, each at its `sweep_interval`.
+/// The thread that sweeps the zones and logs what they limited, each at its `sweep_interval`,
+/// and the requests refused at the upstreams once a minute.
 fn start_sweeper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let spawned = std::thread::Builder::new().name("web-ratelimit".into()).spawn(|| {
             let mut last: FxHashMap<usize, Instant> = FxHashMap::default();
+            let mut upstream_logged = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
+                if upstream_logged.elapsed() >= Duration::from_secs(60) {
+                    upstream_logged = Instant::now();
+                    let refused = IN_FLIGHT.refused.swap(0, Ordering::Relaxed);
+                    if refused > 0 {
+                        let message = if DRY_RUN.load(Ordering::Relaxed) {
+                            "requests would be refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP, WEB_RATE_LIMIT_DRY_RUN)"
+                        } else {
+                            "requests refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP)"
+                        };
+                        tracing::warn!(refused, "{message}");
+                    }
+                }
                 let zones: Vec<Arc<ZoneState>> = {
                     let mut zones = ZONES.lock().unwrap_or_else(PoisonError::into_inner);
                     zones.retain(|zone| zone.strong_count() > 0);

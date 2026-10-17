@@ -35,6 +35,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/early_hints.rs`                           | `respond 103`: Early Hints over HTTP/3, the headers with the final response elsewhere               |
 | `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |
 | `tests/ratelimit.rs`                             | `rate_limit`: zones, 429 and `handle_errors`, ready answers, reloads                                |
+| `tests/upstream_limit.rs`                        | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, against an upstream that holds its answers                      |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -66,8 +67,9 @@ CI ([`.gitlab-ci.yml`](../.gitlab-ci.yml)) runs the same jobs on every push and 
 builds the image on the default branch and tags.
 
 Cargo features, both on by default: `mimalloc` (the allocator of the binary and of
-`examples/bench.rs`) and `rate-limit` (`rate_limit`, src/ratelimit.rs; without it the directive
-stops the startup with an error that says so). `--no-default-features` builds the server without
+`examples/bench.rs`) and `rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`,
+src/ratelimit.rs; without it the directive and its variables stop the startup with an error that
+says so). `--no-default-features` builds the server without
 them; clippy checks that build too.
 
 ## Tests
@@ -90,7 +92,10 @@ connections (HTTP/1.1 and HTTP/3) are closed spread over the window; on Linux it
 SIGHUP and SIGTERM to the binary. `tests/ratelimit.rs` (with the feature) sends requests through
 zones of every kind of key: the tightest zone exceeded answers, through `handle_errors`, with its
 name and `Retry-After`; the paths no zone takes keep their ready answers; a reload keeps the
-counts; what the plugin has and webfast does not is refused.
+counts; what the plugin has and webfast does not is refused. `tests/upstream_limit.rs` holds
+requests at an upstream until a client has its limit of them: the next is refused, a page is not, a
+trusted proxy's own requests pass and the clients it names are each limited, and the slots come
+back when the responses end.
 
 ## The PGO build
 

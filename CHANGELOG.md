@@ -37,6 +37,9 @@
   `WEB_RATE_LIMIT_KEYS` (a million) bounds the keys of a zone, `WEB_RATE_LIMIT_DRY_RUN` only
   counts. The counts outlive a reload; the paths no zone takes keep their ready answers. Checked
   against Caddy with the plugin (`SCENARIO=ratelimit`).
+- With the same feature, `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` (256): a client's requests at the
+  upstreams at once, a response counting until its body ends; more are refused with 429. Behind a
+  trusted proxy, the client it names; the proxy's own requests are not limited.
 - An HTTP/3 connection asked to finish (idle, or drained) with no request left is closed at once
   after its GOAWAY, not 10 s later.
 - Per request, only the connection's own reference counts change: the port's state and the

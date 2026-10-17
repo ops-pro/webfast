@@ -92,7 +92,7 @@ impl Admission {
 }
 
 /// IPv6 addresses count per /64 (one subscriber's network); IPv4 per address.
-fn address_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn address_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let segments = v6.segments();

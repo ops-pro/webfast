@@ -151,12 +151,21 @@ impl ReverseProxy {
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
             return ctx.status(StatusCode::BAD_GATEWAY);
         }
+        // The client's slot at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP), held until the
+        // response ends.
+        #[cfg(feature = "rate-limit")]
+        let slot = match crate::ratelimit::upstream_slot(&ctx) {
+            Ok(slot) => slot,
+            Err(_) => return ctx.fail(StatusCode::TOO_MANY_REQUESTS, None),
+        };
+        #[cfg(not(feature = "rate-limit"))]
+        let slot: Slot = None;
         // A WebSocket handshake on a connection that can be handed over (HTTP/1.1); anything else
         // goes on as an ordinary request, its Upgrade dropped as hop-by-hop.
         if let Some(protocol) = upgrade_of(&ctx.req.headers)
             && let Some(client) = ctx.req.extensions.remove::<OnUpgrade>()
         {
-            return self.tunnel(ctx, protocol, client).await;
+            return self.tunnel(ctx, protocol, client, slot).await;
         }
         let headers = self.upstream_headers(&ctx);
         let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
@@ -224,7 +233,7 @@ impl ReverseProxy {
                 for op in &rendered_down {
                     op.apply(&mut parts.headers);
                 }
-                ctx.respond_appending(Response::from_parts(parts, boxed(incoming)))
+                ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), slot)))
             }
             Err(status) => ctx.fail(status, None),
         }
@@ -247,7 +256,7 @@ impl ReverseProxy {
     /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own;
     /// when it answers 101, the client's connection and that one become a tunnel, copied both ways
     /// until either side closes. Any other answer is passed on as it is, with no tunnel.
-    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade) -> Response<Body> {
+    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade, slot: Slot) -> Response<Body> {
         let mut headers = self.upstream_headers(&ctx);
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, protocol);
@@ -293,8 +302,10 @@ impl ReverseProxy {
             for op in &rendered_down {
                 op.apply(&mut parts.headers);
             }
-            return ctx.respond_appending(Response::from_parts(parts, boxed(incoming)));
+            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), slot)));
         }
+        // A tunnel counts as the connection it came from (src/guard.rs), not as a request: its
+        // slot is given back with this answer.
         let upstream_io = hyper::upgrade::on(&mut response);
         let (mut parts, _) = response.into_parts();
         let switched_to = parts.headers.get(UPGRADE).cloned();
@@ -328,6 +339,57 @@ impl ReverseProxy {
             }
         });
         ctx.respond_appending(Response::from_parts(parts, crate::body::empty()))
+    }
+}
+
+/// A request's slot at the upstreams (src/ratelimit.rs, WEB_MAX_UPSTREAM_REQUESTS_PER_IP).
+#[cfg(feature = "rate-limit")]
+type Slot = Option<crate::ratelimit::UpstreamSlot>;
+#[cfg(not(feature = "rate-limit"))]
+type Slot = Option<std::convert::Infallible>;
+
+/// A response body that holds the request's slot at the upstreams until it ends (or is dropped).
+#[cfg(feature = "rate-limit")]
+fn holding(body: Body, slot: Slot) -> Body {
+    match slot {
+        Some(slot) => crate::body::boxed(Holding { body, slot: Some(slot) }),
+        None => body,
+    }
+}
+
+#[cfg(not(feature = "rate-limit"))]
+fn holding(body: Body, _: Slot) -> Body {
+    body
+}
+
+#[cfg(feature = "rate-limit")]
+struct Holding {
+    body: Body,
+    slot: Option<crate::ratelimit::UpstreamSlot>,
+}
+
+#[cfg(feature = "rate-limit")]
+impl http_body::Body for Holding {
+    type Data = bytes::Bytes;
+    type Error = crate::body::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.slot = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
