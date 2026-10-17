@@ -1,17 +1,19 @@
 // Differential check: sends the same requests to Caddy and to webfast (same Caddyfile, same site)
 // and reports every difference in status, headers and (decoded) body.
-//   node compare.mjs http://caddy:8080 http://ours:8080 [sample|errors]
+//   node compare.mjs http://caddy:8080 http://ours:8080 [sample|errors|ratelimit]
 // The scenario picks the requests: `sample` for sample/Caddyfile, `errors` for
-// compat/errors.Caddyfile. Expected differences are listed, not failed: ETag values (ours hash the
-// content), Last-Modified (ours have none), Via on proxied responses (Caddy adds one), the
+// compat/errors.Caddyfile, `ratelimit` for compat/ratelimit.Caddyfile (sent in order: the counts
+// of both servers move together). Expected differences are listed, not failed: ETag values (ours
+// hash the content), Last-Modified (ours have none), Via on proxied responses (Caddy adds one), the
 // compressed bytes of on-the-fly encoding (different compressors; the decoded bodies must match),
-// and deferred site headers on failed requests (ours keep them).
+// deferred site headers on failed requests (ours keep them), and Retry-After values (the plugin's
+// sliding window and our GCRA count differently).
 import http from 'node:http';
 import zlib from 'node:zlib';
 
 const [caddyBase, oursBase, scenario = 'sample'] = process.argv.slice(2);
-if (!caddyBase || !oursBase || !['sample', 'errors'].includes(scenario)) {
-  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url> [sample|errors]');
+if (!caddyBase || !oursBase || !['sample', 'errors', 'ratelimit'].includes(scenario)) {
+  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url> [sample|errors|ratelimit]');
   process.exit(2);
 }
 
@@ -35,6 +37,16 @@ const errorCases = [
   ['POST', '/en/contact.html'],
   ['DELETE', '/sw.js'],
   ['GET', '/api/forms/x'],
+];
+const rateLimitCases = [
+  ...Array(5).fill(['GET', '/together/a']),
+  ['POST', '/login'],
+  ['POST', '/login'],
+  ['POST', '/login'],
+  ['GET', '/login'],
+  ['GET', '/both/x'],
+  ['GET', '/both/x'],
+  ['GET', '/other'],
 ];
 const sampleCases = [
   ['GET', '/healthz'],
@@ -109,7 +121,7 @@ const sampleCases = [
   ['GET', '/stream/card'],
   ['GET', '/missing'],
 ];
-const cases = scenario === 'errors' ? errorCases : sampleCases;
+const cases = { sample: sampleCases, errors: errorCases, ratelimit: rateLimitCases }[scenario];
 
 function request(base, method, path, headers = {}, body) {
   const url = new URL(base);
@@ -191,7 +203,7 @@ const DEFERRED_ON_ERRORS = new Set([
   'x-frame-options',
 ]);
 // The statuses of failed requests in each scenario (handle_errors may answer with another).
-const FAILED = (status) => status === 405 || (scenario === 'errors' && status >= 400);
+const FAILED = (status) => status === 405 || (scenario !== 'sample' && status >= 400);
 
 let failures = 0;
 const known = new Map();
@@ -215,6 +227,12 @@ for (const [method, path, headers, body] of cases) {
     if (va === vb) continue;
     if (a.status === b.status && FAILED(a.status) && DEFERRED_ON_ERRORS.has(name)) {
       const kind = 'deferred site headers on failed requests (ours keep them)';
+      known.set(kind, (known.get(kind) ?? 0) + 1);
+      continue;
+    }
+    // How long to wait: a sliding window (the plugin) and GCRA (ours) count differently.
+    if (name === 'retry-after' && va && vb) {
+      const kind = 'retry-after values (sliding window vs GCRA)';
       known.set(kind, (known.get(kind) ?? 0) + 1);
       continue;
     }

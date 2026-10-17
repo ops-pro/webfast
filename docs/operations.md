@@ -246,6 +246,7 @@ What keeps one client from holding the server:
 
 | Threat                                                | Limit                                                                                                                                                             |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Many requests from one client (a login form, an API)  | `rate_limit` zones (docs/configuration.md, Rate limits): 429 with `Retry-After`, the zone's count logged once per `sweep_interval`                                |
 | Many connections (one address, or many)               | `WEB_MAX_CONNECTIONS_PER_IP` (256; an IPv6 /64 is one address; trusted proxies exempt) and `WEB_MAX_CONNECTIONS` (16 384), TCP and QUIC together: refused at once |
 | Slowloris: headers sent byte by byte                  | `timeouts { read_header }` (30 s) for the whole header block; the TLS handshake gets 10 s                                                                         |
 | Connections opened and left silent                    | HTTP/2 and HTTP/3 must send their first request within `read_header` (HTTP/1.1 already must)                                                                      |

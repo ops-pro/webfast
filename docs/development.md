@@ -16,6 +16,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `src/static_files.rs`                            | `file_server`: index files, canonical slashes, precompressed siblings, conditional requests, ranges |
 | `src/files.rs`                                   | the site files in memory: ETags, LZ4, snapshots replaced on change                                  |
 | `src/memo.rs`                                    | ready answers for the files                                                                         |
+| `src/ratelimit.rs`                               | `rate_limit` (cargo feature `rate-limit`): GCRA zones                                               |
 | `src/watch.rs`                                   | changed files picked up: inotify or polling                                                         |
 | `src/encode.rs`                                  | Accept-Encoding and on-the-fly zstd / Brotli / gzip                                                 |
 | `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; WebSocket tunnels                                          |
@@ -33,6 +34,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/disk.rs`                                  | files over `WEB_MAX_FILE_IN_MEMORY`, streamed from disk                                             |
 | `tests/early_hints.rs`                           | `respond 103`: Early Hints over HTTP/3, the headers with the final response elsewhere               |
 | `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |
+| `tests/ratelimit.rs`                             | `rate_limit`: zones, 429 and `handle_errors`, ready answers, reloads                                |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -53,7 +55,7 @@ scripts/check.sh fmt clippy # some
 | Check    | What                                                                                    |
 | -------- | --------------------------------------------------------------------------------------- |
 | `fmt`    | `cargo fmt --check` (rustfmt.toml: edition 2024, 120 columns)                           |
-| `clippy` | `cargo clippy --all-targets -- -D warnings`                                             |
+| `clippy` | `cargo clippy --all-targets -- -D warnings`, also with `--no-default-features`          |
 | `test`   | `cargo test` on the current stable Rust                                                 |
 | `msrv`   | `cargo test` on the `rust-version` of Cargo.toml                                        |
 | `deny`   | `cargo deny check`: advisories (RustSec), licenses, banned or duplicate crates, sources |
@@ -62,6 +64,11 @@ scripts/check.sh fmt clippy # some
 directory and the tools in Docker volumes (`webfast-cargo`, `webfast-target`, `webfast-tools`).
 CI ([`.gitlab-ci.yml`](../.gitlab-ci.yml)) runs the same jobs on every push and merge request, and
 builds the image on the default branch and tags.
+
+Cargo features, both on by default: `mimalloc` (the allocator of the binary and of
+`examples/bench.rs`) and `rate-limit` (`rate_limit`, src/ratelimit.rs; without it the directive
+stops the startup with an error that says so). `--no-default-features` builds the server without
+them; clippy checks that build too.
 
 ## Tests
 
@@ -80,7 +87,10 @@ certificates are the new configuration's, a connection's trust follows `trusted_
 what needs a restart is refused; with `WEB_RELOAD=lazy` an open connection keeps its
 configuration while a new one gets the new, and both serve changed files; with `drain` the old
 connections (HTTP/1.1 and HTTP/3) are closed spread over the window; on Linux it also sends
-SIGHUP and SIGTERM to the binary.
+SIGHUP and SIGTERM to the binary. `tests/ratelimit.rs` (with the feature) sends requests through
+zones of every kind of key: the tightest zone exceeded answers, through `handle_errors`, with its
+name and `Retry-After`; the paths no zone takes keep their ready answers; a reload keeps the
+counts; what the plugin has and webfast does not is refused.
 
 ## The PGO build
 
@@ -112,6 +122,7 @@ cargo build --release --example train --example bench --example rtt
 ```bash
 WEBFAST_BIN=target/release/webfast TRAIN_BIN=target/release/examples/train compat/run.sh
 SCENARIO=errors WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh   # handle_errors and error
+SCENARIO=ratelimit WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh   # rate_limit, against caddy-ratelimit
 ```
 
 Caddy (`caddy:2-alpine`) and webfast serve the same Caddyfile and site from Docker volumes, stub
@@ -122,8 +133,11 @@ proxying, SSE — comparing status, headers and decoded bodies. Expected differe
 something else; the request list is written for the sample site. `SCENARIO=errors` serves
 `compat/errors.Caddyfile` instead, a configuration that fails requests in every way it can
 (file_server's 404 and 405, `error`, an upstream that cannot be reached) and answers them with
-`handle_errors` blocks. Stock Caddy has no Brotli encoder, so both get the Caddyfile without `br`
-in `encode`.
+`handle_errors` blocks. `SCENARIO=ratelimit` serves `compat/ratelimit.Caddyfile` to a Caddy
+built with the caddy-ratelimit plugin (`compat/caddy-plugins.Dockerfile`, built by run.sh unless
+`CADDY_IMAGE` names one) and sends both the same requests in the same order, until each zone
+refuses; the `Retry-After` values are expected to differ. Stock Caddy has no Brotli encoder, so
+both get the Caddyfile without `br` in `encode`.
 
 ## Benchmarks
 

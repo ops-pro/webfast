@@ -193,6 +193,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "rewrite",
     "uri",
     "try_files",
+    "rate_limit",
     "basicauth",
     "basic_auth",
     "forward_auth",
@@ -1301,6 +1302,7 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
             }
             Ok(vec![entry(name, matcher, Handler::Respond { status, body, close })])
         }
+        "rate_limit" => parse_rate_limit(line, cx, site),
         "error" => {
             let (matcher, start) = matcher_token(line, scope)?;
             let args = &line.tokens[start..];
@@ -1684,6 +1686,154 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         client,
         counter: AtomicUsize::new(0),
     })
+}
+
+/// `rate_limit { zone <name> { match { … } key … events … window … ipv4_prefix … ipv6_prefix … }
+/// jitter … sweep_interval … log_key }`, as the caddy-ratelimit plugin reads it (no matcher before
+/// the block; zones need `events` and `window`). Not supported: `distributed`, `storage`,
+/// `disable_metrics`.
+#[cfg(feature = "rate-limit")]
+fn parse_rate_limit(line: &Line, cx: &mut Cx, site: &mut SiteCx) -> Result<Vec<Entry>> {
+    use crate::ratelimit::{Options, RateLimit, ZoneSpec};
+    if line.tokens.len() > 1 {
+        bail!(at_err(
+            &line.at,
+            "rate_limit takes no arguments: each zone has its own `match`"
+        ));
+    }
+    let mut zones = Vec::new();
+    let mut options = Options {
+        jitter: 0.0,
+        sweep_interval: Duration::from_secs(60),
+        log_key: false,
+    };
+    for sub in line.block.as_deref().unwrap_or(&[]) {
+        let args = &sub.tokens[1..];
+        match sub.name() {
+            "zone" => {
+                let [name] = args else {
+                    bail!(at_err(&sub.at, "rate_limit: `zone <name> { … }`"));
+                };
+                if zones.iter().any(|z: &ZoneSpec| z.name == name.text) {
+                    bail!(token_err(
+                        name,
+                        format!("rate_limit: zone {} is defined twice", name.text)
+                    ));
+                }
+                let mut zone = ZoneSpec {
+                    name: name.text.clone(),
+                    matcher: None,
+                    key: Template::default(),
+                    events: 0,
+                    window: Duration::ZERO,
+                    ipv4_prefix: 0,
+                    ipv6_prefix: 0,
+                };
+                for field in sub.block.as_deref().unwrap_or(&[]) {
+                    let value = field.tokens.get(1);
+                    let one = || {
+                        value
+                            .filter(|_| field.tokens.len() == 2)
+                            .ok_or_else(|| at_err(&field.at, format!("rate_limit: `{} <value>`", field.name())))
+                    };
+                    match field.name() {
+                        "match" => {
+                            let mut set = zone.matcher.take().unwrap_or_default();
+                            for m in field.block.as_deref().unwrap_or(&[]) {
+                                add_matcher(
+                                    &mut set,
+                                    m.name(),
+                                    &m.tokens[1..],
+                                    m.block.as_deref(),
+                                    &m.at,
+                                    &zone.name,
+                                    cx,
+                                    site,
+                                )?;
+                            }
+                            zone.matcher = Some(set);
+                        }
+                        "key" => zone.key = template(one()?)?,
+                        "events" => {
+                            zone.events = one()?
+                                .text
+                                .parse()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| at_err(&field.at, "rate_limit: events is a positive number"))?
+                        }
+                        "window" => {
+                            zone.window = parse_duration(&one()?.text).map_err(|e| at_err(&field.at, e))?;
+                        }
+                        "ipv4_prefix" | "ipv6_prefix" => {
+                            let max = if field.name() == "ipv4_prefix" { 32 } else { 128 };
+                            let bits: u8 =
+                                one()?.text.parse().ok().filter(|b| *b <= max).ok_or_else(|| {
+                                    at_err(&field.at, format!("rate_limit: a prefix of 0–{max} bits"))
+                                })?;
+                            if field.name() == "ipv4_prefix" {
+                                zone.ipv4_prefix = bits;
+                            } else {
+                                zone.ipv6_prefix = bits;
+                            }
+                        }
+                        other => bail!(at_err(
+                            &field.at,
+                            format!("rate_limit: unsupported zone option {other:?}")
+                        )),
+                    }
+                }
+                if zone.events == 0 || zone.window.is_zero() {
+                    bail!(at_err(
+                        &sub.at,
+                        "a rate limit zone requires both a window and maximum events"
+                    ));
+                }
+                zones.push(zone);
+            }
+            "jitter" => {
+                options.jitter = args
+                    .first()
+                    .filter(|_| args.len() == 1)
+                    .and_then(|t| t.text.parse::<f64>().ok())
+                    .filter(|j| *j >= 0.0 && j.is_finite())
+                    .ok_or_else(|| at_err(&sub.at, "rate_limit: `jitter <fraction>`, 0 or more"))?;
+            }
+            "sweep_interval" => {
+                let [value] = args else {
+                    bail!(at_err(&sub.at, "rate_limit: `sweep_interval <duration>`"));
+                };
+                options.sweep_interval = parse_duration(&value.text)
+                    .map_err(|e| token_err(value, e))?
+                    .max(Duration::from_secs(1));
+            }
+            "log_key" => {
+                no_block(sub)?;
+                if !args.is_empty() {
+                    bail!(at_err(&sub.at, "rate_limit: log_key takes no value"));
+                }
+                options.log_key = true;
+            }
+            "distributed" | "storage" | "disable_metrics" => bail!(at_err(
+                &sub.at,
+                format!("rate_limit: {} is not supported (limits are per instance)", sub.name())
+            )),
+            other => bail!(at_err(&sub.at, format!("rate_limit: unsupported option {other:?}"))),
+        }
+    }
+    if zones.is_empty() {
+        bail!(at_err(&line.at, "rate_limit needs a zone"));
+    }
+    let limit = RateLimit::new(zones, options);
+    Ok(vec![entry("rate_limit", None, Handler::RateLimit(Arc::new(limit)))])
+}
+
+#[cfg(not(feature = "rate-limit"))]
+fn parse_rate_limit(line: &Line, _: &mut Cx, _: &mut SiteCx) -> Result<Vec<Entry>> {
+    bail!(at_err(
+        &line.at,
+        "rate_limit: this webfast was built without it (cargo feature rate-limit)"
+    ))
 }
 
 fn parse_matcher_def(line: &Line, name: &str, cx: &mut Cx, site: &mut SiteCx) -> Result<MatcherSet> {

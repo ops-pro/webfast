@@ -163,6 +163,26 @@ No difference within the noise: a variant's own runs spread over 10–25 µs at 
 by 10–30 thousand requests/s flat out, while what is measured costs nanoseconds. The choice
 between the modes is about what open connections get after a reload, not about speed.
 
+## Rate limits
+
+`examples/bench.rs` on the sample site, plain release builds, 2026-10-17, two passes in opposite
+order (median ns per request of 10 rounds of 200 000): built without the `rate-limit` feature,
+with it and no `rate_limit`, and with a zone on `/en/*` keyed by `{client_ip}` (never exceeded):
+
+| Build                        | `/en/` ready answer | `/en/` through the chain | `/en/contact` through the chain |
+| ---------------------------- | ------------------- | ------------------------ | ------------------------------- |
+| without the feature          | 953, 968            | 3488, 3465               | 3813, 3793                      |
+| with it, no zone             | 958, 938            | 3406, 3429               | 3742, 3763                      |
+| with it, a zone on the paths | (none: in the zone) | 3665, 3849               | 3981, 4459                      |
+
+Built in and not configured, it costs nothing: the directive is a step of the chain only where it
+is written. A zone costs its paths their ready answers (the request is counted, so it goes through
+the chain) and some 0.2–0.3 µs on the chain: the matcher, a monotonic clock read (35 ns here), a
+keyed hash of the address (10 ns), one shard's lock and its map (15 ns). Against the 21 µs of CPU
+a page takes in the server flat out (Reloading, above: sockets, protocol, log), 1–1.5 %; a
+request to an application behind `reverse_proxy` costs far more than that. Put zones on what needs
+them (logins, forms, an API), not on the static files, which lose their ready answers too.
+
 ## The way here
 
 Handler chain in process, a page as br (precompressed):

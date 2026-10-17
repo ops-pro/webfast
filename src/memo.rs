@@ -57,6 +57,16 @@ fn every_preference() -> Vec<(u16, String)> {
 #[derive(Debug, Clone, Copy)]
 pub struct Preparing;
 
+/// Set by a handler that the request would have gone through differently live (a `rate_limit`
+/// zone takes it): the answer is not kept.
+#[derive(Debug, Clone, Copy)]
+pub struct Unkept;
+
+/// The response being made is to be kept as a ready answer.
+pub fn keeps(request: &http::request::Parts) -> bool {
+    request.extensions.get::<Preparing>().is_some() && request.extensions.get::<Unkept>().is_none()
+}
+
 /// Marks a response that `file_server` made from a stored file as it is, and names the file
 /// (`encode` takes the mark off when it compresses the body). Only for `Preparing` requests:
 /// inserting it costs an allocation, which other requests need not pay.
@@ -427,6 +437,10 @@ fn decided_by_path(routes: &[Route]) -> bool {
                 | Handler::Respond { .. }
                 | Handler::Error { .. }
                 | Handler::Proxy(_) => true,
+                // A path that a zone takes gets no ready answer (`Unkept`); the zones must
+                // tell those paths by the path.
+                #[cfg(feature = "rate-limit")]
+                Handler::RateLimit(limit) => limit.decided_by_path(),
             }
     })
 }

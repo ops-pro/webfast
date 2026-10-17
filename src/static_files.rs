@@ -208,7 +208,7 @@ impl FileServer {
         {
             response.headers_mut().insert(ETAG, etag);
             *response.status_mut() = StatusCode::NOT_MODIFIED;
-            if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+            if crate::memo::keeps(&ctx.req) {
                 response.extensions_mut().insert(crate::memo::FromFile(chosen.clone()));
             }
             return ctx.respond(response);
@@ -323,7 +323,7 @@ impl FileServer {
         if method != Method::HEAD {
             *response.body_mut() = full(body);
         }
-        if status == StatusCode::OK && ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+        if status == StatusCode::OK && crate::memo::keeps(&ctx.req) {
             response.extensions_mut().insert(crate::memo::FromFile(chosen.clone()));
         }
         ctx.respond(response)

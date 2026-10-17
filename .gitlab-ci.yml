@@ -29,6 +29,8 @@ clippy:
   script:
     - rustup component add clippy
     - cargo clippy --locked --all-targets -- -D warnings
+    # The optional modules (rate-limit) left out: the core builds on its own.
+    - cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
 test:
   extends: .rust

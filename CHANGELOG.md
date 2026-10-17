@@ -28,6 +28,15 @@
 - `respond 103`: Early Hints, as in Caddy — the headers set so far go out as an interim response
   and the chain goes on. Sent over HTTP/3; over HTTP/1.1 and HTTP/2 (hyper sends no interim
   responses) the headers come with the final response.
+- `rate_limit` (cargo feature `rate-limit`, on by default), in the syntax of Caddy's
+  caddy-ratelimit plugin: zones of a matcher, a key (`{client_ip}`, any placeholder, `static`;
+  `ipv4_prefix`, `ipv6_prefix`), `events` and `window`; `jitter`, `sweep_interval`,
+  `log_key`. Each zone is a GCRA in 64 shards with keyed hashes; the tightest zone exceeded
+  refuses with 429 and `Retry-After`, which `handle_errors 429` can answer
+  (`{http.rate_limit.exceeded.name}`). Refused requests are logged as a summary per zone;
+  `WEB_RATE_LIMIT_KEYS` (a million) bounds the keys of a zone, `WEB_RATE_LIMIT_DRY_RUN` only
+  counts. The counts outlive a reload; the paths no zone takes keep their ready answers. Checked
+  against Caddy with the plugin (`SCENARIO=ratelimit`).
 - An HTTP/3 connection asked to finish (idle, or drained) with no request left is closed at once
   after its GOAWAY, not 10 s later.
 - Per request, only the connection's own reference counts change: the port's state and the

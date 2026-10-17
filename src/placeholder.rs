@@ -51,6 +51,17 @@ enum Var {
     ErrorStatusCode,
     ErrorStatusText,
     ErrorMessage,
+    /// In `handle_errors` routes: the `rate_limit` zone that refused the request.
+    RateLimitZone,
+}
+
+/// A template that is a client address and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sole {
+    /// `{client_ip}`
+    ClientIp,
+    /// `{remote_host}`
+    RemoteHost,
 }
 
 impl Template {
@@ -133,6 +144,15 @@ impl Template {
                     | Var::Env(_)
             ),
         })
+    }
+
+    /// The client address, when the template is that alone (no string needs to be made of it).
+    pub fn sole_address(&self) -> Option<Sole> {
+        match &self.parts[..] {
+            [Part::Var(Var::ClientIp)] => Some(Sole::ClientIp),
+            [Part::Var(Var::RemoteHost)] => Some(Sole::RemoteHost),
+            _ => None,
+        }
     }
 
     /// The text as written in the Caddyfile.
@@ -224,6 +244,7 @@ fn var_of(key: &str) -> Option<Var> {
         "http.error.status_code" => Var::ErrorStatusCode,
         "http.error.status_text" => Var::ErrorStatusText,
         "http.error.message" => Var::ErrorMessage,
+        "http.rate_limit.exceeded.name" => Var::RateLimitZone,
         other => {
             if let Some(name) = other.strip_prefix("http.request.header.") {
                 Var::Header(HeaderName::from_bytes(name.as_bytes()).ok()?)
@@ -306,6 +327,12 @@ fn value(var: &Var, ctx: &Ctx) -> String {
             .unwrap_or_default()
             .to_string(),
         Var::ErrorMessage => ctx.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
+        Var::RateLimitZone => ctx
+            .error
+            .as_ref()
+            .and_then(|e| e.zone.as_deref())
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 

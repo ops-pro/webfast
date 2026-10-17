@@ -3,7 +3,8 @@
 #
 #   scripts/check.sh [fmt] [clippy] [test] [msrv] [deny]     (none named: all)
 #
-# fmt: rustfmt; clippy: lints, warnings are errors; test: unit and end-to-end tests on stable
+# fmt: rustfmt; clippy: lints, warnings are errors (also without the optional modules,
+# --no-default-features); test: unit and end-to-end tests on stable
 # Rust; msrv: the tests on Cargo.toml's rust-version; deny: cargo-deny (advisories, licenses,
 # bans, sources). The crate cache, build directories and tools stay in Docker volumes
 # (webfast-cargo, webfast-target, webfast-tools). RUST_IMAGE (rust:1-slim-bookworm),
@@ -30,7 +31,7 @@ for check in "${checks[@]}"; do
   echo "== $check"
   case $check in
     fmt) command="rustup component add rustfmt >/dev/null 2>&1 && cargo fmt --check" ;;
-    clippy) command="rustup component add clippy >/dev/null 2>&1 && cargo clippy --locked --all-targets -- -D warnings" ;;
+    clippy) command="rustup component add clippy >/dev/null 2>&1 && cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets --no-default-features -- -D warnings" ;;
     test) command="cargo test --locked" ;;
     msrv) command="cargo test --locked" ;;
     deny) command="command -v cargo-deny >/dev/null || cargo install --locked cargo-deny --version $deny_version; cargo deny check" ;;

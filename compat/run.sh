@@ -5,6 +5,8 @@
 #
 #   WEBFAST_BIN=…/webfast TRAIN_BIN=…/examples/train compat/run.sh
 #   SCENARIO=errors … compat/run.sh      # handle_errors and error: compat/errors.Caddyfile
+#   SCENARIO=ratelimit … compat/run.sh   # rate_limit, against Caddy with caddy-ratelimit (built
+#                                        # from compat/caddy-plugins.Dockerfile)
 #
 # The site and configuration: scripts/volumes.sh (SITE_DIR, CADDYFILE, HEADERS); compare.mjs's
 # requests are written for the sample site. Images can be overridden: CADDY_IMAGE (caddy:2-alpine),
@@ -16,8 +18,15 @@ scenario=${SCENARIO:-sample}
 case $scenario in
   sample) ;;
   errors) export CADDYFILE=${CADDYFILE:-$here/errors.Caddyfile} ;;
+  ratelimit)
+    export CADDYFILE=${CADDYFILE:-$here/ratelimit.Caddyfile}
+    if [ -z "${CADDY_IMAGE:-}" ]; then
+      docker build -q -t webfast-compat-caddy-plugins -f "$here/caddy-plugins.Dockerfile" "$here" >/dev/null
+      CADDY_IMAGE=webfast-compat-caddy-plugins
+    fi
+    ;;
   *)
-    echo "SCENARIO: sample or errors" >&2
+    echo "SCENARIO: sample, errors or ratelimit" >&2
     exit 2
     ;;
 esac

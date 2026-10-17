@@ -20,7 +20,9 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "rate-limit"]
+# `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
+rate-limit = []
 # mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 

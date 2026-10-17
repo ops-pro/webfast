@@ -11,16 +11,16 @@ Docker image starts with it.
 
 ## The subset
 
-| Kind           | Supported                                                                                                                                                                                                                                                                                                   |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                 |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                                                            |
-| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                             |
-| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`                                  |
-| Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                        |
-| reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                   |
-| file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                             |
-| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms |
+| Kind           | Supported                                                                                                                                                                                                                                                                                                                                      |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                                                    |
+| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                                                                                               |
+| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
+| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits)                                         |
+| Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
+| reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                                                      |
+| file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
+| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms; `{http.rate_limit.exceeded.name}` |
 
 Semantics follow Caddy: the directive order and path-specificity sorting outside `route`, mutually
 exclusive `handle` blocks, deferred `header` operations, `try_files` matching directories only for
@@ -112,6 +112,67 @@ handle_errors 5xx {
   its own.
 - `respond` with an error status is an answer, not a failure: `handle_errors` does not see it.
 
+### Rate limits
+
+`rate_limit` is read as Caddy's [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugin
+reads it (built in: the cargo feature `rate-limit`, on by default). Each zone has a matcher, a key,
+and how many requests (`events`) a key may make in a `window`:
+
+```caddyfile
+rate_limit {
+	zone login {
+		match {
+			method POST
+			path /login /api/auth/*
+		}
+		key {client_ip}
+		events 5
+		window 1m
+	}
+	zone api {
+		match {
+			path /api/*
+		}
+		key {client_ip}
+		events 600
+		window 1m
+		ipv6_prefix 64
+	}
+}
+handle_errors 429 {
+	respond "Too many requests: try again in a minute."
+}
+```
+
+- A request is counted in each zone that matches it, from the tightest zone (the fewest events per
+  unit of time) to the most permissive. The first zone it exceeds refuses it with 429 and
+  `Retry-After` (seconds); the zones after that one do not count it. `handle_errors 429` can
+  answer, with the zone's name in `{http.rate_limit.exceeded.name}`.
+- `key` is any placeholder or text: `{client_ip}` (behind a trusted proxy, the client it names),
+  `{remote_host}` (the peer), `{header.X-Api-Key}`, `static` (one limit for the whole zone).
+  `ipv4_prefix` and `ipv6_prefix` make one key of the addresses in a network (`ipv6_prefix 64`:
+  a client often has a whole /64).
+- A rested key may make `events` requests at once, and then one more every `window / events`:
+  a client that keeps asking gets its requests back steadily, not when a window ends (GCRA; the
+  plugin counts a sliding window, Differences from Caddy).
+- `jitter <fraction>` adds up to that fraction of the wait to `Retry-After`, at random, so that
+  refused clients do not all come back at the same moment.
+- Refused requests are not logged one by one: once per `sweep_interval` (1 min) a zone that
+  refused any logs a warning with how many (`requests limited`, with `zone`, `limited` and
+  `keys`); `log_key` adds up to ten of the keys it refused. Keys at rest again are dropped at
+  the same time.
+- `WEB_RATE_LIMIT_KEYS` (a million) is how many keys a zone holds, some 34 MiB when full. A full
+  zone drops the keys at rest; if none is, a new key is refused (as nginx's `limit_req` does)
+  rather than let through uncounted.
+- `WEB_RATE_LIMIT_DRY_RUN=on` refuses nothing: the zones count and log what they would refuse
+  (`requests would be limited`), to try limits on real traffic first.
+- A reload keeps a zone's counts when its name, `events`, `window`, `key` and prefixes stay.
+- The answers ready in advance for files (docs/performance.md) stay on the paths no zone takes. A
+  zone that takes GET or HEAD by more than the path (a header, the client's address) costs the
+  whole site its ready answers; a zone for `method POST` only costs nothing.
+- `distributed` and `storage` (limits shared by several instances) and `disable_metrics` are
+  not supported: the limits are each instance's own.
+
 ## Differences from Caddy
 
 Those an answer shows are checked by `compat/`:
@@ -147,6 +208,13 @@ Those an answer shows are checked by `compat/`:
   takes only 103.
 - The configuration is reloaded with SIGHUP (docs/operations.md, Reloading); Caddy reloads
   through its admin API (`caddy reload`), which `admin off` turns off.
+- `rate_limit` is built in; Caddy needs the caddy-ratelimit plugin. A zone is a GCRA, not a
+  sliding window: after `events` at once a key gets one request back every `window / events`,
+  so a key that rested may pass up to twice `events` within one window (the plugin: never more
+  than `events` in any window, but it keeps a timestamp per request of the window, where a key
+  here takes 16 bytes), and the `Retry-After` values differ. Refused requests are logged as a
+  summary per zone and `sweep_interval` (the plugin: each one); a zone holds at most
+  `WEB_RATE_LIMIT_KEYS` keys (the plugin: no bound); no metrics, no `distributed` limits.
 
 ## Environment
 
@@ -162,6 +230,8 @@ Those an answer shows are checked by `compat/`:
 | `WEB_RUNTIME`                | `per-core`  | `per-core`: a thread with its own runtime per listening socket (Unix); `shared`: one multi-threaded runtime for all connections                                                                                                                                    |
 | `WEB_RELOAD`                 | `immediate` | what a reload (SIGHUP) does to open connections: `immediate`, their next request gets the new configuration; `lazy`, they keep theirs until they close; `drain`, as lazy, each closed at a random moment within `WEB_RELOAD_DRAIN` (docs/operations.md, Reloading) |
 | `WEB_RELOAD_DRAIN`           | `60s`       | with `WEB_RELOAD=drain`, the window over which the connections a reload leaves on the old configuration are closed; `0`: all at once                                                                                                                               |
+| `WEB_RATE_LIMIT_KEYS`        | `1000000`   | the keys a `rate_limit` zone holds at most (some 34 MiB when full); a full zone refuses a new key unless keys at rest can be dropped                                                                                                                               |
+| `WEB_RATE_LIMIT_DRY_RUN`     | `off`       | `on`: `rate_limit` refuses nothing, its zones only count and log what they would refuse                                                                                                                                                                            |
 | `WEB_MAX_CONNECTIONS`        | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
 | `WEB_MAX_CONNECTIONS_PER_IP` | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |
 | `WEB_STALL_TIMEOUT`          | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                                                                                                      |

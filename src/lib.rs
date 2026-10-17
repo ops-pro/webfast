@@ -17,6 +17,8 @@ pub mod matcher;
 pub mod memo;
 pub mod placeholder;
 pub mod proxy;
+#[cfg(feature = "rate-limit")]
+pub mod ratelimit;
 pub mod server;
 pub mod sockets;
 pub mod static_files;

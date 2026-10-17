@@ -82,6 +82,8 @@ pub struct HandlerError {
     /// The site root the request had when it failed: the error routes start with it (in Caddy
     /// `root` is a request variable, which they see).
     pub root: Option<Arc<FileStore>>,
+    /// The `rate_limit` zone that refused the request (`{http.rate_limit.exceeded.name}`).
+    pub zone: Option<Arc<str>>,
 }
 
 /// Where `respond 103` sends Early Hints for a request: the protocol that can send an interim
@@ -334,9 +336,30 @@ impl Ctx {
         let status = response.status();
         let message = message.unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
         let root = self.root.clone();
+        response.extensions_mut().insert(Failed(Arc::new(HandlerError {
+            status,
+            message,
+            root,
+            zone: None,
+        })));
         response
-            .extensions_mut()
-            .insert(Failed(Arc::new(HandlerError { status, message, root })));
+    }
+
+    /// A `rate_limit` zone refused the request: 429 with `Retry-After`, marked for
+    /// `handle_errors` with the zone's name.
+    #[cfg(feature = "rate-limit")]
+    pub fn fail_rate_limited(&mut self, zone: Arc<str>, wait: std::time::Duration) -> Response<Body> {
+        self.pre_headers
+            .insert(http::header::RETRY_AFTER, crate::ratelimit::retry_after(wait));
+        let mut response = self.status(StatusCode::TOO_MANY_REQUESTS);
+        let status = StatusCode::TOO_MANY_REQUESTS;
+        let message = status.canonical_reason().unwrap_or("").to_string();
+        response.extensions_mut().insert(Failed(Arc::new(HandlerError {
+            status,
+            message,
+            root: self.root.clone(),
+            zone: Some(zone),
+        })));
         response
     }
 }
@@ -647,6 +670,9 @@ pub enum Handler {
     },
     Proxy(Arc<ReverseProxy>),
     Files(Arc<FileServer>),
+    /// `rate_limit`: counts the request in its zones, and refuses it when one is exceeded.
+    #[cfg(feature = "rate-limit")]
+    RateLimit(Arc<crate::ratelimit::RateLimit>),
 }
 
 /// The rest of the chain: routes from `index` on, then the enclosing list's rest.
@@ -739,6 +765,15 @@ impl Next {
                     }
                     continue;
                 }
+                #[cfg(feature = "rate-limit")]
+                Handler::RateLimit(limit) => match limit.check(&mut ctx) {
+                    None => continue,
+                    Some((zone, wait)) => {
+                        let hooks = std::mem::take(&mut ctx.hooks);
+                        let response = ctx.fail_rate_limited(zone, wait);
+                        return finish(hooks, response).await;
+                    }
+                },
                 _ => {}
             }
             // A handler that answers; a `pass_thru` file server that goes on starts its own walk,
@@ -931,6 +966,11 @@ impl Handler {
                 };
                 inner.run(ctx).await
             }
+            #[cfg(feature = "rate-limit")]
+            Handler::RateLimit(limit) => match limit.check(&mut ctx) {
+                None => next.run(ctx).await,
+                Some((zone, wait)) => ctx.fail_rate_limited(zone, wait),
+            },
             // Not reached from `Next::walk` (it applies these itself); kept correct regardless.
             _ => {
                 self.step(&mut ctx);

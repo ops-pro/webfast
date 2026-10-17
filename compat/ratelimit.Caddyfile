@@ -1,0 +1,56 @@
+# compat/'s rate limit scenario (SCENARIO=ratelimit compat/run.sh), against Caddy with the
+# caddy-ratelimit plugin (compat/caddy-plugins.Dockerfile): zones by a static key and by the
+# client, the tightest zone first, the 429 answered by handle_errors.
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	header {
+		-Server
+		defer
+	}
+	respond /healthz "ok" 200
+
+	rate_limit {
+		zone together {
+			match {
+				path /together/*
+			}
+			key static
+			events 3
+			window 1m
+		}
+		zone login {
+			match {
+				method POST
+				path /login
+			}
+			key {remote_host}
+			events 2
+			window 1m
+		}
+		zone loose {
+			match {
+				path /both/*
+			}
+			key static
+			events 10
+			window 1m
+		}
+		zone tight {
+			match {
+				path /both/*
+			}
+			key static
+			events 1
+			window 1m
+		}
+	}
+	respond "ok {path}"
+
+	handle_errors 429 {
+		respond "limited by {http.rate_limit.exceeded.name}"
+	}
+}

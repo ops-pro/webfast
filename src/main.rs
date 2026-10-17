@@ -15,6 +15,8 @@
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
 //! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
+//! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
+//! holds, and WEB_RATE_LIMIT_DRY_RUN (off): count and log only (src/ratelimit.rs).
 //! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection —
 //! WEB_RELOAD (`immediate`: open connections take it for their next request; `lazy`: they keep
 //! the configuration they were accepted with until they close; `drain`: as lazy, and each is
@@ -119,6 +121,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(feature = "rate-limit")]
+    if let Err(e) = webfast::ratelimit::configure_from_env() {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    #[cfg(not(feature = "rate-limit"))]
+    if let Some(name) = ["WEB_RATE_LIMIT_KEYS", "WEB_RATE_LIMIT_DRY_RUN"]
+        .into_iter()
+        .find(|name| std::env::var_os(name).is_some())
+    {
+        eprintln!("{name}: this webfast was built without rate limits (cargo feature rate-limit)");
+        return ExitCode::from(2);
+    }
     let max_in_memory = match webfast::files::max_file_in_memory_from_env() {
         Ok(setting) => setting,
         Err(e) => {

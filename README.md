@@ -40,7 +40,8 @@ compared request by request ([`compat/`](compat)).
   previous version of a bundle gets the new one as a delta to it — 170 bytes instead of 229 KB in
   Chrome for a script with a few changed lines — also when the deploy replaced the old file.
 - **Proxying** with streaming (server-sent events reach the client as they come) and WebSocket;
-  **error pages** with `handle_errors`.
+  **error pages** with `handle_errors`; **rate limits** with `rate_limit`, in the caddy-ratelimit
+  plugin's syntax.
 - Unknown directives, options and placeholders stop the server at startup with the file and line,
   instead of being ignored.
 
