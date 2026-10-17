@@ -248,8 +248,29 @@ async fn request(
         stream: recv,
         done: false,
     });
+    // Early Hints (`respond 103`) go out as they come, while the final response is worked out.
+    let (hints, mut hinted) = tokio::sync::mpsc::channel(4);
+    parts.extensions.insert(crate::handler::EarlyHints(hints));
     let request = crate::server::stall_limited(Request::from_parts(parts, body), limits.stall);
-    let response = handle(conn, request).await;
+    let handling = handle(conn, request);
+    let mut handling = std::pin::pin!(handling);
+    let early = |headers: http::HeaderMap| {
+        let mut early = Response::new(());
+        *early.status_mut() = StatusCode::EARLY_HINTS;
+        *early.headers_mut() = headers;
+        early
+    };
+    let response = loop {
+        tokio::select! {
+            biased;
+            Some(headers) = hinted.recv() => within(&limits, send.send_response(early(headers))).await?,
+            response = &mut handling => break response,
+        }
+    };
+    // Hints given in the same step as the answer still go first.
+    while let Ok(headers) = hinted.try_recv() {
+        within(&limits, send.send_response(early(headers))).await?;
+    }
     let (mut head_parts, mut body) = response.into_parts();
     for name in [CONNECTION, TRANSFER_ENCODING, UPGRADE] {
         head_parts.headers.remove(name);

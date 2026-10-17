@@ -37,6 +37,20 @@ any request, and when the upstream answers 101 the two connections are joined an
 until either side closes. Any other answer reaches the client as it is. Browsers open WebSocket
 over HTTP/1.1 (webfast does not offer it over HTTP/2, RFC 8441), so keep `h1` in `protocols`.
 
+`respond 103` sends Early Hints, as in Caddy: the headers set so far (`header Link …`) go out as
+an interim response and the chain goes on, so a browser starts loading the page's styles and
+scripts while the application behind `reverse_proxy` is still working on the page:
+
+```caddyfile
+@pages not path /api/* /assets/*
+header @pages Link "</assets/app.css>; rel=preload; as=style"
+respond @pages 103
+reverse_proxy app:8080
+```
+
+Early Hints go out over HTTP/3. Over HTTP/1.1 and HTTP/2 hyper sends no interim responses, so
+there the same headers come only with the final response (where browsers use them too).
+
 ### Error pages
 
 A handler that fails — `file_server` with no file (404) or asked with a method other than GET and
@@ -94,6 +108,9 @@ Those an answer shows are checked by `compat/`:
   `stream_close_delay 0`). `stream_timeout` and `stream_close_delay` are not supported.
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
+- Early Hints (`respond 103`) go out over HTTP/3 only (Caddy: over every protocol); a file's ready
+  answer is not preceded by them (it is as quick as they would be). Of the 1xx statuses `respond`
+  takes only 103.
 - The configuration is reloaded with SIGHUP (docs/operations.md, Reloading); Caddy reloads
   through its admin API (`caddy reload`), which `admin off` turns off.
 

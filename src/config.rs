@@ -1290,6 +1290,15 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
                     other => bail!(at_err(&sub.at, format!("respond: unsupported option {other:?}"))),
                 }
             }
+            // 1xx: only 103 Early Hints, which sends the headers set so far and goes on (Caddy).
+            if let Some(code) = status.filter(StatusCode::is_informational) {
+                if code != StatusCode::EARLY_HINTS {
+                    bail!(at_err(&line.at, "respond: of the 1xx statuses only 103 (Early Hints)"));
+                }
+                if !body.is_empty() || close {
+                    bail!(at_err(&line.at, "respond 103 sends headers only: no body, no close"));
+                }
+            }
             Ok(vec![entry(name, matcher, Handler::Respond { status, body, close })])
         }
         "error" => {

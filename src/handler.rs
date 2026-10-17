@@ -84,6 +84,12 @@ pub struct HandlerError {
     pub root: Option<Arc<FileStore>>,
 }
 
+/// Where `respond 103` sends Early Hints for a request: the protocol that can send an interim
+/// response puts it in the request's extensions (src/h3.rs; hyper sends none over HTTP/1.1 and
+/// HTTP/2, so there the hints only reach the client with the final response).
+#[derive(Debug, Clone)]
+pub struct EarlyHints(pub tokio::sync::mpsc::Sender<HeaderMap>);
+
 /// The mark on the response of a handler that failed.
 #[derive(Debug, Clone)]
 pub struct Failed(pub Arc<HandlerError>);
@@ -801,6 +807,16 @@ impl Handler {
                 ctx.accept = None;
             }
             Handler::Rewrite(to) => rewrite(ctx, to),
+            // `respond 103`: the headers set so far go out as Early Hints, the chain goes on (Caddy),
+            // and they stay for the final response.
+            Handler::Respond {
+                status: Some(StatusCode::EARLY_HINTS),
+                ..
+            } => {
+                if let Some(EarlyHints(hints)) = ctx.req.extensions.get::<EarlyHints>() {
+                    let _ = hints.try_send(ctx.pre_headers.clone());
+                }
+            }
             Handler::StripPrefix(prefix) => strip_prefix(ctx, prefix),
             _ => return false,
         }
@@ -862,6 +878,14 @@ impl Handler {
                 let head = ctx.req.method == http::Method::HEAD;
                 let response = next.run(ctx).await;
                 encode.apply(encoding, head, response).await
+            }
+            // Early Hints are not an answer (`step`).
+            Handler::Respond {
+                status: Some(StatusCode::EARLY_HINTS),
+                ..
+            } => {
+                self.step(&mut ctx);
+                next.run(ctx).await
             }
             Handler::Respond { status, body, close } => {
                 let text = body.render(&ctx);

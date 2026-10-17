@@ -18,6 +18,9 @@
   configuration for their next request; `lazy`, the one they were accepted with, for as long as
   they stay open; `drain`, as lazy, and each is closed gracefully at a moment drawn at random
   within `WEB_RELOAD_DRAIN` (60 s), so that clients reconnect spread over it.
+- `respond 103`: Early Hints, as in Caddy — the headers set so far go out as an interim response
+  and the chain goes on. Sent over HTTP/3; over HTTP/1.1 and HTTP/2 (hyper sends no interim
+  responses) the headers come with the final response.
 - An HTTP/3 connection asked to finish (idle, or drained) with no request left is closed at once
   after its GOAWAY, not 10 s later.
 - Per request, only the connection's own reference counts change: the port's state and the
