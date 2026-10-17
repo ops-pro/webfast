@@ -26,13 +26,14 @@ systemctl reload webfast          # recipes/systemd: validates first, then sends
 What is replaced: each port's sites, `trusted_proxies`, `client_ip_headers` and `grace_period`,
 whole. The certificates are read again, and the ready answers are worked out for the new sites,
 before anything changes. A request under way always finishes with the configuration it started
-with, and no connection is closed by a reload. What the connections already open get next is
+with, and no connection is cut by a reload. What the connections already open get next is
 `WEB_RELOAD`:
 
-| `WEB_RELOAD`          | A connection open before the reload                                                     | New connections       | Per request                                         |
-| --------------------- | --------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------- |
-| `immediate` (default) | its next request is answered by the new configuration                                   | the new configuration | one atomic read of the port's current configuration |
-| `lazy`                | keeps the configuration it was accepted with for as long as it stays open, however long | the new configuration | nothing: the connection holds its configuration     |
+| `WEB_RELOAD`          | A connection open before the reload                                                           | New connections       | Per request                                         |
+| --------------------- | --------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------- |
+| `immediate` (default) | its next request is answered by the new configuration                                         | the new configuration | one atomic read of the port's current configuration |
+| `lazy`                | keeps the configuration it was accepted with for as long as it stays open, however long       | the new configuration | nothing: the connection holds its configuration     |
+| `drain`               | as `lazy`, and is asked to close at a moment drawn at random within `WEB_RELOAD_DRAIN` (60 s) | the new configuration | nothing                                             |
 
 - `immediate`: the new configuration is in force for every request from the moment the reload is
   done; a connection's trust (`trusted_proxies`) is worked out again on its next request.
@@ -46,8 +47,16 @@ with, and no connection is closed by a reload. What the connections already open
   every connection, as long as the new configuration still uses their root (the old
   configuration's ready answers are dropped when its files change, and those connections take the
   handler chain for them).
-- In both modes a TLS connection keeps the certificate it was opened with, and a WebSocket
-  tunnel stays as it is.
+- `drain`: as `lazy`, but the old configuration lasts at most `WEB_RELOAD_DRAIN` (60 s) after the
+  reload, plus 10 s for a request still under way (as when an idle connection is closed). Each
+  connection the reload left on it draws its own moment in that window and is then closed
+  gracefully: HTTP/1.1 after the response in progress (at once when idle), HTTP/2 and HTTP/3 with
+  GOAWAY, after which the streams under way finish and a request the client had not sent yet goes
+  on a new connection. So the clients reconnect spread over the window — 10 000 connections over
+  60 s are about 170 new connections (and TLS handshakes) a second — rather than all at once, as
+  when a server closes every connection on a reload. `WEB_RELOAD_DRAIN=0` closes them all at once.
+- In every mode a TLS connection keeps the certificate it was opened with, and a WebSocket
+  tunnel stays as it is (`drain` does not close tunnels: their clients would all reconnect).
 - Site roots that stay are taken over as they are, not read again (with `WEB_FILES_WATCH` on they
   are looked at again at once, as at startup); new roots are loaded, and what all of them take
   must fit `WEB_MAX_MEMORY`.

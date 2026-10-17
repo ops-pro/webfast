@@ -226,6 +226,128 @@ async fn lazy_connections_keep_their_configuration_until_they_close() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+/// The configuration `:0 { header X-Version <version>; respond "ok" }` with WEB_RELOAD=drain.
+fn draining(version: u32, window: Duration, running: Option<&Running>) -> webfast::config::Config {
+    let text = format!(":0 {{\n\theader X-Version {version}\n\trespond \"ok\"\n}}\n");
+    let mut config = load(&text, running).unwrap();
+    config.servers[0].reload = webfast::config::ReloadMode::Drain(window);
+    config
+}
+
+/// How long until the server closes `stream`, at most `limit`.
+async fn closed_after(mut stream: TcpStream, started: std::time::Instant, limit: Duration) -> Option<Duration> {
+    let mut buf = [0u8; 256];
+    loop {
+        match tokio::time::timeout_at((started + limit).into(), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return Some(started.elapsed()),
+            Ok(Ok(_)) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn drain_closes_the_old_connections_spread_over_the_window() {
+    let window = Duration::from_millis(1500);
+    let mut running = server::start(draining(1, window, None)).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut old = Vec::new();
+    for _ in 0..24 {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(ask(&mut stream, "/").await.contains("x-version: 1"));
+        old.push(stream);
+    }
+
+    running.reload(draining(2, window, Some(&running))).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut new = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(ask(&mut new, "/").await.contains("x-version: 2"));
+    let limit = window + Duration::from_secs(1);
+    let waits: Vec<_> = old
+        .into_iter()
+        .map(|stream| tokio::spawn(closed_after(stream, started, limit)))
+        .collect();
+    let mut times = Vec::new();
+    for wait in waits {
+        times.push(
+            wait.await
+                .unwrap()
+                .expect("every old connection closed within the window"),
+        );
+    }
+    times.sort();
+    let (first, last) = (times[0], times[times.len() - 1]);
+    // Spread over the window, not all at once (24 moments drawn: their range is under a third of
+    // the window about once in four billion times).
+    assert!(last - first > window / 3, "{times:?}");
+    // The new connection is not touched.
+    assert!(
+        closed_after(new, std::time::Instant::now(), Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn drain_closes_old_http3_connections_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = self_signed(dir.path(), "cert");
+    let text = |version: u32| {
+        format!(
+            "localhost:0 {{\n\ttls {d}/cert.pem {d}/cert.key\n\theader X-Version {version}\n\trespond \"ok\"\n}}\n",
+            d = dir.path().display()
+        )
+    };
+    let window = Duration::from_millis(300);
+    let draining = |version: u32, running: Option<&Running>| {
+        let mut config = load(&text(version), running).unwrap();
+        config.servers[0].reload = webfast::config::ReloadMode::Drain(window);
+        config
+    };
+    let mut running = server::start(draining(1, None)).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let conn = endpoint
+        .connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await.unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let mut stream = send_request
+        .send_request(
+            http::Request::get(format!("https://localhost:{port}/"))
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    stream.finish().await.unwrap();
+    let response = stream.recv_response().await.unwrap();
+    assert_eq!(response.headers()["x-version"], "1");
+    while stream.recv_data().await.unwrap().is_some() {}
+
+    running.reload(draining(2, Some(&running))).await.unwrap();
+    tokio::time::timeout(window + Duration::from_secs(5), conn.closed())
+        .await
+        .expect("the old QUIC connection was closed after the reload");
+    drop(send_request);
+    drive.abort();
+    endpoint.close(0u32.into(), b"done");
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
 fn self_signed(dir: &Path, name: &str) -> rcgen::Certificate {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     std::fs::write(dir.join(format!("{name}.pem")), certified.cert.pem()).unwrap();

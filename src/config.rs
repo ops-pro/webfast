@@ -78,6 +78,20 @@ pub enum ReloadMode {
     /// They keep the configuration they were accepted with for as long as they stay open, and new
     /// connections get the new one; requests look nothing up.
     Lazy,
+    /// As `Lazy`, and each of them is asked to close (gracefully) at a moment drawn at random
+    /// within this window after the reload (WEB_RELOAD_DRAIN), so that their clients reconnect
+    /// spread over it (src/guard.rs `Retire`).
+    Drain(Duration),
+}
+
+impl ReloadMode {
+    /// The default window of `Drain`.
+    pub const DRAIN: Duration = Duration::from_secs(60);
+
+    /// Connections keep the configuration they were accepted with.
+    pub fn pins(&self) -> bool {
+        !matches!(self, ReloadMode::Immediate)
+    }
 }
 
 /// What a connection may take of the server (src/guard.rs); `timeouts` in the Caddyfile, the

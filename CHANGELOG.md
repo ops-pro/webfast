@@ -16,7 +16,10 @@
   fails, and the running configuration stays. The systemd recipe has `ExecReload` (validate, then
   SIGHUP). `WEB_RELOAD` says what open connections get: `immediate` (the default), the new
   configuration for their next request; `lazy`, the one they were accepted with, for as long as
-  they stay open.
+  they stay open; `drain`, as lazy, and each is closed gracefully at a moment drawn at random
+  within `WEB_RELOAD_DRAIN` (60 s), so that clients reconnect spread over it.
+- An HTTP/3 connection asked to finish (idle, or drained) with no request left is closed at once
+  after its GOAWAY, not 10 s later.
 - Per request, only the connection's own reference counts change: the port's state and the
   WebSocket bookkeeping (the server's stop signal) are held once per connection.
 - Header values with bytes outside visible ASCII no longer stop the startup with a panic.

@@ -218,6 +218,11 @@ impl Activity {
         self.quiet.notified().await
     }
 
+    /// No request is in progress.
+    pub fn is_quiet(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+
     /// When the connection is next due for something, and what.
     pub fn next(&self, limits: &Limits) -> (Instant, Due) {
         let blocked = self.blocked.load(Ordering::Acquire);
@@ -421,16 +426,56 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Io<T> {
     }
 }
 
+/// When a connection that a reload left on the old configuration closes (WEB_RELOAD=drain): once
+/// the port's configuration is newer than the connection's, at a moment drawn at random within
+/// `window` — so that the connections a reload leaves behind close spread over it, and their
+/// clients come back spread over it too, instead of all at once.
+pub struct Retire {
+    /// The port's configuration generation, sent by each reload.
+    pub reloads: watch::Receiver<u64>,
+    /// The connection's.
+    pub generation: u64,
+    pub window: Duration,
+}
+
+impl Retire {
+    /// Resolves at the connection's moment to close; never when no reload comes.
+    pub async fn due(mut self) {
+        while *self.reloads.borrow_and_update() <= self.generation {
+            if self.reloads.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        tokio::time::sleep(self.window.mul_f64(random_fraction())).await;
+    }
+}
+
+/// A number in [0, 1), different on every call (the standard library's randomly keyed hasher).
+fn random_fraction() -> f64 {
+    use std::hash::BuildHasher;
+    let bits = std::hash::RandomState::new().hash_one(Instant::now());
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// What may end a connection besides itself: the server's stop, and with WEB_RELOAD=drain a
+/// reload (`retire`).
+pub struct Ends {
+    pub stop: watch::Receiver<bool>,
+    pub retire: Option<Retire>,
+}
+
 /// Runs a connection to its end under `limits`. `graceful` asks it to finish gracefully (hyper's
 /// `graceful_shutdown`); when `stop` turns true (server shutdown) that is asked too and the
-/// connection is then waited for — the server bounds that wait itself.
+/// connection is then waited for — the server bounds that wait itself. With `retire`, a reload
+/// asks it to finish too, at its moment (WEB_RELOAD=drain); a close of our own is cut after `grace`.
 pub async fn drive<C: Future>(
     connection: C,
     graceful: impl Fn(Pin<&mut C>),
     activity: &Activity,
     limits: &Limits,
-    stop: watch::Receiver<bool>,
+    ends: Ends,
 ) {
+    let Ends { stop, retire } = ends;
     let mut connection = std::pin::pin!(connection);
     let mut stopped = std::pin::pin!(async move {
         let mut stop = stop;
@@ -440,6 +485,13 @@ pub async fn drive<C: Future>(
             }
         }
     });
+    let mut retiring = std::pin::pin!(async move {
+        match retire {
+            Some(retire) => retire.due().await,
+            None => std::future::pending().await,
+        }
+    });
+    let mut retired = false;
     let mut timer = std::pin::pin!(tokio::time::sleep(limits.idle));
     let mut armed: Option<Instant> = None;
     // Since when a graceful close of our own (idle) is under way.
@@ -449,6 +501,11 @@ pub async fn drive<C: Future>(
         loop {
             if !stopping && stopped.as_mut().poll(cx).is_ready() {
                 stopping = true;
+                graceful(connection.as_mut());
+            }
+            if !stopping && !retired && closing.is_none() && retiring.as_mut().poll(cx).is_ready() {
+                retired = true;
+                closing = Some(Instant::now());
                 graceful(connection.as_mut());
             }
             if connection.as_mut().poll(cx).is_ready() {

@@ -75,7 +75,8 @@ answers to the same Caddyfile. `tests/reload.rs` reloads a running server: the n
 open connection gets the new sites, kept roots are not read again, the files watched and the
 certificates are the new configuration's, a connection's trust follows `trusted_proxies`, and
 what needs a restart is refused; with `WEB_RELOAD=lazy` an open connection keeps its
-configuration while a new one gets the new, and both serve changed files; on Linux it also sends
+configuration while a new one gets the new, and both serve changed files; with `drain` the old
+connections (HTTP/1.1 and HTTP/3) are closed spread over the window; on Linux it also sends
 SIGHUP and SIGTERM to the binary.
 
 ## The PGO build

@@ -62,6 +62,7 @@ pub async fn serve(
         let remote = incoming.remote_address();
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
         let conn = state.connection(remote);
+        let retire = state.retire(&conn);
         let Some(permit) = admission.admit(remote.ip(), conn.info().trusted) else {
             tracing::debug!(%remote, "QUIC connection refused: too many open");
             incoming.refuse();
@@ -71,7 +72,7 @@ pub async fn serve(
         let handshakes = handshakes.clone();
         tokio::spawn(async move {
             let _permit: Permit = permit;
-            if let Err(e) = connection(incoming, conn, stop, limits, handshakes).await {
+            if let Err(e) = connection(incoming, conn, stop, retire, limits, handshakes).await {
                 tracing::debug!(error = %e, "HTTP/3 connection ended with an error");
             }
         });
@@ -91,6 +92,7 @@ async fn connection(
     incoming: quinn::Incoming,
     served: Arc<ConnState>,
     mut stop: watch::Receiver<bool>,
+    retire: Option<crate::guard::Retire>,
     limits: Limits,
     handshakes: Arc<AtomicUsize>,
 ) -> Result<(), BoxError> {
@@ -124,8 +126,15 @@ async fn connection(
     if stopping {
         h3.shutdown(0).await?;
     }
-    // Since when a graceful close of our own (idle) is under way.
+    // Since when a graceful close of our own (idle, or WEB_RELOAD=drain) is under way.
     let mut closing: Option<Instant> = None;
+    let mut retiring = std::pin::pin!(async move {
+        match retire {
+            Some(retire) => retire.due().await,
+            None => std::future::pending().await,
+        }
+    });
+    let mut retired = false;
     loop {
         let (when, due) = match closing {
             Some(since) => (since + limits.grace, Due::Cut),
@@ -159,6 +168,12 @@ async fn connection(
                     h3.shutdown(0).await?;
                 }
             }
+            // A reload left this connection on the old configuration: its moment to close.
+            () = &mut retiring, if !retired && !stopping && closing.is_none() => {
+                retired = true;
+                closing = Some(Instant::now());
+                h3.shutdown(0).await?;
+            }
             // The last request ended: the idle clock starts; look again.
             () = activity.quiet() => {}
             () = tokio::time::sleep_until(when.into()) => match due {
@@ -174,9 +189,19 @@ async fn connection(
                 }
             },
         }
+        // Asked to finish (idle, or a reload with WEB_RELOAD=drain) and no request left: closed now
+        // rather than after `grace`; what the client had not sent yet it sends again on a new
+        // connection, as after any GOAWAY.
+        if closing.is_some() && activity.is_quiet() {
+            quic.close(H3_NO_ERROR, b"");
+            break;
+        }
     }
     Ok(())
 }
+
+/// The HTTP/3 code for a connection closed without error.
+const H3_NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0x100);
 
 /// A send under the stall limit: a client that takes nothing for that long loses the stream.
 async fn within<T, E: Into<BoxError>>(

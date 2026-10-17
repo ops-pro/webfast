@@ -16,7 +16,8 @@
 //! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
 //! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection —
 //! WEB_RELOAD (`immediate`: open connections take it for their next request; `lazy`: they keep
-//! the configuration they were accepted with until they close); SIGTERM
+//! the configuration they were accepted with until they close; `drain`: as lazy, and each is
+//! closed gracefully at a random moment within WEB_RELOAD_DRAIN, 60s); SIGTERM
 //! and SIGINT stop gracefully.
 
 use std::io::{Read, Write};
@@ -227,12 +228,25 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         Ok(value) => return Err(format!("WEB_RUNTIME: shared or per-core, not {value:?}")),
         Err(_) => None,
     };
+    let drain = match std::env::var("WEB_RELOAD_DRAIN") {
+        Ok(value) => match config::parse_duration(&value) {
+            Ok(window) => Some(window),
+            Err(_) => return Err(format!("WEB_RELOAD_DRAIN: a duration (e.g. 60s), not {value:?}")),
+        },
+        Err(_) => None,
+    };
     let reload = match std::env::var("WEB_RELOAD") {
         Ok(value) if value.trim().eq_ignore_ascii_case("immediate") => config::ReloadMode::Immediate,
         Ok(value) if value.trim().eq_ignore_ascii_case("lazy") => config::ReloadMode::Lazy,
-        Ok(value) => return Err(format!("WEB_RELOAD: immediate or lazy, not {value:?}")),
+        Ok(value) if value.trim().eq_ignore_ascii_case("drain") => {
+            config::ReloadMode::Drain(drain.unwrap_or(config::ReloadMode::DRAIN))
+        }
+        Ok(value) => return Err(format!("WEB_RELOAD: immediate, lazy or drain, not {value:?}")),
         Err(_) => config::ReloadMode::default(),
     };
+    if drain.is_some() && !matches!(reload, config::ReloadMode::Drain(_)) {
+        return Err("WEB_RELOAD_DRAIN is the window of WEB_RELOAD=drain".to_string());
+    }
     for server in &mut config.servers {
         if let Some(per_core) = per_core {
             server.per_core = per_core;

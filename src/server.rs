@@ -34,11 +34,14 @@ use tokio_rustls::TlsAcceptor;
 /// configuration is reloaded (`Running::reload`); the rest is the port's own.
 pub struct ServerState {
     routing: ArcSwap<Routing>,
-    /// WEB_RELOAD=lazy: a connection keeps the routing it was accepted with (`ConnState`).
-    lazy: bool,
-    /// With `lazy`, the routings a reload replaced, while connections still use them: when files
-    /// change their ready answers are forgotten too (src/watch.rs), so that those connections serve
-    /// the files as they are now.
+    /// WEB_RELOAD: with `lazy` and `drain` a connection keeps the routing it was accepted with
+    /// (`ConnState`); with `drain` it is also asked to close after a reload (src/guard.rs `Retire`).
+    mode: ReloadMode,
+    /// The routing's generation, sent by each reload (to the connections `drain` retires).
+    reloads: watch::Sender<u64>,
+    /// With `lazy` and `drain`, the routings a reload replaced, while connections still use them:
+    /// when files change their ready answers are forgotten too (src/watch.rs), so that those
+    /// connections serve the files as they are now.
     retired: Mutex<Vec<Weak<Routing>>>,
     tls: bool,
     alt_svc: Option<HeaderValue>,
@@ -56,7 +59,7 @@ pub struct Routing {
 }
 
 /// What the requests of one connection share: the port, the connection's facts, and — with
-/// WEB_RELOAD=lazy — the routing it was accepted with, which it keeps for as long as it is open.
+/// WEB_RELOAD=lazy or drain — the routing it was accepted with, which it keeps while it is open.
 /// One per connection, so that its requests count references on it, not on the port that every
 /// connection shares.
 pub struct ConnState {
@@ -93,8 +96,8 @@ impl ServerState {
         self.routing.load_full()
     }
 
-    /// The routings that connections use: the current one, and with WEB_RELOAD=lazy those that
-    /// connections accepted before a reload still keep.
+    /// The routings that connections use: the current one, and with WEB_RELOAD=lazy or drain
+    /// those that connections accepted before a reload still keep.
     pub(crate) fn routings(&self) -> Vec<Arc<Routing>> {
         let mut all = vec![self.routing.load_full()];
         let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
@@ -108,7 +111,7 @@ impl ServerState {
     }
 
     /// A new connection: its facts, worked out with the routing in use now — which it keeps with
-    /// WEB_RELOAD=lazy.
+    /// WEB_RELOAD=lazy or drain.
     pub fn connection(self: &Arc<Self>, remote: SocketAddr) -> Arc<ConnState> {
         let current = self.routing.load();
         let info = Arc::new(ConnInfo {
@@ -117,13 +120,25 @@ impl ServerState {
             trusted: current.trusts(remote.ip()),
         });
         let generation = current.generation;
-        let pinned = self.lazy.then(|| arc_swap::Guard::into_inner(current));
+        let pinned = self.mode.pins().then(|| arc_swap::Guard::into_inner(current));
         Arc::new(ConnState {
             state: self.clone(),
             info,
             pinned,
             generation,
         })
+    }
+
+    /// With WEB_RELOAD=drain, when `conn` is to close after a reload (src/guard.rs `Retire`).
+    pub(crate) fn retire(&self, conn: &ConnState) -> Option<crate::guard::Retire> {
+        match self.mode {
+            ReloadMode::Drain(window) => Some(crate::guard::Retire {
+                reloads: self.reloads.subscribe(),
+                generation: conn.generation,
+                window,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -208,7 +223,7 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let (parts, body) = request.into_parts();
     let remote = connection.info.remote;
     let version = parts.version;
-    // The site, in the connection's routing (WEB_RELOAD=lazy) or in the port's as it is now; what
+    // The site, in the connection's routing (WEB_RELOAD=lazy, drain) or in the port's as it is now; what
     // the request needs of it is taken out, so that nothing holds the routing across an await.
     let picked = {
         let current;
@@ -475,9 +490,9 @@ impl Running {
                 client_ip_headers: server.client_ip_headers,
                 generation,
             }));
-            // WEB_RELOAD=lazy: connections keep the old routing as long as they are open (also one
-            // being accepted right now, which may not hold it yet: kept whatever its count).
-            if state.lazy {
+            // WEB_RELOAD=lazy or drain: connections keep the old routing while they are open (also
+            // one being accepted right now, which may not hold it yet: kept whatever its count).
+            if state.mode.pins() {
                 let mut retired = state.retired.lock().unwrap_or_else(PoisonError::into_inner);
                 retired.retain(|routing| routing.strong_count() > 0);
                 retired.push(Arc::downgrade(&old));
@@ -485,6 +500,8 @@ impl Running {
             if let (Some(resolver), Some(certificates)) = (&port.resolver, certificates) {
                 resolver.install(certificates);
             }
+            // With drain, the connections on older routings now draw their moment to close.
+            state.reloads.send_replace(generation);
         }
         // The files watched are the new configuration's (the roots it kept are looked at again at
         // once, as at startup).
@@ -680,7 +697,8 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
             client_ip_headers,
             generation: 0,
         }),
-        lazy: reload == ReloadMode::Lazy,
+        mode: reload,
+        reloads: watch::channel(0).0,
         retired: Mutex::new(Vec::new()),
         tls: state_tls,
         alt_svc: None,
@@ -822,6 +840,7 @@ async fn accept_loop(
         };
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
         let conn = state.connection(remote);
+        let retire = state.retire(&conn);
         let Some(permit) = admission.admit(remote.ip(), conn.info.trusted) else {
             tracing::debug!(%remote, "connection refused: too many open");
             continue;
@@ -835,6 +854,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             // The connection's place: its requests carry it, and a WebSocket tunnel keeps it.
             let place = Place::new(permit, stop.clone());
+            let ends = crate::guard::Ends { stop, retire };
             let service = {
                 let activity = activity.clone();
                 // Per request only this connection's own reference counts change.
@@ -861,7 +881,7 @@ async fn accept_loop(
                         _ if protocols.h1 => Mode::Http1,
                         _ => return,
                     };
-                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, stop).await;
+                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, ends).await;
                 }
                 None => {
                     let mode = match (protocols.h1, protocols.h2c) {
@@ -869,7 +889,7 @@ async fn accept_loop(
                         (false, true) => Mode::Http2,
                         _ => Mode::Http1,
                     };
-                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, stop).await;
+                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, ends).await;
                 }
             }
         });
@@ -883,7 +903,7 @@ async fn serve_connection<I, S>(
     mode: Mode,
     activity: &Activity,
     limits: &Limits,
-    stop: watch::Receiver<bool>,
+    ends: crate::guard::Ends,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>
@@ -899,7 +919,7 @@ async fn serve_connection<I, S>(
     };
     // With upgrades: a request that switches protocols (WebSocket) hands the connection over.
     let connection = builder.serve_connection_with_upgrades(io, service).into_owned();
-    crate::guard::drive(connection, |c| c.graceful_shutdown(), activity, limits, stop).await;
+    crate::guard::drive(connection, |c| c.graceful_shutdown(), activity, limits, ends).await;
 }
 
 #[cfg(test)]
