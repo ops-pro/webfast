@@ -334,11 +334,17 @@ async fn static_site_behaves_like_the_caddy_config() {
     assert_eq!(contact.status, 200);
     assert_eq!(&contact.body[..], b"<!doctype html><title>Contact</title>");
     // No open redirect through the path: `//host` and `/\host` (a browser reads `\` as `/`) in
-    // {re.html.1} and in the canonical trailing-slash redirect stay on the site.
+    // {re.html.1} and in the canonical trailing-slash redirect stay on the site — also with a tab
+    // or newline between the slashes, which a browser drops ("/%09/host" would be "//host").
     for (path, location) in [
         ("/%5Cevil.example/x.html", "/evil.example/x"),
         ("//evil.example/x.html", "/evil.example/x"),
         ("/%5C%5Cevil.example/x.html", "/evil.example/x"),
+        ("/%09/evil.example/x.html", "/evil.example/x"),
+        ("/%09%5Cevil.example/x.html", "/evil.example/x"),
+        ("/%0D/evil.example/x.html", "/evil.example/x"),
+        ("/%09/evil.example/../../en", "/evil.example/../../en/"),
+        ("/%09page.html", "/%09page"),
     ] {
         let got = h.get(path, &[]).await;
         assert_eq!(

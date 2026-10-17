@@ -458,17 +458,37 @@ pub fn encode_path(decoded: &str) -> String {
 
 /// A redirect target built from the request may not point off the site: a path that starts with
 /// `//` or `/\` (browsers read `\` as `/`) would be taken as scheme-relative, `//evil.example/x`,
-/// so the run of slashes and backslashes it starts with becomes one `/`. Anything else — an
-/// absolute URL, a plain path — is kept as it is.
+/// so the run of slashes and backslashes it starts with becomes one `/`. Browsers also drop ASCII
+/// tabs and newlines anywhere in a URL (WHATWG URL parsing), so `/<TAB>/evil.example` is read as
+/// `//evil.example`: they count as part of that run. Anything else — an absolute URL, a plain
+/// path — is kept as it is.
 pub fn same_site_location(location: String) -> String {
     if !location.starts_with('/') {
         return location;
     }
-    let rest = location.trim_start_matches(['/', '\\']);
-    if location.len() - rest.len() > 1 {
+    let rest = location.trim_start_matches(['/', '\\', '\t', '\n', '\r']);
+    let run = &location[..location.len() - rest.len()];
+    if run.bytes().filter(|b| matches!(b, b'/' | b'\\')).count() > 1 {
         return format!("/{rest}");
     }
     location
+}
+
+/// A `Location` value with control characters percent-encoded: a raw tab or newline would be
+/// dropped by the browser, which would then follow a different URL than the one checked.
+fn escape_controls(location: String) -> String {
+    if !location.bytes().any(|b| b.is_ascii_control()) {
+        return location;
+    }
+    let mut out = String::with_capacity(location.len() + 8);
+    for ch in location.chars() {
+        if ch.is_ascii_control() {
+            out.push_str(&format!("%{:02X}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// A header value: built once when it has no placeholders (cloning it is a reference count),
@@ -906,7 +926,7 @@ impl Handler {
                 response
             }
             Handler::Redir { to, status, html } => {
-                let location = same_site_location(to.render(&ctx));
+                let location = escape_controls(same_site_location(to.render(&ctx)));
                 if *html {
                     let escaped = crate::static_files::html_escape(&location);
                     let body = format!(
@@ -1032,6 +1052,14 @@ mod tests {
         assert_eq!(same(r"/\evil.example/x"), "/evil.example/x");
         assert_eq!(same(r"///\/evil.example"), "/evil.example");
         assert_eq!(same(r"/x/\y"), r"/x/\y", "only the start matters");
+        // Tabs and newlines, which browsers drop, do not hide a second slash.
+        assert_eq!(same("/\t/evil.example"), "/evil.example");
+        assert_eq!(same("/\n\r/evil.example"), "/evil.example");
+        assert_eq!(same("/\t\\evil.example"), "/evil.example");
+        assert_eq!(same("/\t/evil.example/../../en/"), "/evil.example/../../en/");
+        assert_eq!(same("/\tpage"), "/\tpage", "one slash: on the site");
+        assert_eq!(escape_controls("/\tpage".into()), "/%09page");
+        assert_eq!(escape_controls("/a b".into()), "/a b");
         assert_eq!(
             same("https://example.com/"),
             "https://example.com/",
