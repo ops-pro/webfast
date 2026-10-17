@@ -1,0 +1,23 @@
+# compat/'s cache scenario (SCENARIO=cache compat/run.sh), against Caddy with the cache-handler
+# plugin (compat/caddy-plugins.Dockerfile): proxied responses kept and answered again, what may
+# not be kept passed on each time.
+{
+	auto_https off
+	admin off
+	cache {
+		ttl 60s
+	}
+}
+
+:8080 {
+	header {
+		-Server
+		defer
+	}
+	respond /healthz "ok" 200
+
+	encode zstd gzip
+	cache
+	reverse_proxy /cached/* app:8787
+	reverse_proxy /api/* app:8787
+}

@@ -40,6 +40,15 @@
 - With the same feature, `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` (256): a client's requests at the
   upstreams at once, a response counting until its body ends; more are refused with 429. Behind a
   trusted proxy, the client it names; the proxy's own requests are not limited.
+- `cache` (cargo feature `proxy-cache`, on by default), in the syntax of Caddy's cache-handler
+  plugin (the global option and the directive; `ttl`, `stale`, `default_cache_control`,
+  `max_cacheable_body_bytes`, `cache_name`, `regex { exclude }`, `mode strict`): proxied GET
+  200 answers kept in memory (`WEB_PROXY_CACHE_MEMORY`, 64 MiB). The first client is answered as
+  the upstream sends; a tee keeps the frames, and a background thread decides, decodes (bounded),
+  asks an encoding upstream for its other encodings and makes the rest at the highest levels.
+  Hits come from memory in the best encoding the client takes, with Age, Cache-Status and 304s;
+  stale answers while a conditional request revalidates them, and when the upstream fails.
+  Checked against Caddy with the plugin (`SCENARIO=cache`).
 - An HTTP/3 connection asked to finish (idle, or drained) with no request left is closed at once
   after its GOAWAY, not 10 s later.
 - Per request, only the connection's own reference counts change: the port's state and the

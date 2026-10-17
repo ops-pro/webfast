@@ -190,6 +190,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "request_body",
     "redir",
     "method",
+    "cache",
     "rewrite",
     "uri",
     "try_files",
@@ -257,6 +258,9 @@ struct Globals {
     debug: bool,
     servers: Vec<(Option<u16>, ServerOpts)>,
     order: Vec<String>,
+    /// The global `cache` option: where each `cache` directive starts from.
+    #[cfg(feature = "proxy-cache")]
+    cache: crate::cache::Settings,
 }
 
 impl Default for Globals {
@@ -268,6 +272,8 @@ impl Default for Globals {
             debug: false,
             servers: Vec::new(),
             order: DIRECTIVE_ORDER.iter().map(|s| s.to_string()).collect(),
+            #[cfg(feature = "proxy-cache")]
+            cache: crate::cache::Settings::default(),
         }
     }
 }
@@ -583,6 +589,7 @@ fn parse_globals(lines: &[Line]) -> Result<Globals> {
             "grace_period" => g.grace = parse_duration(&one_arg(line)?).map_err(|e| at_err(&line.at, e))?,
             "debug" => g.debug = true,
             "order" => apply_order(&mut g.order, line)?,
+            "cache" => parse_cache_global(line, &mut g)?,
             "servers" => {
                 let listener = match args.first() {
                     Some(t) => {
@@ -1303,6 +1310,7 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
             Ok(vec![entry(name, matcher, Handler::Respond { status, body, close })])
         }
         "rate_limit" => parse_rate_limit(line, cx, site),
+        "cache" => parse_cache(line, scope, cx),
         "error" => {
             let (matcher, start) = matcher_token(line, scope)?;
             let args = &line.tokens[start..];
@@ -1826,6 +1834,119 @@ fn parse_rate_limit(line: &Line, cx: &mut Cx, site: &mut SiteCx) -> Result<Vec<E
     }
     let limit = RateLimit::new(zones, options);
     Ok(vec![entry("rate_limit", None, Handler::RateLimit(Arc::new(limit)))])
+}
+
+/// The global `cache` option (the cache-handler plugin's): defaults for every `cache` directive.
+#[cfg(feature = "proxy-cache")]
+fn parse_cache_global(line: &Line, g: &mut Globals) -> Result<()> {
+    if line.tokens.len() > 1 {
+        bail!(at_err(&line.at, "cache: the global option takes a block, no arguments"));
+    }
+    parse_cache_options(line.block.as_deref().unwrap_or(&[]), &mut g.cache)
+}
+
+#[cfg(not(feature = "proxy-cache"))]
+fn parse_cache_global(line: &Line, _: &mut Globals) -> Result<()> {
+    bail!(at_err(
+        &line.at,
+        "cache: this webfast was built without it (cargo feature proxy-cache)"
+    ))
+}
+
+/// `cache [<matcher>] [{ … }]`: the proxied responses of the requests it takes are kept.
+#[cfg(feature = "proxy-cache")]
+fn parse_cache(line: &Line, scope: &Scope, cx: &mut Cx) -> Result<Vec<Entry>> {
+    let (matcher, start) = matcher_token(line, scope)?;
+    if line.tokens.len() != start {
+        bail!(at_err(&line.at, "cache: `cache [<matcher>] [{ … }]`"));
+    }
+    let mut settings = cx.globals.cache.clone();
+    parse_cache_options(line.block.as_deref().unwrap_or(&[]), &mut settings)?;
+    Ok(vec![entry(
+        "cache",
+        matcher,
+        Handler::Cache(Arc::new(crate::cache::Cache::new(settings))),
+    )])
+}
+
+#[cfg(not(feature = "proxy-cache"))]
+fn parse_cache(line: &Line, _: &Scope, _: &mut Cx) -> Result<Vec<Entry>> {
+    bail!(at_err(
+        &line.at,
+        "cache: this webfast was built without it (cargo feature proxy-cache)"
+    ))
+}
+
+/// The options of the global `cache` and of the directive: the plugin's, those that a cache in
+/// memory of one instance has.
+#[cfg(feature = "proxy-cache")]
+fn parse_cache_options(block: &[Line], settings: &mut crate::cache::Settings) -> Result<()> {
+    for sub in block {
+        let args = &sub.tokens[1..];
+        let one = || -> Result<&Token> {
+            match args {
+                [value] if sub.block.is_none() => Ok(value),
+                _ => Err(at_err(&sub.at, format!("cache: `{} <value>`", sub.name()))),
+            }
+        };
+        match sub.name() {
+            "ttl" => settings.ttl = parse_duration(&one()?.text).map_err(|e| at_err(&sub.at, e))?,
+            "stale" => settings.stale = parse_duration(&one()?.text).map_err(|e| at_err(&sub.at, e))?,
+            "default_cache_control" => {
+                let text = args.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+                if text.is_empty() {
+                    bail!(at_err(&sub.at, "cache: `default_cache_control <value>`"));
+                }
+                settings.default_cache_control = Some(
+                    http::HeaderValue::from_str(&text)
+                        .map_err(|_| at_err(&sub.at, "cache: default_cache_control is not a header value"))?,
+                );
+            }
+            "max_cacheable_body_bytes" => {
+                settings.max_body = Some(
+                    one()?
+                        .text
+                        .parse::<usize>()
+                        .map_err(|_| at_err(&sub.at, "cache: max_cacheable_body_bytes is a number of bytes"))?,
+                );
+            }
+            "cache_name" => settings.name = Arc::from(one()?.text.as_str()),
+            "regex" => {
+                if !args.is_empty() {
+                    bail!(at_err(&sub.at, "cache: `regex { exclude <regexp> }`"));
+                }
+                for item in sub.block.as_deref().unwrap_or(&[]) {
+                    match (item.name(), &item.tokens[1..]) {
+                        ("exclude", [re]) => {
+                            settings.exclude = Some(
+                                regex::Regex::new(&re.text)
+                                    .map_err(|e| token_err(re, format!("cache: regex exclude: {e}")))?,
+                            );
+                        }
+                        _ => bail!(at_err(&item.at, "cache: `regex { exclude <regexp> }`")),
+                    }
+                }
+            }
+            "mode" => {
+                if one()?.text != "strict" {
+                    bail!(at_err(
+                        &sub.at,
+                        "cache: only `mode strict` (the cache follows RFC 9111 for requests and responses)"
+                    ));
+                }
+            }
+            "badger" | "etcd" | "nuts" | "olric" | "otter" | "redis" | "simplefs" | "storers" => bail!(at_err(
+                &sub.at,
+                format!(
+                    "cache: {} is not supported: the cache is kept in memory (WEB_PROXY_CACHE_MEMORY)",
+                    sub.name()
+                )
+            )),
+            "api" | "cdn" => bail!(at_err(&sub.at, format!("cache: {} is not supported", sub.name()))),
+            other => bail!(at_err(&sub.at, format!("cache: unsupported option {other:?}"))),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "rate-limit"))]

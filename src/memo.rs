@@ -441,6 +441,9 @@ fn decided_by_path(routes: &[Route]) -> bool {
                 // tell those paths by the path.
                 #[cfg(feature = "rate-limit")]
                 Handler::RateLimit(limit) => limit.decided_by_path(),
+                // It keeps only proxied answers, which are never ready ones.
+                #[cfg(feature = "proxy-cache")]
+                Handler::Cache(_) => true,
             }
     })
 }

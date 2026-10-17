@@ -1,5 +1,6 @@
 // Stub upstream for the compatibility check: echoes the request (as the app or the streaming service would see it)
-// and streams SSE on /api/stream/chat. Run as `app` (PORT 8787) and `stream` (PORT 8800).
+// and streams SSE on /api/stream/chat; /cached/* is a page that may be kept by a cache (/cached/private/* one that may
+// not). Run as `app` (PORT 8787) and `stream` (PORT 8800).
 import http from 'node:http';
 
 const port = Number(process.env.PORT ?? 8787);
@@ -27,6 +28,18 @@ http
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
         res.write('data: 1\n\n');
         setTimeout(() => res.end('data: 2\n\n'), 400);
+        return;
+      }
+      if (req.url.startsWith('/cached/')) {
+        const body = `a page from ${req.url}\n`.repeat(40);
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-length': Buffer.byteLength(body),
+          'cache-control': req.url.startsWith('/cached/private/') ? 'private, max-age=60' : 'public, max-age=60',
+          etag: '"c1"',
+          'x-upstream': name,
+        });
+        res.end(body);
         return;
       }
       const headers = Object.fromEntries(seen.filter((h) => h in req.headers).map((h) => [h, req.headers[h]]));

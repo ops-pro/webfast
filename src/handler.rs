@@ -122,6 +122,9 @@ pub struct Ctx {
     hooks: Vec<Hook>,
     /// In `handle_errors` routes: the failure they answer for.
     pub error: Option<Arc<HandlerError>>,
+    /// A `cache` the request passed without an answer: for the proxy, which keeps its response.
+    #[cfg(feature = "proxy-cache")]
+    pub cache_miss: Option<Box<crate::cache::Miss>>,
 }
 
 /// A change to the response recorded on the way down the chain.
@@ -181,6 +184,8 @@ impl Ctx {
             pre_headers: HeaderMap::new(),
             hooks: Vec::new(),
             error: None,
+            #[cfg(feature = "proxy-cache")]
+            cache_miss: None,
         }
     }
 
@@ -673,6 +678,9 @@ pub enum Handler {
     /// `rate_limit`: counts the request in its zones, and refuses it when one is exceeded.
     #[cfg(feature = "rate-limit")]
     RateLimit(Arc<crate::ratelimit::RateLimit>),
+    /// `cache`: answers from the proxy cache, or marks the request for the proxy to keep its answer.
+    #[cfg(feature = "proxy-cache")]
+    Cache(Arc<crate::cache::Cache>),
 }
 
 /// The rest of the chain: routes from `index` on, then the enclosing list's rest.
@@ -754,6 +762,10 @@ impl Next {
                     continue;
                 }
                 Handler::Encode(encode) => {
+                    #[cfg(feature = "proxy-cache")]
+                    if let Some(miss) = ctx.cache_miss.as_mut() {
+                        miss.encode = Some(encode.clone());
+                    }
                     let accept = ctx.accept_encoding();
                     if let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) {
                         let head = ctx.req.method == http::Method::HEAD;
@@ -771,6 +783,14 @@ impl Next {
                     Some((zone, wait)) => {
                         let hooks = std::mem::take(&mut ctx.hooks);
                         let response = ctx.fail_rate_limited(zone, wait);
+                        return finish(hooks, response).await;
+                    }
+                },
+                #[cfg(feature = "proxy-cache")]
+                Handler::Cache(cache) => match cache.check(&mut ctx) {
+                    None => continue,
+                    Some(response) => {
+                        let hooks = std::mem::take(&mut ctx.hooks);
                         return finish(hooks, response).await;
                     }
                 },
@@ -906,6 +926,10 @@ impl Handler {
                 ctx.respond(response)
             }
             Handler::Encode(encode) => {
+                #[cfg(feature = "proxy-cache")]
+                if let Some(miss) = ctx.cache_miss.as_mut() {
+                    miss.encode = Some(encode.clone());
+                }
                 let accept = ctx.accept_encoding();
                 let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) else {
                     return next.run(ctx).await;
@@ -970,6 +994,11 @@ impl Handler {
             Handler::RateLimit(limit) => match limit.check(&mut ctx) {
                 None => next.run(ctx).await,
                 Some((zone, wait)) => ctx.fail_rate_limited(zone, wait),
+            },
+            #[cfg(feature = "proxy-cache")]
+            Handler::Cache(cache) => match cache.check(&mut ctx) {
+                None => next.run(ctx).await,
+                Some(response) => response,
             },
             // Not reached from `Next::walk` (it applies these itself); kept correct regardless.
             _ => {

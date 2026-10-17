@@ -18,6 +18,8 @@
 //! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
 //! holds, WEB_RATE_LIMIT_DRY_RUN (off): count and log only, and WEB_MAX_UPSTREAM_REQUESTS_PER_IP
 //! (256; 0: no limit): a client's requests at the upstreams at once (src/ratelimit.rs).
+//! With the cargo feature proxy-cache: WEB_PROXY_CACHE_MEMORY (64MiB; `off`), what the proxied
+//! responses kept by `cache` may take (src/cache.rs).
 //! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection —
 //! WEB_RELOAD (`immediate`: open connections take it for their next request; `lazy`: they keep
 //! the configuration they were accepted with until they close; `drain`: as lazy, and each is
@@ -125,6 +127,16 @@ fn main() -> ExitCode {
     #[cfg(feature = "rate-limit")]
     if let Err(e) = webfast::ratelimit::configure_from_env() {
         eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    #[cfg(feature = "proxy-cache")]
+    if let Err(e) = webfast::cache::configure_from_env() {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    #[cfg(not(feature = "proxy-cache"))]
+    if std::env::var_os("WEB_PROXY_CACHE_MEMORY").is_some() {
+        eprintln!("WEB_PROXY_CACHE_MEMORY: this webfast was built without the proxy cache (cargo feature proxy-cache)");
         return ExitCode::from(2);
     }
     #[cfg(not(feature = "rate-limit"))]

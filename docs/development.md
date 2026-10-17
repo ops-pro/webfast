@@ -17,6 +17,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `src/files.rs`                                   | the site files in memory: ETags, LZ4, snapshots replaced on change                                  |
 | `src/memo.rs`                                    | ready answers for the files                                                                         |
 | `src/ratelimit.rs`                               | `rate_limit` (cargo feature `rate-limit`): GCRA zones                                               |
+| `src/cache.rs`                                   | `cache` (cargo feature `proxy-cache`): proxied answers in memory, the worker that stores them       |
 | `src/watch.rs`                                   | changed files picked up: inotify or polling                                                         |
 | `src/encode.rs`                                  | Accept-Encoding and on-the-fly zstd / Brotli / gzip                                                 |
 | `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; WebSocket tunnels                                          |
@@ -36,6 +37,7 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |
 | `tests/ratelimit.rs`                             | `rate_limit`: zones, 429 and `handle_errors`, ready answers, reloads                                |
 | `tests/upstream_limit.rs`                        | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, against an upstream that holds its answers                      |
+| `tests/cache.rs`                                 | `cache`: hits in every encoding, what is not stored, stale answers, the upstream's own encodings    |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
 | `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
 | `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
@@ -66,8 +68,9 @@ directory and the tools in Docker volumes (`webfast-cargo`, `webfast-target`, `w
 CI ([`.gitlab-ci.yml`](../.gitlab-ci.yml)) runs the same jobs on every push and merge request, and
 builds the image on the default branch and tags.
 
-Cargo features, both on by default: `mimalloc` (the allocator of the binary and of
-`examples/bench.rs`) and `rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`,
+Cargo features, all on by default: `mimalloc` (the allocator of the binary and of
+`examples/bench.rs`), `proxy-cache` (`cache` and `WEB_PROXY_CACHE_MEMORY`, src/cache.rs) and
+`rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`,
 src/ratelimit.rs; without it the directive and its variables stop the startup with an error that
 says so). `--no-default-features` builds the server without
 them; clippy checks that build too.
@@ -95,7 +98,12 @@ name and `Retry-After`; the paths no zone takes keep their ready answers; a relo
 counts; what the plugin has and webfast does not is refused. `tests/upstream_limit.rs` holds
 requests at an upstream until a client has its limit of them: the next is refused, a page is not, a
 trusted proxy's own requests pass and the clients it names are each limited, and the slots come
-back when the responses end.
+back when the responses end. `tests/cache.rs` (with the feature) proxies to an upstream written
+with hyper whose paths answer each in their own way: a stored answer comes back in zstd, Brotli,
+gzip and identity with its ETags and 304s, HEAD included; what may not be stored (private,
+Set-Cookie, Vary, 404, event streams, too large, excluded, ranges, no-store) reaches the upstream
+every time; `ttl` and `default_cache_control`; a stale answer while its revalidation brings a
+304, and in place of a 503; an upstream that sends gzip is asked for br and zstd and its br kept.
 
 ## The PGO build
 
@@ -128,6 +136,7 @@ cargo build --release --example train --example bench --example rtt
 WEBFAST_BIN=target/release/webfast TRAIN_BIN=target/release/examples/train compat/run.sh
 SCENARIO=errors WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh   # handle_errors and error
 SCENARIO=ratelimit WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh   # rate_limit, against caddy-ratelimit
+SCENARIO=cache WEBFAST_BIN=… TRAIN_BIN=… compat/run.sh       # cache, against cache-handler
 ```
 
 Caddy (`caddy:2-alpine`) and webfast serve the same Caddyfile and site from Docker volumes, stub
@@ -141,7 +150,9 @@ something else; the request list is written for the sample site. `SCENARIO=error
 `handle_errors` blocks. `SCENARIO=ratelimit` serves `compat/ratelimit.Caddyfile` to a Caddy
 built with the caddy-ratelimit plugin (`compat/caddy-plugins.Dockerfile`, built by run.sh unless
 `CADDY_IMAGE` names one) and sends both the same requests in the same order, until each zone
-refuses; the `Retry-After` values are expected to differ. Stock Caddy has no Brotli encoder, so
+refuses; the `Retry-After` values are expected to differ. `SCENARIO=cache` serves
+`compat/cache.Caddyfile` to the same Caddy (it has the cache-handler plugin too) and sends each
+request twice, the second from the cache; the values of `Cache-Status` and `Age` differ. Stock Caddy has no Brotli encoder, so
 both get the Caddyfile without `br` in `encode`.
 
 ## Benchmarks

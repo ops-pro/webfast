@@ -25,6 +25,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -97,7 +98,7 @@ pub const CLIENT_IDENTITY_HEADERS: &[&str] = &[
     "x-real-ip",
 ];
 
-fn remove_hop_headers(headers: &mut HeaderMap) {
+pub(crate) fn remove_hop_headers(headers: &mut HeaderMap) {
     let listed: Vec<HeaderName> = headers
         .get_all(CONNECTION)
         .iter()
@@ -146,7 +147,7 @@ impl ReverseProxy {
         &self.upstreams[index]
     }
 
-    pub async fn serve(&self, mut ctx: Ctx) -> Response<Body> {
+    pub async fn serve(self: &Arc<Self>, mut ctx: Ctx) -> Response<Body> {
         // Preparing ready answers (src/memo.rs): never kept from a proxy, so no upstream is called.
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
             return ctx.status(StatusCode::BAD_GATEWAY);
@@ -160,6 +161,9 @@ impl ReverseProxy {
         };
         #[cfg(not(feature = "rate-limit"))]
         let slot: Slot = None;
+        // A `cache` the request passed: the response may be kept (src/cache.rs).
+        #[cfg(feature = "proxy-cache")]
+        let mut miss = ctx.cache_miss.take();
         // A WebSocket handshake on a connection that can be handed over (HTTP/1.1); anything else
         // goes on as an ordinary request, its Upgrade dropped as hop-by-hop.
         if let Some(protocol) = upgrade_of(&ctx.req.headers)
@@ -233,9 +237,54 @@ impl ReverseProxy {
                 for op in &rendered_down {
                     op.apply(&mut parts.headers);
                 }
+                #[cfg(feature = "proxy-cache")]
+                if let Some(mut miss) = miss {
+                    if parts.status.is_server_error()
+                        && let Some(stale) = miss.fallback(&mut ctx, parts.status)
+                    {
+                        return stale;
+                    }
+                    let pq = path_and_query.as_ref().map_or("/", |pq| pq.as_str());
+                    let body = miss.tee(self, pq, &headers, &rendered_down, &mut parts, boxed(incoming));
+                    return ctx.respond_appending(Response::from_parts(parts, holding(body, slot)));
+                }
                 ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), slot)))
             }
-            Err(status) => ctx.fail(status, None),
+            Err(status) => {
+                #[cfg(feature = "proxy-cache")]
+                if let Some(stale) = miss.as_mut().and_then(|miss| miss.fallback(&mut ctx, status)) {
+                    return stale;
+                }
+                ctx.fail(status, None)
+            }
+        }
+    }
+
+    /// A request of the server's own to an upstream (src/cache.rs: revalidations, and the
+    /// upstream's own encodings of a response).
+    #[cfg(feature = "proxy-cache")]
+    pub(crate) async fn fetch(
+        &self,
+        path_and_query: &str,
+        headers: HeaderMap,
+    ) -> Result<Response<hyper::body::Incoming>, String> {
+        let uri = Uri::builder()
+            .scheme(Scheme::HTTP)
+            .authority(self.pick(0).clone())
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut request = Request::new(crate::body::empty());
+        *request.uri_mut() = uri;
+        *request.version_mut() = http::Version::HTTP_11;
+        *request.headers_mut() = headers;
+        let sent = self.client.request(request);
+        match self.response_header_timeout {
+            Some(limit) => match tokio::time::timeout(limit, sent).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("no answer in time".to_string()),
+            },
+            None => sent.await.map_err(|e| e.to_string()),
         }
     }
 

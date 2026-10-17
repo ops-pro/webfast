@@ -205,6 +205,14 @@ Precompressed siblings work alike, each from memory or disk by its own size. The
 ready answers. Measured (docs/performance.md): about 0.5 GB/s per download from the page cache,
 and 1–2 MB of memory per download under way.
 
+### The proxy cache
+
+`cache` (docs/configuration.md, Proxy cache) holds proxied answers in memory besides the site
+files: at most `WEB_PROXY_CACHE_MEMORY` (64 MiB), every encoding of an answer counted. Its
+background thread (`web-cache`) compresses at the highest levels, so a stored answer costs CPU
+once, there and not on the connections' threads; a full queue of answers to store (64) drops the
+newest, logged once a minute.
+
 ## Logs
 
 The server's own log is JSON lines on stderr (`LOG_LEVEL`). At startup it says what was loaded and

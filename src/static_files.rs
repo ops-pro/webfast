@@ -759,7 +759,7 @@ fn base(path: &str) -> &str {
 }
 
 /// If-Match (strong comparison) / If-None-Match (weak comparison) against one ETag; no allocation.
-fn etag_list_matches(list: &str, etag: &HeaderValue, strong: bool) -> bool {
+pub(crate) fn etag_list_matches(list: &str, etag: &HeaderValue, strong: bool) -> bool {
     fn opaque(tag: &str) -> &str {
         tag.trim().trim_start_matches("W/")
     }

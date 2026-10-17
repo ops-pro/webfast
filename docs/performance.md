@@ -183,6 +183,25 @@ a page takes in the server flat out (Reloading, above: sockets, protocol, log), 
 request to an application behind `reverse_proxy` costs far more than that. Put zones on what needs
 them (logins, forms, an API), not on the static files, which lose their ready answers too.
 
+## Proxy cache
+
+`examples/bench.rs` in process, plain release build, 2026-10-17, with the stub upstream of
+`compat/` (Node, in another container on the same machine) as `app`; the same Caddyfile
+(`encode zstd br gzip`, `reverse_proxy`) without and with `cache`, two passes in opposite order,
+median of 10 rounds of 20 000 requests:
+
+| Request                                     | proxied, no `cache` | `cache`                    |
+| ------------------------------------------- | ------------------- | -------------------------- |
+| a 1 KB page that may be kept, as zstd       | 206.6, 190.4 µs     | 2.49, 2.52 µs: from memory |
+| the same page, identity                     | 145.6, 155.4 µs     | 2.16, 2.15 µs: from memory |
+| an answer that may not be kept (`no-store`) | 208.2, 214.9 µs     | 220.1, 219.8 µs: passed on |
+
+A hit costs 2.5 µs and 29 allocations (14 KB) — less than a static file through the chain (Rate
+limits, above) — where the proxied request took the upstream's round trip and the on-the-fly
+compression: some 80 times less. What is not kept pays for the marks on its way (a few
+allocations, `Cache-Status`), within the upstream's own spread here. The compression at the
+highest levels is the worker's, once per stored answer, off the connections' threads.
+
 ## The way here
 
 Handler chain in process, a page as br (precompressed):

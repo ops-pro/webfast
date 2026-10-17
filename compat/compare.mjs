@@ -1,19 +1,22 @@
 // Differential check: sends the same requests to Caddy and to webfast (same Caddyfile, same site)
 // and reports every difference in status, headers and (decoded) body.
-//   node compare.mjs http://caddy:8080 http://ours:8080 [sample|errors|ratelimit]
+//   node compare.mjs http://caddy:8080 http://ours:8080 [sample|errors|ratelimit|cache]
 // The scenario picks the requests: `sample` for sample/Caddyfile, `errors` for
 // compat/errors.Caddyfile, `ratelimit` for compat/ratelimit.Caddyfile (sent in order: the counts
-// of both servers move together). Expected differences are listed, not failed: ETag values (ours
+// of both servers move together), `cache` for compat/cache.Caddyfile (each request twice, the second
+// from the cache). Expected differences are listed, not failed: ETag values (ours
 // hash the content), Last-Modified (ours have none), Via on proxied responses (Caddy adds one), the
 // compressed bytes of on-the-fly encoding (different compressors; the decoded bodies must match),
-// deferred site headers on failed requests (ours keep them), and Retry-After values (the plugin's
-// sliding window and our GCRA count differently).
+// deferred site headers on failed requests (ours keep them), Retry-After values (the plugin's
+// sliding window and our GCRA count differently), the values of Cache-Status (the cache's name
+// and key) and Age, and ours' Vary and Age on the answers it gives from the cache in identity and
+// to HEAD.
 import http from 'node:http';
 import zlib from 'node:zlib';
 
 const [caddyBase, oursBase, scenario = 'sample'] = process.argv.slice(2);
-if (!caddyBase || !oursBase || !['sample', 'errors', 'ratelimit'].includes(scenario)) {
-  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url> [sample|errors|ratelimit]');
+if (!caddyBase || !oursBase || !['sample', 'errors', 'ratelimit', 'cache'].includes(scenario)) {
+  console.error('usage: node compare.mjs <caddy-base-url> <ours-base-url> [sample|errors|ratelimit|cache]');
   process.exit(2);
 }
 
@@ -47,6 +50,16 @@ const rateLimitCases = [
   ['GET', '/both/x'],
   ['GET', '/both/x'],
   ['GET', '/other'],
+];
+const twice = (c) => [c, c];
+const cacheCases = [
+  ...twice(['GET', '/cached/page']),
+  ...twice(['GET', '/cached/gz', { 'accept-encoding': 'gzip' }]),
+  ...twice(['GET', '/cached/zstd', { 'accept-encoding': 'gzip, deflate, br, zstd' }]),
+  ['GET', '/cached/head'],
+  ['HEAD', '/cached/head'],
+  ...twice(['GET', '/cached/private/page']),
+  ...twice(['GET', '/api/forms/x']),
 ];
 const sampleCases = [
   ['GET', '/healthz'],
@@ -121,7 +134,7 @@ const sampleCases = [
   ['GET', '/stream/card'],
   ['GET', '/missing'],
 ];
-const cases = { sample: sampleCases, errors: errorCases, ratelimit: rateLimitCases }[scenario];
+const cases = { sample: sampleCases, errors: errorCases, ratelimit: rateLimitCases, cache: cacheCases }[scenario];
 
 function request(base, method, path, headers = {}, body) {
   const url = new URL(base);
@@ -208,6 +221,8 @@ const FAILED = (status) => status === 405 || (scenario !== 'sample' && status >=
 let failures = 0;
 const known = new Map();
 for (const [method, path, headers, body] of cases) {
+  // A cache stores in the background (ours does): give it the time before the next request.
+  if (scenario === 'cache') await new Promise((resolve) => setTimeout(resolve, 200));
   const [a, b] = await Promise.all([
     request(caddyBase, method, path, headers, body),
     request(oursBase, method, path, headers, body),
@@ -229,6 +244,26 @@ for (const [method, path, headers, body] of cases) {
       const kind = 'deferred site headers on failed requests (ours keep them)';
       known.set(kind, (known.get(kind) ?? 0) + 1);
       continue;
+    }
+    // What each cache says about itself, and how old its answer is.
+    if ((name === 'cache-status' || name === 'age') && va && vb) {
+      const kind = `${name} values`;
+      known.set(kind, (known.get(kind) ?? 0) + 1);
+      continue;
+    }
+    // Ours answers HEAD from what GET stored (Souin passes it on), and says that it chose the
+    // encoding by Accept-Encoding also when it chose none.
+    if (scenario === 'cache' && !va && vb) {
+      const kind =
+        name === 'age' && method === 'HEAD'
+          ? 'HEAD answered from what GET stored (ours)'
+          : name === 'vary' && vb === 'Accept-Encoding'
+            ? 'Vary on an identity answer from the cache (ours)'
+            : null;
+      if (kind) {
+        known.set(kind, (known.get(kind) ?? 0) + 1);
+        continue;
+      }
     }
     // How long to wait: a sliding window (the plugin) and GCRA (ours) count differently.
     if (name === 'retry-after' && va && vb) {

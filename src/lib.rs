@@ -4,6 +4,8 @@
 
 pub mod accesslog;
 pub mod body;
+#[cfg(feature = "proxy-cache")]
+pub mod cache;
 pub mod caddyfile;
 pub mod config;
 pub mod date;

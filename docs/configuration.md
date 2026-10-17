@@ -14,9 +14,9 @@ Docker image starts with it.
 | Kind           | Supported                                                                                                                                                                                                                                                                                                                                      |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                                                    |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`                                                                                                               |
+| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`, `cache { … }` (Proxy cache)                                                                                  |
 | Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
-| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits)                                         |
+| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
 | reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                                                      |
 | file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
@@ -183,6 +183,64 @@ answers webfast makes itself are not counted. The client is `{client_ip}`: an IP
 behind a trusted proxy it is the client the proxy names, and a trusted proxy's own requests are not
 limited. `WEB_RATE_LIMIT_DRY_RUN` applies here too; the refusals are logged once a minute.
 
+### Proxy cache
+
+`cache` keeps what `reverse_proxy` answers in memory and answers from there, read as Caddy's
+[cache-handler](https://github.com/caddyserver/cache-handler) plugin reads it (built in: the cargo
+feature `proxy-cache`, on by default). The global option sets the defaults; the directive in a
+site (with a matcher, or for all its requests) turns the cache on there and may change them:
+
+```caddyfile
+{
+	cache {
+		ttl 120s
+		stale 1h
+	}
+}
+example.com {
+	encode zstd br gzip
+	cache /api/catalog/*
+	reverse_proxy app:8080
+}
+```
+
+- What is kept: the answer to a GET with status 200, whole, of at most `max_cacheable_body_bytes`
+  (a sixteenth of `WEB_PROXY_CACHE_MEMORY` unless set), without Set-Cookie, not `private`,
+  `no-store` or `no-cache`, varying on nothing but Accept-Encoding, not an event stream; the answer
+  to a request with Authorization only when it is `public` (or has `s-maxage` or
+  `must-revalidate`). It is fresh for its `s-maxage`, `max-age` or `Expires`, otherwise for
+  `ttl` (120 s); `default_cache_control` is the Cache-Control of an answer that has none (the
+  client gets it too).
+- The first client gets the answer as it comes, and the cache keeps its frames on the side; once
+  it has ended whole, a background thread stores it: each encoding the site's `encode` lists is
+  made once, at the highest level (zstd 19, Brotli 11, gzip 9), and an upstream that sent its
+  answer encoded is asked first for its own other encodings. Every client then gets the best
+  encoding it takes, from memory, with `Age`, `Cache-Status: webfast; hit; ttl=<seconds>` and 304
+  for its ETag or Last-Modified; HEAD is answered from what GET stored.
+- Past its freshness, within `stale` (or the answer's own `stale-while-revalidate`), an answer is
+  still given as it is (`Cache-Status: …; fwd=stale`) while one conditional request brings it up
+  to date in the background; within `stale` (or `stale-if-error`) it also answers in place of an
+  upstream that fails or answers 5xx (`fwd-status=<status>`). `must-revalidate` turns both off.
+- The client's own Cache-Control counts (`mode strict`: the plugin's default, and the only mode
+  here): `no-cache`, or a `max-age` the stored answer is older than, goes to the upstream and keeps
+  what it brings; `no-store` keeps nothing; `only-if-cached` gets 504 when nothing is stored. A
+  browser's reload sends `max-age=0`, so it reaches the upstream.
+- A POST, PUT, PATCH or DELETE drops what is stored for its URI. Ranges, WebSocket and requests for
+  an event stream pass through; so do request URIs (path and query) that `regex { exclude
+  <regexp> }` matches.
+- As with any shared cache, an answer that differs from one user to another must say so: `private`
+  or `no-store`, a Set-Cookie, or `Vary: Cookie`. The cache comes before `rate_limit` in the
+  directive order (as in Caddy), so answers from it are not counted.
+- Misses are not collapsed: until an answer is stored, every request for it goes to the upstream.
+- `WEB_PROXY_CACHE_MEMORY` (64 MiB; `off`: nothing is kept) is what the stored answers take,
+  every encoding counted; past it, those not asked for since eviction last passed go first. The
+  cache outlives a reload.
+- Background requests (revalidations, the upstream's own encodings) carry the headers of the
+  request that brought the answer, without its client's address, credentials and cookies.
+- `cache_name` is the name in `Cache-Status`. Not supported: the plugin's storages (`redis`,
+  `badger`, `nuts`, `otter`, `olric`, `etcd`: the cache is in memory), `cdn`, `api`, `key`,
+  `cache_keys` and the other modes.
+
 ## Differences from Caddy
 
 Those an answer shows are checked by `compat/`:
@@ -227,6 +285,15 @@ Those an answer shows are checked by `compat/`:
   `WEB_RATE_LIMIT_KEYS` keys (the plugin: no bound); no metrics, no `distributed` limits.
 - A client's requests at the upstreams at once are limited (`WEB_MAX_UPSTREAM_REQUESTS_PER_IP`,
   256): Caddy has no such limit.
+- `cache` is built in; Caddy needs the cache-handler plugin (Souin). Kept are GET answers with
+  status 200 only (Souin: also 203, 204, 301, 404, 410 and others, and answers with Set-Cookie);
+  one entry per URI, every encoding made from it (Souin stores what `encode` made, a variant per
+  Accept-Encoding, each from the upstream); stored after the first client has its answer, so a
+  miss's `Cache-Status` says `stored` before it is (Souin answers once stored); `stale` lets every
+  answer be served stale (Souin: those whose Cache-Control allows it); HEAD is answered from what
+  GET stored (Souin passes it on), and an identity answer from the cache carries `Vary:
+  Accept-Encoding` too. `Cache-Status` names `webfast` and shows no key, and its values and `Age`
+  differ; only memory as storage.
 
 ## Environment
 
@@ -245,6 +312,7 @@ Those an answer shows are checked by `compat/`:
 | `WEB_RATE_LIMIT_KEYS`              | `1000000`   | the keys a `rate_limit` zone holds at most (some 34 MiB when full); a full zone refuses a new key unless keys at rest can be dropped                                                                                                                               |
 | `WEB_RATE_LIMIT_DRY_RUN`           | `off`       | `on`: `rate_limit` refuses nothing, its zones only count and log what they would refuse                                                                                                                                                                            |
 | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` | `256`       | a client's requests at the upstreams at once (`reverse_proxy`, until the response ends; behind a trusted proxy, the client it names); more are refused with 429; `0`: no limit (docs/configuration.md, Rate limits)                                                |
+| `WEB_PROXY_CACHE_MEMORY`           | `64MiB`     | what the answers kept by `cache` may take, every encoding counted; past it the least asked for go first; `off`: nothing is kept (docs/configuration.md, Proxy cache)                                                                                               |
 | `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
 | `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |
 | `WEB_STALL_TIMEOUT`                | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                                                                                                      |

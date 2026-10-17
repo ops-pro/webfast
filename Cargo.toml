@@ -20,9 +20,11 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "rate-limit"]
+default = ["mimalloc", "rate-limit", "proxy-cache"]
 # `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
 rate-limit = []
+# `cache`: proxied responses kept in memory, in the cache-handler plugin's syntax (src/cache.rs).
+proxy-cache = []
 # mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
