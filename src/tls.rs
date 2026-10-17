@@ -8,6 +8,11 @@
 //! host — and of those the first, in Caddyfile order, whose key signs with a scheme the client
 //! offers; as Caddy chooses, so the same file serves the same certificates in both.
 //!
+//! Certificate compression (RFC 8879, TLS 1.3 over TCP and QUIC): a client that offers brotli or
+//! zlib gets the chain compressed, a shorter server flight. Each chain is compressed once, at the
+//! slow and small level, and kept; the cache has room for every certificate in both algorithms
+//! (rustls keeps 4 by default: with more certificates every handshake would compress again).
+//!
 //! Resumption, kept in this process (a restart or another replica means a full handshake):
 //!   - TCP: stateless session tickets for TLS 1.3 (keys rotated by the ticketer), the session cache
 //!     for TLS 1.2 session IDs; no early data.
@@ -189,8 +194,12 @@ pub fn server_config(resolver: Arc<CertResolver>, alpn: &[&[u8]], quic: bool) ->
     } else {
         builder.with_safe_default_protocol_versions()?
     };
+    let certificates = resolver.specs.len();
     let mut config = builder.with_no_client_auth().with_cert_resolver(resolver);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    // Compressed chains: one per certificate and algorithm, never evicted while those are in use.
+    let compressions = certificates * config.cert_compressors.len();
+    config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::new(compressions.max(4)));
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE);
     if quic {
         // Stateful tickets (the default: no ticketer) allow 0-RTT; quinn takes exactly this value.
@@ -310,5 +319,80 @@ mod tests {
         let named = [loaded[2].clone(), loaded[1].clone()];
         assert_eq!(chosen(&named, "other.test", &[EC]), 1);
         assert_eq!(chosen(&named, "other.test", &[RSA]), 0);
+    }
+
+    /// Bytes the server sends until a handshake between these two is complete.
+    fn server_flight(server: Arc<rustls::ServerConfig>, client: rustls::ClientConfig) -> usize {
+        let mut server = rustls::ServerConnection::new(server).unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap()).unwrap();
+        let mut sent = 0;
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut bytes = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut bytes).unwrap();
+            }
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                server.read_tls(&mut rest).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut bytes = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut bytes).unwrap();
+            }
+            sent += bytes.len();
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                client.read_tls(&mut rest).unwrap();
+                client.process_new_packets().unwrap();
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn certificates_go_compressed_to_clients_that_offer_it() {
+        // A certificate with many names, as a site with many hosts would have.
+        let mut names = vec!["localhost".to_string()];
+        names.extend((0..60).map(|i| format!("service-{i}.example.test")));
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(names)
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let signing = provider().key_provider.load_private_key(key).unwrap();
+        let resolver = Arc::new(CertResolver {
+            specs: Vec::new(),
+            loaded: RwLock::new(vec![LoadedEntry {
+                hosts: Vec::new(),
+                key: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing)),
+                stamp: Vec::new(),
+            }]),
+        });
+        let server = Arc::new(server_config(resolver, &[b"h2"], false).unwrap());
+        assert_eq!(server.cert_compressors.len(), 2, "brotli and zlib");
+
+        let client = |decompressors: Vec<&'static dyn rustls::compress::CertDecompressor>| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.der().clone()).unwrap();
+            let mut config = rustls::ClientConfig::builder_with_provider(provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            config.cert_decompressors = decompressors;
+            config
+        };
+        let plain = server_flight(server.clone(), client(Vec::new()));
+        let brotli = server_flight(server.clone(), client(vec![rustls::compress::BROTLI_DECOMPRESSOR]));
+        let zlib = server_flight(server.clone(), client(vec![rustls::compress::ZLIB_DECOMPRESSOR]));
+        assert!(cert.der().len() > 1500, "{}", cert.der().len());
+        assert!(brotli + 1000 < plain, "brotli {brotli}, uncompressed {plain}");
+        assert!(zlib + 1000 < plain, "zlib {zlib}, uncompressed {plain}");
+        // The next handshake takes the compressed chain from the cache (the flight differs only by
+        // the ECDSA signature, whose DER length varies by a byte or two).
+        let again = server_flight(server, client(vec![rustls::compress::BROTLI_DECOMPRESSOR]));
+        assert!(again.abs_diff(brotli) <= 4, "brotli {brotli}, then {again}");
     }
 }

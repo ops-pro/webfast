@@ -58,7 +58,8 @@ percent-encoding = "2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 regex = "1"
 rustc-hash = "2"
-rustls = "0.23"
+# brotli, zlib: TLS certificate compression (RFC 8879) for the clients that offer it (src/tls.rs).
+rustls = { version = "0.23", features = ["brotli", "zlib"] }
 serde_json = "1"
 # Socket options for the listening TCP and UDP sockets (src/sockets.rs).
 socket2 = { version = "0.6", features = ["all"] }
