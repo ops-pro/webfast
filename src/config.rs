@@ -51,6 +51,10 @@ pub struct ServerConfig {
     pub port: u16,
     /// Certificates (TLS sites); `None`: plain HTTP.
     pub tls: Option<Vec<CertSpec>>,
+    /// TLS: a certificate only for a name a site names, exactly or by a wildcard; a handshake
+    /// without SNI or for another name ends before any certificate is sent (WEB_TLS_STRICT_SNI,
+    /// src/main.rs; src/tls.rs).
+    pub strict_sni: bool,
     pub protocols: Protocols,
     pub trusted_proxies: Vec<IpNet>,
     pub trusted_strict: bool,
@@ -425,6 +429,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                 servers.push(ServerConfig {
                     port: p.port,
                     tls: (!p.tls.is_empty()).then(Vec::new),
+                    strict_sni: false,
                     protocols: opts.protocols.unwrap_or_default(),
                     trusted_proxies: opts.trusted.clone().unwrap_or_default(),
                     trusted_strict: opts.strict.unwrap_or(false),

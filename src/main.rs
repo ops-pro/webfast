@@ -14,7 +14,9 @@
 //! WEB_WORKERS (one per CPU; `auto`): the listening sockets per port, so the threads that serve
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
-//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs).
+//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_TLS_STRICT_SNI
+//! (`off`; `on`: a TLS handshake without SNI or for a name no site names gets no certificate and
+//! ends, src/tls.rs).
 //! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
 //! holds, WEB_RATE_LIMIT_DRY_RUN (off): count and log only, and WEB_MAX_UPSTREAM_REQUESTS_PER_IP
 //! (256; 0: no limit): a client's requests at the upstreams at once (src/ratelimit.rs).
@@ -265,6 +267,12 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         }
         Err(_) => None,
     };
+    let strict_sni = match std::env::var("WEB_TLS_STRICT_SNI") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("on") => true,
+        Ok(value) if value.trim().eq_ignore_ascii_case("off") => false,
+        Ok(value) => return Err(format!("WEB_TLS_STRICT_SNI: on or off, not {value:?}")),
+        Err(_) => false,
+    };
     let per_core = match std::env::var("WEB_RUNTIME") {
         Ok(value) if value.trim().eq_ignore_ascii_case("per-core") => Some(true),
         Ok(value) if value.trim().eq_ignore_ascii_case("shared") => Some(false),
@@ -291,6 +299,7 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         return Err("WEB_RELOAD_DRAIN is the window of WEB_RELOAD=drain".to_string());
     }
     for server in &mut config.servers {
+        server.strict_sni = strict_sni;
         if let Some(per_core) = per_core {
             server.per_core = per_core;
         }

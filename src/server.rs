@@ -646,6 +646,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
     let ServerConfig {
         port,
         tls,
+        strict_sni,
         protocols,
         trusted_proxies,
         trusted_strict,
@@ -672,7 +673,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
     let mut quic_resolver = None;
     let mut port_resolver = None;
     if let Some(specs) = tls {
-        let resolver = Arc::new(CertResolver::new(specs, &tls::provider())?);
+        let resolver = Arc::new(CertResolver::new(specs, strict_sni, &tls::provider())?);
         tls::watch(resolver.clone());
         port_resolver = Some(resolver.clone());
         let mut alpn: Vec<&[u8]> = Vec::new();
@@ -740,6 +741,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         sockets = listeners.len(),
         congestion = crate::sockets::congestion_of(&listeners[0]).unwrap_or_default(),
         tls = state_tls,
+        strict_sni = state_tls && strict_sni,
         h1 = protocols.h1,
         h2 = protocols.h2 && state_tls,
         h2c = protocols.h2c && !state_tls,

@@ -691,6 +691,66 @@ async fn a_site_with_several_certificates_gives_each_client_one_it_can_verify() 
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+/// How a TLS handshake with `server_name` (`None`: no SNI) ended: Ok, or the rustls error.
+async fn handshake(
+    port: u16,
+    mut config: rustls::ClientConfig,
+    server_name: Option<&str>,
+) -> Result<(), rustls::Error> {
+    config.enable_sni = server_name.is_some();
+    let name = server_name.unwrap_or("localhost").to_string();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    match connector.connect(name.try_into().unwrap(), tcp_stream).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .cloned()
+            .unwrap_or_else(|| panic!("not a TLS error: {e}"))),
+    }
+}
+
+#[tokio::test]
+async fn with_strict_sni_only_the_names_of_the_sites_get_a_certificate() {
+    let (certified, dir) = self_signed();
+    let tls = format!(
+        "tls {} {}",
+        dir.path().join("cert.pem").display(),
+        dir.path().join("key.pem").display()
+    );
+    // A named site and a site for any host, both with a certificate.
+    let text = format!("localhost:0 {{\n\t{tls}\n\trespond \"named\"\n}}\n:0 {{\n\t{tls}\n\trespond \"any\"\n}}\n");
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+
+    for strict in [true, false] {
+        let mut config = webfast::load_parsed(&file, 1 << 20).unwrap();
+        config.servers[0].strict_sni = strict;
+        let running = server::start(config).await.unwrap();
+        let port = running.bound[0].1.port();
+        let client = || client_tls(&certified.cert, b"h2");
+
+        assert_eq!(
+            handshake(port, client(), Some("localhost")).await,
+            Ok(()),
+            "strict {strict}"
+        );
+        let other = handshake(port, client(), Some("other.test")).await;
+        let no_sni = handshake(port, client(), None).await;
+        if strict {
+            // The server ends the handshake: no certificate reached the client.
+            assert!(matches!(other, Err(rustls::Error::AlertReceived(_))), "{other:?}");
+            assert!(matches!(no_sni, Err(rustls::Error::AlertReceived(_))), "{no_sni:?}");
+        } else {
+            // The site for any host gives its certificate, which the client finds not to be for
+            // that name; without SNI the client checks it against "localhost" and takes it.
+            assert!(matches!(other, Err(rustls::Error::InvalidCertificate(_))), "{other:?}");
+            assert_eq!(no_sni, Ok(()));
+        }
+        running.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
 /// One HTTP/3 request on a QUIC connection: status and body.
 async fn h3_request(conn: quinn::Connection, method: Method, port: u16) -> (StatusCode, String) {
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();

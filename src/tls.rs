@@ -8,6 +8,11 @@
 //! host — and of those the first, in Caddyfile order, whose key signs with a scheme the client
 //! offers; as Caddy chooses, so the same file serves the same certificates in both.
 //!
+//! With WEB_TLS_STRICT_SNI=on a certificate goes only to a name a site names, exactly or by a
+//! wildcard: a handshake without SNI (a scanner trying the address) or for another name ends with
+//! an alert before any certificate is sent, as Cloudflare does — the certificates' names, the
+//! sites served, are not given away. The site for any host then serves no TLS handshake.
+//!
 //! Certificate compression (RFC 8879, TLS 1.3 over TCP and QUIC): a client that offers brotli or
 //! zlib gets the chain compressed, a shorter server flight. Each chain is compressed once, at the
 //! slow and small level, and kept; the cache has room for every certificate in both algorithms
@@ -44,6 +49,8 @@ pub fn provider() -> Arc<CryptoProvider> {
 #[derive(Debug)]
 pub struct CertResolver {
     loaded: RwLock<Vec<LoadedEntry>>,
+    /// Certificates only for the names the sites name (WEB_TLS_STRICT_SNI).
+    strict_sni: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,9 +99,12 @@ fn load(spec: &CertSpec, provider: &CryptoProvider) -> Result<LoadedEntry> {
 }
 
 impl CertResolver {
-    pub fn new(specs: Vec<CertSpec>, provider: &CryptoProvider) -> Result<CertResolver> {
+    /// `strict_sni`: a handshake without SNI, or for a name no site names exactly or by a wildcard,
+    /// gets no certificate and ends (the site for any host gives none either).
+    pub fn new(specs: Vec<CertSpec>, strict_sni: bool, provider: &CryptoProvider) -> Result<CertResolver> {
         Ok(CertResolver {
             loaded: RwLock::new(CertResolver::read(&specs, provider)?.0),
+            strict_sni,
         })
     }
 
@@ -158,15 +168,30 @@ impl ResolvesServerCert for CertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let loaded = self.loaded.read().ok()?;
         let name = hello.server_name().map(str::to_ascii_lowercase);
-        choose(&loaded, name.as_deref(), hello.signature_schemes()).map(|e| e.key.clone())
+        let chosen = choose(&loaded, name.as_deref(), hello.signature_schemes(), self.strict_sni);
+        if chosen.is_none() {
+            // Scanners do this all the time: debug, not to flood the log.
+            tracing::debug!(
+                sni = name.as_deref().unwrap_or(""),
+                "TLS handshake refused: no site for this name"
+            );
+        }
+        chosen.map(|e| e.key.clone())
     }
 }
 
 /// The certificate for a handshake: of the entries that fit the SNI `name` best — exactly, else by
 /// a wildcard, else an entry for any host, else (none fits) all of them — the first whose key can
 /// sign with one of the client's `schemes`; when none can, the first of them (the handshake then
-/// fails as it would have).
-fn choose<'a>(loaded: &'a [LoadedEntry], name: Option<&str>, schemes: &[SignatureScheme]) -> Option<&'a LoadedEntry> {
+/// fails as it would have). With `strict_sni` only an exact or wildcard fit counts: no name, or
+/// one that only the site for any host would take, gets none (rustls then ends the handshake with
+/// an alert, before any certificate is sent).
+fn choose<'a>(
+    loaded: &'a [LoadedEntry],
+    name: Option<&str>,
+    schemes: &[SignatureScheme],
+    strict_sni: bool,
+) -> Option<&'a LoadedEntry> {
     // How well an entry fits the name: 0 exactly, 1 by a wildcard, 2 as an entry for any host.
     let fit = |entry: &LoadedEntry| -> Option<u8> {
         if entry.spec.hosts.is_empty() {
@@ -180,6 +205,9 @@ fn choose<'a>(loaded: &'a [LoadedEntry], name: Option<&str>, schemes: &[Signatur
             .or_else(|| by.next().map(|_| 1))
     };
     let best = loaded.iter().filter_map(fit).min();
+    if strict_sni && !matches!(best, Some(0 | 1)) {
+        return None;
+    }
     let candidates = || loaded.iter().filter(move |e| best.is_none() || fit(e) == best);
     candidates()
         .find(|e| e.key.key.choose_scheme(schemes).is_some())
@@ -194,7 +222,7 @@ pub fn server_config(resolver: Arc<CertResolver>, alpn: &[&[u8]], quic: bool) ->
     } else {
         builder.with_safe_default_protocol_versions()?
     };
-    let certificates = resolver.specs.len();
+    let certificates = resolver.loaded.read().map_or(1, |l| l.len());
     let mut config = builder.with_no_client_auth().with_cert_resolver(resolver);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     // Compressed chains: one per certificate and algorithm, never evicted while those are in use.
@@ -253,7 +281,7 @@ mod tests {
     }
 
     fn chosen(loaded: &[LoadedEntry], name: &str, schemes: &[SignatureScheme]) -> usize {
-        let entry = choose(loaded, Some(name), schemes).expect("a certificate");
+        let entry = choose(loaded, Some(name), schemes, false).expect("a certificate");
         loaded.iter().position(|e| std::ptr::eq(e, entry)).unwrap()
     }
 
@@ -312,13 +340,41 @@ mod tests {
         );
         assert_eq!(chosen(&loaded, "other.test", &[EC]), 0, "the site for any host");
         assert!(
-            std::ptr::eq(choose(&loaded, None, &[EC]).unwrap(), &loaded[0]),
+            std::ptr::eq(choose(&loaded, None, &[EC], false).unwrap(), &loaded[0]),
             "no SNI"
         );
         // No site for any host and no name that fits: the first certificate the client can verify.
         let named = [loaded[2].clone(), loaded[1].clone()];
         assert_eq!(chosen(&named, "other.test", &[EC]), 1);
         assert_eq!(chosen(&named, "other.test", &[RSA]), 0);
+    }
+
+    #[test]
+    fn strict_sni_gives_certificates_only_to_the_names_of_the_sites() {
+        let loaded = [
+            entry(&[], &rcgen::PKCS_ECDSA_P256_SHA256),
+            entry(&["*.example.test"], &rcgen::PKCS_ECDSA_P256_SHA256),
+            entry(&["www.example.test"], &rcgen::PKCS_ECDSA_P256_SHA256),
+        ];
+        let strict = |name: Option<&str>| {
+            choose(&loaded, name, &[EC], true).map(|e| loaded.iter().position(|l| std::ptr::eq(l, e)).unwrap())
+        };
+        assert_eq!(strict(Some("www.example.test")), Some(2), "exact");
+        assert_eq!(strict(Some("api.example.test")), Some(1), "wildcard");
+        assert_eq!(
+            strict(None),
+            None,
+            "no SNI: no certificate, even with a site for any host"
+        );
+        assert_eq!(strict(Some("other.test")), None, "a name no site names");
+        assert_eq!(strict(Some("a.b.example.test")), None, "a wildcard covers one label");
+        let named = [loaded[2].clone()];
+        assert!(choose(&named, None, &[EC], true).is_none());
+        assert!(choose(&named, Some("other.test"), &[EC], true).is_none());
+        assert!(
+            choose(&named, Some("other.test"), &[EC], false).is_some(),
+            "not strict: the first"
+        );
     }
 
     /// Bytes the server sends until a handshake between these two is complete.
@@ -363,9 +419,13 @@ mod tests {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let signing = provider().key_provider.load_private_key(key).unwrap();
         let resolver = Arc::new(CertResolver {
-            specs: Vec::new(),
+            strict_sni: false,
             loaded: RwLock::new(vec![LoadedEntry {
-                hosts: Vec::new(),
+                spec: CertSpec {
+                    hosts: Vec::new(),
+                    cert: std::path::PathBuf::new(),
+                    key: std::path::PathBuf::new(),
+                },
                 key: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing)),
                 stamp: Vec::new(),
             }]),
