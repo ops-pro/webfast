@@ -90,6 +90,8 @@ HTTPS and HTTP/3 served directly, a hardened systemd service — each checked by
 ## Documentation
 
 - [Recipes](recipes): configurations for common setups.
+- [Overview](docs/overview.md): how a connection and a request are handled, with diagrams, and
+  where each cargo feature takes part.
 - [Configuration](docs/configuration.md): the Caddyfile subset, how it differs from Caddy, the
   environment variables.
 - [Operations](docs/operations.md): the Docker image, running behind a proxy or with TLS and
