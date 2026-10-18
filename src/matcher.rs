@@ -214,6 +214,12 @@ impl PathPattern {
         }
     }
 
+    /// Whether the pattern matches `path`, lowercased and cleaned as the `path` matcher sees it
+    /// (for modules that match paths the same way, src/jwt).
+    pub fn matches_path(&self, path: &str) -> bool {
+        self.matches(path)
+    }
+
     /// `path` lowercased and cleaned.
     fn matches(&self, path: &str) -> bool {
         match &self.kind {

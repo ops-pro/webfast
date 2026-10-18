@@ -3,6 +3,8 @@
 //! docs/).
 
 pub mod accesslog;
+#[cfg(feature = "api-firewall")]
+pub mod apifw;
 pub mod body;
 #[cfg(feature = "proxy-cache")]
 pub mod cache;
@@ -15,6 +17,8 @@ pub mod guard;
 pub mod h3;
 pub mod h3limit;
 pub mod handler;
+#[cfg(feature = "jwt")]
+pub mod jwt;
 pub mod matcher;
 pub mod memo;
 pub mod placeholder;

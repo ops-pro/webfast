@@ -20,20 +20,34 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "rate-limit", "proxy-cache"]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall"]
 # `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
 rate-limit = []
 # `cache`: proxied responses kept in memory, in the cache-handler plugin's syntax (src/cache.rs).
 proxy-cache = []
 # mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# JWT validation at the edge (src/jwt), on when WEB_JWT_CONFIG names its file; without the feature
+# none of its code or dependencies is built.
+jwt = ["dep:hyper-rustls", "dep:serde", "dep:serde_yaml_ng"]
+# OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
+# file; without the feature none of its code or dependencies is built.
+api-firewall = ["dep:jsonschema", "dep:serde", "dep:serde_yaml_ng"]
 
 [dependencies]
 anyhow = "1"
+# JWKS over HTTPS (src/jwt), the Mozilla roots built in: the image has no CA store.
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "aws-lc-rs", "webpki-roots", "tls12"] }
+# OpenAPI schemas compiled into validators once (src/apifw); no fetching of remote references.
+jsonschema = { version = "0.59", optional = true, default-features = false }
+serde = { version = "1", optional = true, features = ["derive"] }
+# The JWT configuration file (src/jwt); serde_yaml's maintained fork.
+serde_yaml_ng = { version = "0.10", optional = true }
 # The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
 # requests load them without counting references.
 arc-swap = "1"
-# SHA-256 of the files that may be compression dictionaries (src/files.rs); already the TLS
+# SHA-256 of the files that may be compression dictionaries (src/files.rs) and JWT signatures
+# with keys parsed once (src/jwt); already the TLS
 # backend, with the same features as rustls asks for.
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 blake3 = "1"
@@ -76,6 +90,8 @@ zstd = "0.13"
 libc = "0.2"
 
 [dev-dependencies]
+# Tests read RSA keys' modulus and exponent back to write JWKS (src/jwt).
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "ring-io"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
 tokio-stream = "0.1"
