@@ -14,7 +14,8 @@
 //! WEB_WORKERS (one per CPU; `auto`): the listening sockets per port, so the threads that serve
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
-//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_TLS_STRICT_SNI
+//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_JWT_CONFIG and
+//! WEB_API_FIREWALL_CONFIG: YAML files of the request checks (src/jwt, src/apifw); WEB_TLS_STRICT_SNI
 //! (`off`; `on`: a TLS handshake without SNI or for a name no site names gets no certificate and
 //! ends, src/tls.rs).
 //! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
@@ -187,7 +188,18 @@ fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
+    let checks = match checks_from_env(&mut config) {
+        Ok(checks) => checks,
+        Err(e) => {
+            tracing::error!(error = %e, "request checks configuration error");
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     if command == "validate" {
+        for line in &checks {
+            println!("{line}");
+        }
         let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
         let files = config.files;
         println!(
@@ -218,6 +230,51 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The request checks the environment names: WEB_JWT_CONFIG (src/jwt) and
+/// WEB_API_FIREWALL_CONFIG (src/apifw), each a YAML file; what was loaded, one line each.
+fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
+    let _ = &config;
+    #[allow(unused_mut)]
+    let mut loaded = Vec::new();
+    let file = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(path) = file("WEB_JWT_CONFIG") {
+        #[cfg(feature = "jwt")]
+        {
+            let jwt = webfast::jwt::JwtAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+            let (providers, rules) = jwt.counts();
+            loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s)"));
+            config.jwt = Some(std::sync::Arc::new(jwt));
+        }
+        #[cfg(not(feature = "jwt"))]
+        return Err(format!("WEB_JWT_CONFIG={path}: this build has no `jwt` feature"));
+    }
+    if let Some(path) = file("WEB_API_FIREWALL_CONFIG") {
+        #[cfg(feature = "api-firewall")]
+        {
+            let firewall =
+                webfast::apifw::ApiFirewall::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+            let (apis, operations) = firewall.counts();
+            loaded.push(format!(
+                "API firewall: {path}, {apis} API(s), {operations} operation(s)"
+            ));
+            config.api_firewall = Some(std::sync::Arc::new(firewall));
+        }
+        #[cfg(not(feature = "api-firewall"))]
+        return Err(format!(
+            "WEB_API_FIREWALL_CONFIG={path}: this build has no `api-firewall` feature"
+        ));
+    }
+    for line in &loaded {
+        tracing::info!("request checks: {line}");
+    }
+    Ok(loaded)
 }
 
 /// WEB_WORKERS: how many threads serve connections (`auto` or unset: one per CPU).

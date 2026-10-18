@@ -48,6 +48,60 @@ pub struct ServerState {
     /// TLS with the Host check on (`strict_sni_host`, on unless `insecure_off`): the certificates,
     /// to tell whether a request's Host is served with the connection's one.
     host_check: Option<Arc<CertResolver>>,
+    checks: Checks,
+}
+
+/// What every request is checked by before its site's routes and ready answers, when configured:
+/// its JWT (src/jwt), then the OpenAPI spec of the API it is for (src/apifw).
+#[derive(Clone, Default)]
+pub(crate) struct Checks {
+    #[cfg(feature = "jwt")]
+    jwt: Option<Arc<crate::jwt::JwtAuth>>,
+    #[cfg(feature = "api-firewall")]
+    api_firewall: Option<Arc<crate::apifw::ApiFirewall>>,
+}
+
+impl Checks {
+    fn from_config(config: &Config) -> Checks {
+        let _ = config;
+        Checks {
+            #[cfg(feature = "jwt")]
+            jwt: config.jwt.clone(),
+            #[cfg(feature = "api-firewall")]
+            api_firewall: config.api_firewall.clone(),
+        }
+    }
+
+    /// Whether any check is configured (none: requests skip this step whole).
+    fn any(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut any = false;
+        #[cfg(feature = "jwt")]
+        {
+            any |= self.jwt.is_some();
+        }
+        #[cfg(feature = "api-firewall")]
+        {
+            any |= self.api_firewall.is_some();
+        }
+        any
+    }
+
+    /// `Ok` with the body to go on with (the same bytes, when a check read it), or the answer
+    /// that refuses the request.
+    #[allow(clippy::result_large_err)]
+    async fn check(&self, parts: &mut http::request::Parts, body: Body) -> std::result::Result<Body, Response<Body>> {
+        let _ = &parts;
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.jwt {
+            jwt.check(parts).await?;
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.api_firewall {
+            return firewall.check(parts, body).await;
+        }
+        Ok(body)
+    }
 }
 
 /// A port's sites, and whose word on the client's address is taken.
@@ -247,7 +301,7 @@ enum Way {
 /// Handles one request on any protocol.
 pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Response<Body> {
     let started = Instant::now();
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let remote = connection.info.remote;
     let version = parts.version;
     // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
@@ -301,12 +355,19 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         uri: parts.uri.clone(),
         started,
     });
-    let way = if misdirected {
+    // Refused before the routes and ready answers: a Host of another certificate (421), then by
+    // the request checks.
+    let (way, body) = if misdirected {
         let mut response = Response::new(crate::body::empty());
         *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
-        Way::Ready(response)
+        (Way::Ready(response), crate::body::empty())
+    } else if state.checks.any() {
+        match state.checks.check(&mut parts, body).await {
+            Ok(body) => (way, body),
+            Err(response) => (Way::Ready(response), crate::body::empty()),
+        }
     } else {
-        way
+        (way, body)
     };
     let mut response = match way {
         Way::Ready(response) => response,
@@ -597,8 +658,13 @@ pub async fn start(config: Config) -> Result<Running> {
         stores: Vec::new(),
         watcher: None,
     };
+    let checks = Checks::from_config(&config);
+    #[cfg(feature = "jwt")]
+    if let Some(jwt) = &checks.jwt {
+        jwt.start()?;
+    }
     for server in config.servers {
-        start_server(server, &mut running).await?;
+        start_server(server, &mut running, checks.clone()).await?;
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
     running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
@@ -680,7 +746,7 @@ fn bind_quic(port: u16, config: quinn::ServerConfig) -> Result<quinn::Endpoint> 
     .with_context(|| format!("cannot serve HTTP/3 on UDP port {port}"))
 }
 
-async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()> {
+async fn start_server(server: ServerConfig, running: &mut Running, checks: Checks) -> Result<()> {
     let shape = Shape::of(&server);
     let ServerConfig {
         port,
@@ -748,6 +814,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         tls: state_tls,
         alt_svc: None,
         host_check,
+        checks,
     };
     let mut quic_endpoint = None;
     if let Some(resolver) = quic_resolver {

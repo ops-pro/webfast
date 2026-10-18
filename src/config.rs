@@ -47,6 +47,12 @@ pub struct Config {
     pub watch: crate::watch::Watch,
     pub grace_period: Duration,
     pub debug: bool,
+    /// JWT validation (WEB_JWT_CONFIG, src/jwt): every request is checked by it first.
+    #[cfg(feature = "jwt")]
+    pub jwt: Option<Arc<crate::jwt::JwtAuth>>,
+    /// OpenAPI request validation (WEB_API_FIREWALL_CONFIG, src/apifw), after the JWT check.
+    #[cfg(feature = "api-firewall")]
+    pub api_firewall: Option<Arc<crate::apifw::ApiFirewall>>,
 }
 
 pub struct ServerConfig {
@@ -505,6 +511,10 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         watch: crate::watch::Watch::default(),
         grace_period: globals.grace,
         debug: globals.debug,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "api-firewall")]
+        api_firewall: None,
     })
 }
 

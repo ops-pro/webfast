@@ -550,24 +550,46 @@ impl Api {
             }
             return (Ok(()), crate::body::boxed(limited));
         }
-        let bytes = match http_body_util::Limited::new(body, self.max_body).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(error) => {
-                let too_large = error.downcast_ref::<http_body_util::LengthLimitError>().is_some()
-                    || error.downcast_ref::<TooLargeError>().is_some()
-                    || std::error::Error::source(&*error).is_some_and(|e| e.downcast_ref::<TooLargeError>().is_some());
-                let violation = if too_large {
-                    Violation::new("request-body:too-large", "over max_body_size")
-                        .with_status(StatusCode::PAYLOAD_TOO_LARGE)
-                } else {
-                    Violation::new("request-body:unread", error.to_string()).with_status(StatusCode::BAD_REQUEST)
-                };
-                return (Err(violation), crate::body::empty());
-            }
+        let bytes = match read_body(body, self.max_body).await {
+            Ok(bytes) => bytes,
+            Err(violation) => return (Err(violation), crate::body::empty()),
         };
         let outcome = validate_body(media, &bytes);
         (outcome, crate::body::full(bytes))
     }
+}
+
+/// The whole body, at most `max` bytes (frame by frame: no adapter whose error conversions would
+/// keep the request's future from being `Send`).
+async fn read_body(mut body: Body, max: usize) -> std::result::Result<Bytes, Violation> {
+    let too_large =
+        || Violation::new("request-body:too-large", "over max_body_size").with_status(StatusCode::PAYLOAD_TOO_LARGE);
+    let hint = http_body::Body::size_hint(&body);
+    if hint.lower() > max as u64 {
+        return Err(too_large());
+    }
+    let mut collected = bytes::BytesMut::with_capacity(hint.exact().map_or(0, |n| n as usize));
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    if collected.len() + data.len() > max {
+                        return Err(too_large());
+                    }
+                    collected.extend_from_slice(&data);
+                }
+            }
+            Err(error) => {
+                if error.downcast_ref::<TooLargeError>().is_some() {
+                    return Err(too_large());
+                }
+                return Err(
+                    Violation::new("request-body:unread", error.to_string()).with_status(StatusCode::BAD_REQUEST)
+                );
+            }
+        }
+    }
+    Ok(collected.freeze())
 }
 
 fn validate_body(media: &spec::Media, bytes: &Bytes) -> std::result::Result<(), Violation> {

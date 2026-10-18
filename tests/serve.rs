@@ -118,6 +118,8 @@ async fn upstream() -> SocketAddr {
                         "xfh": header("x-forwarded-host"),
                         "country": header("cf-ipcountry"),
                         "real_ip": header("x-real-ip"),
+                        "user": header("x-user"),
+                        "authorization": header("authorization"),
                         // /api/big: past the size compressed on the blocking pool (64 KiB).
                         "padding": "x".repeat(if req.uri().path() == "/api/big" { 300_000 } else { 600 }),
                     });
@@ -238,12 +240,18 @@ struct Harness {
 }
 
 async fn start() -> Harness {
+    start_with(|_| {}).await
+}
+
+/// The harness with its configuration changed first (the request checks, say).
+async fn start_with(adjust: impl FnOnce(&mut webfast::config::Config)) -> Harness {
     let site = site();
     let app = upstream().await;
     let ai = upstream().await;
     let text = caddyfile(site.path(), app, ai);
     let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
-    let config = webfast::load_parsed(&file, 1 << 24).unwrap();
+    let mut config = webfast::load_parsed(&file, 1 << 24).unwrap();
+    adjust(&mut config);
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -737,6 +745,107 @@ async fn request_bodies_over_their_limit_get_413() {
     );
     // Paths without a limit take any size.
     assert_eq!(post("/api/slurp", sized(5000)).await, (StatusCode::OK, "5000".into()));
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+/// base64url without padding (test tokens).
+#[cfg(feature = "jwt")]
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "jwt")]
+#[tokio::test]
+async fn jwts_are_checked_before_the_routes() {
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+    let point = key.public_key().as_ref().to_vec();
+    let jwks = serde_json::json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k",
+        "x": base64url(&point[1..33]), "y": base64url(&point[33..65])}]});
+    let yaml = format!(
+        "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\n    output_claim_to_headers: [{{header: X-User, claim: sub}}]\nrules:\n  - match: {{paths: [\"/api/*\"]}}\n    providers: [id]\n"
+    );
+    let jwt = webfast::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap();
+    let h = start_with(|config| config.jwt = Some(Arc::new(jwt))).await;
+
+    let missing = h.get("/api/echo", &[]).await;
+    assert_eq!(missing.status, 401);
+    assert_eq!(header(&missing, "www-authenticate"), "Bearer");
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let input = format!(
+        "{}.{}",
+        base64url(br#"{"alg":"ES256","kid":"k"}"#),
+        base64url(
+            serde_json::json!({"iss": "https://id.test", "sub": "u1", "exp": exp})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let signature = key
+        .sign(&aws_lc_rs::rand::SystemRandom::new(), input.as_bytes())
+        .unwrap();
+    let token = format!("{input}.{}", base64url(signature.as_ref()));
+    let bearer = format!("Bearer {token}");
+    let ok = h
+        .get("/api/echo", &[("authorization", &bearer), ("x-user", "admin")])
+        .await;
+    assert_eq!(ok.status, 200);
+    let echo: serde_json::Value = serde_json::from_slice(&ok.body).unwrap();
+    assert_eq!(echo["user"], "u1", "the claim, not what the client sent");
+    assert_eq!(echo["authorization"], "", "the token is not passed on");
+
+    // Paths no rule covers: no token needed, and still no made-up claim headers upstream.
+    let elsewhere = h.get("/legacy-page", &[("x-user", "admin")]).await;
+    assert_eq!(elsewhere.status, 200);
+    let echo: serde_json::Value = serde_json::from_slice(&elsewhere.body).unwrap();
+    assert_eq!(echo["user"], "");
+    assert_eq!(h.get("/en/", &[]).await.status, 200, "files too");
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[cfg(feature = "api-firewall")]
+#[tokio::test]
+async fn api_requests_are_checked_against_the_spec() {
+    let spec = "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths:\n  /slurp:\n    post:\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {type: object, required: [n], properties: {n: {type: integer}}}\n      responses: {'200': {description: ok}}\n  /echo:\n    get:\n      parameters: [{name: q, in: query, schema: {type: integer}}]\n      responses: {'200': {description: ok}}\n";
+    let firewall = webfast::apifw::ApiFirewall::from_spec(spec, "spec: inline\nbase_path: /api\n").unwrap();
+    let h = start_with(|config| config.api_firewall = Some(Arc::new(firewall))).await;
+    let post = |body: &'static str| {
+        let request = Request::post(format!("{}/api/slurp", h.base))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let sent = h.client.request(request);
+        async move {
+            let response = sent.await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status.as_u16(), String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    // The upstream gets the bytes that were checked: it answers with their number.
+    assert_eq!(post(r#"{"n": 1}"#).await, (200, "8".to_string()));
+    assert_eq!(post(r#"{"n": "x"}"#).await.0, 403);
+    assert_eq!(h.get("/api/echo?q=1", &[]).await.status, 200);
+    assert_eq!(h.get("/api/echo?q=x", &[]).await.status, 403);
+    assert_eq!(h.get("/api/unknown", &[]).await.status, 403);
+    assert_eq!(h.get("/legacy-page", &[]).await.status, 200, "outside the API");
+    assert_eq!(h.get("/en/", &[]).await.status, 200, "files too");
     h.running.shutdown(Duration::from_secs(1)).await;
 }
 

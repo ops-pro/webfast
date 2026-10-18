@@ -460,10 +460,22 @@ fn specs_and_configurations_that_cannot_work_are_refused() {
 async fn timings() {
     let fw = firewall("");
     let order = r#"{"name":"pen","qty":2,"note":null,"email":"a@b.test","price":1.5}"#;
-    let cases: [(&str, &str, &str, Vec<(&str, &str)>, &str); 4] = [
+    let cases = [
         ("outside the API", "GET", "/index.html", vec![], ""),
-        ("GET with 3 parameters", "GET", "/api/orders?limit=10&tag=a&tag=b", vec![TRACE], ""),
-        ("POST, JSON body (70 B)", "POST", "/api/orders", vec![("content-type", "application/json"), BEARER], order),
+        (
+            "GET with 3 parameters",
+            "GET",
+            "/api/orders?limit=10&tag=a&tag=b",
+            vec![TRACE],
+            "",
+        ),
+        (
+            "POST, JSON body (70 B)",
+            "POST",
+            "/api/orders",
+            vec![("content-type", "application/json"), BEARER],
+            order,
+        ),
         ("unknown path, refused", "GET", "/api/nope", vec![], ""),
     ];
     for (name, method, uri, headers, body) in cases {
@@ -480,6 +492,9 @@ async fn timings() {
             let _ = run(&none, method, uri, &headers, body).await;
         }
         let baseline = started.elapsed() / rounds;
-        println!("{name}: {:?} (request alone {baseline:?})", total.saturating_sub(baseline));
+        println!(
+            "{name}: {:?} (request alone {baseline:?})",
+            total.saturating_sub(baseline)
+        );
     }
 }
