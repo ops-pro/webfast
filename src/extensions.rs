@@ -107,13 +107,7 @@ pub trait ProxyObserver: Send + Sync {
     fn fallback(&self, pending: &mut Self::Pending, ctx: &mut Ctx, status: StatusCode) -> Option<Response<Body>>;
 
     /// The response as it goes out: its body, perhaps wrapped.
-    fn observe(
-        &self,
-        pending: Self::Pending,
-        sent: Sent<'_>,
-        parts: &mut http::response::Parts,
-        body: Body,
-    ) -> Body;
+    fn observe(&self, pending: Self::Pending, sent: Sent<'_>, parts: &mut http::response::Parts, body: Body) -> Body;
 }
 
 /// What `file_server` has of a file in an encoding, when there is no precompressed sibling.
@@ -515,7 +509,6 @@ pub fn check_bindings(config: &Config) -> Result<()> {
     within(&bound, &config.upstreams())
 }
 
-
 // Startup: the environment, the files, and what runs once the server does.
 
 /// The extensions' environment (WEB_*), read before the configuration: each built extension's
@@ -527,7 +520,11 @@ pub fn configure_from_env() -> std::result::Result<(), String> {
     unbuilt(
         "rate limits",
         "rate-limit",
-        &["WEB_RATE_LIMIT_KEYS", "WEB_RATE_LIMIT_DRY_RUN", "WEB_MAX_UPSTREAM_REQUESTS_PER_IP"],
+        &[
+            "WEB_RATE_LIMIT_KEYS",
+            "WEB_RATE_LIMIT_DRY_RUN",
+            "WEB_MAX_UPSTREAM_REQUESTS_PER_IP",
+        ],
     )?;
     #[cfg(feature = "proxy-cache")]
     crate::cache::configure_from_env()?;
@@ -536,7 +533,11 @@ pub fn configure_from_env() -> std::result::Result<(), String> {
     #[cfg(feature = "compress-files")]
     crate::variants::configure_from_env()?;
     #[cfg(not(feature = "compress-files"))]
-    unbuilt("compressed variants", "compress-files", &["WEB_COMPRESSED_FILES_MEMORY"])?;
+    unbuilt(
+        "compressed variants",
+        "compress-files",
+        &["WEB_COMPRESSED_FILES_MEMORY"],
+    )?;
     #[cfg(not(feature = "jwt"))]
     unbuilt("JWT validation", "jwt", &["WEB_JWT_CONFIG"])?;
     #[cfg(not(feature = "api-firewall"))]
@@ -547,7 +548,9 @@ pub fn configure_from_env() -> std::result::Result<(), String> {
 #[allow(dead_code)]
 fn unbuilt(what: &str, feature: &str, variables: &[&str]) -> std::result::Result<(), String> {
     match variables.iter().find(|name| std::env::var_os(name).is_some()) {
-        Some(name) => Err(format!("{name}: this webfast was built without {what} (cargo feature {feature})")),
+        Some(name) => Err(format!(
+            "{name}: this webfast was built without {what} (cargo feature {feature})"
+        )),
         None => Ok(()),
     }
 }
@@ -722,7 +725,11 @@ mod tests {
         assert_eq!(refused.status(), http::StatusCode::FORBIDDEN);
         assert_eq!(pass_then_refuse.0.as_ref().unwrap().calls.load(Ordering::Relaxed), 1);
         assert_eq!((pass_then_refuse.1).0.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(((pass_then_refuse.1).1).0.calls.load(Ordering::Relaxed), 0, "not reached");
+        assert_eq!(
+            ((pass_then_refuse.1).1).0.calls.load(Ordering::Relaxed),
+            0,
+            "not reached"
+        );
 
         let unconfigured: Option<Counting> = None;
         assert!(

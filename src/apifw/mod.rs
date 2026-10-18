@@ -965,7 +965,9 @@ impl crate::extensions::UpstreamCheck for ApiFirewall {
         client: crate::extensions::Client<'_>,
         upstreams: &[Authority],
     ) -> std::result::Result<(Body, ()), Response<Body>> {
-        self.check_upstream(req, body, client.ip, upstreams).await.map(|body| (body, ()))
+        self.check_upstream(req, body, client.ip, upstreams)
+            .await
+            .map(|body| (body, ()))
     }
 
     fn bound(&self) -> bool {

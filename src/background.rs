@@ -20,7 +20,14 @@ pub struct Worker<J> {
 
 impl<J: Send + 'static> Worker<J> {
     /// `nice`: how far below the requests' threads the worker runs (Linux; 0: the same).
-    pub fn start<R, F, T>(name: &'static str, queue: usize, nice: i32, every: Duration, mut run: R, mut tick: T) -> Worker<J>
+    pub fn start<R, F, T>(
+        name: &'static str,
+        queue: usize,
+        nice: i32,
+        every: Duration,
+        mut run: R,
+        mut tick: T,
+    ) -> Worker<J>
     where
         R: FnMut(J) -> F + Send + 'static,
         F: Future<Output = ()>,
@@ -57,10 +64,7 @@ impl<J: Send + 'static> Worker<J> {
             // The receiver is gone with the thread: every `submit` fails and is counted.
             tracing::error!(thread = name, error = %e, "the background thread cannot start: its work is not done");
         }
-        Worker {
-            jobs,
-            dropped,
-        }
+        Worker { jobs, dropped }
     }
 
     /// Queues `job`; a full queue (or a worker that could not start) gives it back and counts it.
@@ -68,7 +72,8 @@ impl<J: Send + 'static> Worker<J> {
         self.jobs.try_send(job).map_err(|e| {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             match e {
-                tokio::sync::mpsc::error::TrySendError::Full(job) | tokio::sync::mpsc::error::TrySendError::Closed(job) => job,
+                tokio::sync::mpsc::error::TrySendError::Full(job)
+                | tokio::sync::mpsc::error::TrySendError::Closed(job) => job,
             }
         })
     }

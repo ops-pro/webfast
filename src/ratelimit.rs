@@ -643,4 +643,3 @@ mod tests {
         assert_eq!(retry_after(Duration::from_secs(20)), "20");
     }
 }
-

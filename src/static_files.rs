@@ -177,18 +177,18 @@ impl FileServer {
                 Lookup::No => {}
             }
         }
-            if let Some(made) = &variant {
-                chosen = made;
+        if let Some(made) = &variant {
+            chosen = made;
+        }
+        if wanted[0].is_some() && ctx.error.is_none() {
+            if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+                // Not a ready answer: live requests come here and ask for the variant.
+                ctx.req.extensions.insert(crate::memo::Unkept);
+            } else if ctx.req.method == Method::GET || ctx.req.method == Method::HEAD {
+                let encodings: Vec<_> = wanted.iter().flatten().copied().collect();
+                REPRESENTATIONS.wanted(&entry, &store, &encodings);
             }
-            if wanted[0].is_some() && ctx.error.is_none() {
-                if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
-                    // Not a ready answer: live requests come here and ask for the variant.
-                    ctx.req.extensions.insert(crate::memo::Unkept);
-                } else if ctx.req.method == Method::GET || ctx.req.method == Method::HEAD {
-                    let encodings: Vec<_> = wanted.iter().flatten().copied().collect();
-                    REPRESENTATIONS.wanted(&entry, &store, &encodings);
-                }
-            }
+        }
         // The delta, when it is smaller than the best the client could get otherwise.
         if let Some((delta, etag)) = delta
             && delta.len() < chosen.len()

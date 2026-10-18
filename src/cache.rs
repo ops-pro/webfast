@@ -292,7 +292,10 @@ static WORKER: LazyLock<Worker<Job>> = LazyLock::new(|| {
         |dropped| {
             STORE.sweep(Instant::now());
             if dropped > 0 {
-                tracing::warn!(dropped, "proxy cache: answers not stored or revalidated, its queue was full");
+                tracing::warn!(
+                    dropped,
+                    "proxy cache: answers not stored or revalidated, its queue was full"
+                );
             }
         },
     )
@@ -406,12 +409,7 @@ async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
         at: crate::extensions::At::Hit,
     };
     match hooks
-        .check(
-            &mut ctx.req,
-            body,
-            client,
-            &entry.fetch.proxy.upstreams,
-        )
+        .check(&mut ctx.req, body, client, &entry.fetch.proxy.upstreams)
         .await
     {
         Ok((body, _held)) => {
@@ -901,8 +899,7 @@ impl Entry {
     /// Starts a background revalidation unless one is under way (or the queue is full: then a
     /// later request tries again).
     fn revalidate(self: &Arc<Self>) {
-        if !self.revalidating.swap(true, Ordering::AcqRel) && WORKER.submit(Job::Revalidate(self.clone())).is_err()
-        {
+        if !self.revalidating.swap(true, Ordering::AcqRel) && WORKER.submit(Job::Revalidate(self.clone())).is_err() {
             self.revalidating.store(false, Ordering::Release);
         }
     }
@@ -1236,7 +1233,14 @@ impl crate::extensions::ProxyObserver for Observer {
         body: Body,
     ) -> Body {
         match pending {
-            Some(miss) => miss.tee(sent.proxy, sent.path_and_query, sent.headers, sent.header_down, parts, body),
+            Some(miss) => miss.tee(
+                sent.proxy,
+                sent.path_and_query,
+                sent.headers,
+                sent.header_down,
+                parts,
+                body,
+            ),
             None => body,
         }
     }
@@ -1346,4 +1350,3 @@ mod tests {
         }
     }
 }
-

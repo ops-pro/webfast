@@ -840,7 +840,9 @@ impl crate::extensions::UpstreamCheck for JwtAuth {
             req.extensions
                 .insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
         }
-        self.check_upstream(req, client.ip, upstreams).await.map(|()| (body, ()))
+        self.check_upstream(req, client.ip, upstreams)
+            .await
+            .map(|()| (body, ()))
     }
 
     fn bound(&self) -> bool {

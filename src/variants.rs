@@ -373,7 +373,9 @@ mod tests {
         let mut variants = variants_of(&[100, 100, 100, 100]);
         // 1 and 3 were asked for since the last pass.
         for i in [1u128, 3] {
-            variants.slots[&(i, Encoding::Br)].touched.store(true, Ordering::Relaxed);
+            variants.slots[&(i, Encoding::Br)]
+                .touched
+                .store(true, Ordering::Relaxed);
         }
         evict(&mut variants, 250);
         let mut kept: Vec<u128> = variants.slots.keys().map(|k| k.0).collect();

@@ -330,7 +330,13 @@ impl ReverseProxy {
     /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own;
     /// when it answers 101, the client's connection and that one become a tunnel, copied both ways
     /// until either side closes. Any other answer is passed on as it is, with no tunnel.
-    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade, held: UpstreamHeld) -> Response<Body> {
+    async fn tunnel(
+        &self,
+        mut ctx: Ctx,
+        protocol: HeaderValue,
+        client: OnUpgrade,
+        held: UpstreamHeld,
+    ) -> Response<Body> {
         let mut headers = self.upstream_headers(&ctx);
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, protocol);
