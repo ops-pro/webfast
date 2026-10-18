@@ -39,6 +39,20 @@ pub struct ConnInfo {
     pub tls: bool,
     /// Requests from this peer may set the client IP and X-Forwarded-* (trusted_proxies).
     pub trusted: bool,
+    /// TLS: the name the handshake asked for (SNI), lowercase; `None`: none, or plain HTTP.
+    pub sni: Option<Box<str>>,
+}
+
+impl ConnInfo {
+    /// The same connection once its TLS handshake named `sni`.
+    pub fn with_sni(&self, sni: Option<&str>) -> ConnInfo {
+        ConnInfo {
+            remote: self.remote,
+            tls: self.tls,
+            trusted: self.trusted,
+            sni: sni.map(|name| name.to_ascii_lowercase().into_boxed_str()),
+        }
+    }
 }
 
 /// Groups of a `path_regexp` match: byte ranges into the matched path.
@@ -673,6 +687,8 @@ pub enum Handler {
         dynamic: bool,
     },
     RequestHeader(Vec<HeaderOp>),
+    /// `request_body { max_size }`: the request body may have at most this many bytes (0: any).
+    RequestBody(u64),
     Redir {
         to: Template,
         status: StatusCode,
@@ -843,6 +859,25 @@ fn rewrite(ctx: &mut Ctx, to: &Template) {
     ctx.set_path_and_query(target, query.as_deref().or(uri.query()));
 }
 
+/// The request body limited to `max` bytes (0: no limit, as in Caddy); several limits all hold.
+/// A body that is already complete (none, or empty) is left as it is.
+fn limit_body(ctx: &mut Ctx, max: u64) {
+    if max == 0 {
+        return;
+    }
+    let Some(body) = ctx.body.take_if(|body| !http_body::Body::is_end_stream(body)) else {
+        return;
+    };
+    let too_large = ctx
+        .req
+        .extensions
+        .get::<crate::guard::BodyTooLarge>()
+        .cloned()
+        .unwrap_or_default();
+    ctx.req.extensions.insert(too_large.clone());
+    ctx.body = Some(crate::body::boxed(crate::guard::LimitedBody::new(body, max, too_large)));
+}
+
 fn strip_prefix(ctx: &mut Ctx, prefix: &str) {
     let path = ctx.path().to_string();
     // Compared byte by byte, ASCII case-insensitively: `to_lowercase` may change the byte length of
@@ -893,6 +928,7 @@ impl Handler {
                 }
             }
             Handler::StripPrefix(prefix) => strip_prefix(ctx, prefix),
+            Handler::RequestBody(max) => limit_body(ctx, *max),
             _ => return false,
         }
         true
@@ -1038,6 +1074,7 @@ mod tests {
             remote: "127.0.0.1:5000".parse().unwrap(),
             tls: false,
             trusted: false,
+            sni: None,
         });
         let (parts, body) = http::Request::get(path).body(empty()).unwrap().into_parts();
         Ctx::new(conn, parts, body, "127.0.0.1".parse().unwrap())

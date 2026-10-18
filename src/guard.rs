@@ -370,6 +370,90 @@ impl http_body::Body for StalledBody {
     }
 }
 
+/// Set when a request body is over its `request_body` limit (`LimitedBody`): announced by its
+/// Content-Length, or found while it arrived. Kept in the request's extensions so that the proxy
+/// answers 413 — at once, without calling the upstream, when the length said so.
+#[derive(Debug, Clone, Default)]
+pub struct BodyTooLarge(pub Arc<AtomicBool>);
+
+impl BodyTooLarge {
+    pub fn happened(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The error a request body over its limit ends with.
+#[derive(Debug)]
+pub struct TooLargeError;
+
+impl std::fmt::Display for TooLargeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request body is larger than the request_body limit")
+    }
+}
+
+impl std::error::Error for TooLargeError {}
+
+/// A request body of at most `max` bytes (`request_body { max_size }`, as Caddy's): one whose
+/// length announces more is marked at once and fails when read; one that sends more fails at the
+/// frame that goes over.
+pub struct LimitedBody {
+    inner: Body,
+    remaining: u64,
+    too_large: BodyTooLarge,
+    announced: bool,
+}
+
+impl LimitedBody {
+    pub fn new(inner: Body, max: u64, too_large: BodyTooLarge) -> LimitedBody {
+        let announced = http_body::Body::size_hint(&inner).lower() > max;
+        if announced {
+            too_large.mark();
+        }
+        LimitedBody {
+            inner,
+            remaining: max,
+            too_large,
+            announced,
+        }
+    }
+}
+
+impl http_body::Body for LimitedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        if self.announced {
+            return Poll::Ready(Some(Err(Box::new(TooLargeError))));
+        }
+        let polled = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        if let Some(Ok(frame)) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            let len = data.len() as u64;
+            if len > self.remaining {
+                self.too_large.mark();
+                return Poll::Ready(Some(Err(Box::new(TooLargeError))));
+            }
+            self.remaining -= len;
+        }
+        Poll::Ready(polled)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        !self.announced && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// A socket that tells its connection's `Activity` when writes wait and when they move.
 pub struct Io<T> {
     inner: T,
@@ -570,6 +654,33 @@ mod tests {
             admission.admit(proxy, true).is_none(),
             "the overall limit binds trusted proxies too"
         );
+    }
+
+    #[tokio::test]
+    async fn request_bodies_over_the_limit_fail() {
+        use http_body_util::BodyExt;
+        // Content-Length over the limit: marked at once, before anything is read.
+        let flag = BodyTooLarge::default();
+        let body = LimitedBody::new(crate::body::full(vec![0u8; 101]), 100, flag.clone());
+        assert!(flag.happened());
+        assert!(body.collect().await.is_err());
+        // Within it: passes whole.
+        let flag = BodyTooLarge::default();
+        let body = LimitedBody::new(crate::body::full(vec![0u8; 100]), 100, flag.clone());
+        assert_eq!(body.collect().await.unwrap().to_bytes().len(), 100);
+        assert!(!flag.happened());
+        // No length announced: the frame that goes over fails.
+        let frames = vec![
+            Ok::<_, BoxError>(Frame::data(Bytes::from(vec![0u8; 60]))),
+            Ok(Frame::data(Bytes::from(vec![0u8; 60]))),
+        ];
+        let stream = http_body_util::StreamBody::new(tokio_stream::iter(frames));
+        let flag = BodyTooLarge::default();
+        let mut body = LimitedBody::new(crate::body::boxed(stream), 100, flag.clone());
+        assert!(!flag.happened(), "nothing announced");
+        assert!(body.frame().await.unwrap().is_ok(), "60 bytes: within");
+        assert!(body.frame().await.unwrap().is_err(), "120 bytes: over");
+        assert!(flag.happened());
     }
 
     #[test]

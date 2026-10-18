@@ -34,6 +34,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -135,6 +136,44 @@ impl CertResolver {
         }
     }
 
+    /// Whether a request for `host` may be answered on a connection whose handshake named `sni`
+    /// (RFC 9110 §15.5.20; otherwise 421 Misdirected Request): the sites that fit the host best
+    /// share a certificate with those that fit the SNI name best. A browser that coalesced HTTP/2
+    /// connections for names of one certificate is answered; a client that opened the connection
+    /// for one site and asks another, served with another certificate, is not. When neither
+    /// fits any site the request goes to no site anyway and is let through.
+    pub fn same_certificate(&self, sni: Option<&str>, host: &str) -> bool {
+        if sni.is_some_and(|sni| sni.eq_ignore_ascii_case(host)) {
+            return true;
+        }
+        let Ok(loaded) = self.loaded.read() else {
+            return true;
+        };
+        let host = host.to_ascii_lowercase();
+        let by_sni = self.certificates_for(&loaded, sni);
+        let by_host = self.certificates_for(&loaded, Some(&host));
+        if by_sni.is_empty() && by_host.is_empty() {
+            return true;
+        }
+        by_sni.iter().any(|file| by_host.contains(file))
+    }
+
+    /// The certificates (by their files) of the entries that fit `name` best; none when nothing
+    /// fits, or with strict SNI only the site for any host would.
+    fn certificates_for<'a>(&self, loaded: &'a [LoadedEntry], name: Option<&str>) -> Vec<(&'a Path, &'a Path)> {
+        let Some(best) = loaded.iter().filter_map(|e| fit(&e.spec.hosts, name)).min() else {
+            return Vec::new();
+        };
+        if self.strict_sni && best == 2 {
+            return Vec::new();
+        }
+        loaded
+            .iter()
+            .filter(|e| fit(&e.spec.hosts, name) == Some(best))
+            .map(|e| (e.spec.cert.as_path(), e.spec.key.as_path()))
+            .collect()
+    }
+
     /// Re-reads certificates whose files changed; a broken new file keeps the old certificate.
     pub fn reload_changed(&self, provider: &CryptoProvider) {
         let current: Vec<(CertSpec, Stamp)> = self
@@ -180,6 +219,20 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
+/// How well a site's `hosts` fit `name`: 0 exactly, 1 by a wildcard, 2 as the site for any host;
+/// `None`: not at all.
+fn fit(hosts: &[String], name: Option<&str>) -> Option<u8> {
+    if hosts.is_empty() {
+        return Some(2);
+    }
+    let name = name?;
+    let mut by = hosts.iter().filter(|h| host_matches(h, name));
+    by.clone()
+        .any(|h| !h.starts_with("*."))
+        .then_some(0)
+        .or_else(|| by.next().map(|_| 1))
+}
+
 /// The certificate for a handshake: of the entries that fit the SNI `name` best — exactly, else by
 /// a wildcard, else an entry for any host, else (none fits) all of them — the first whose key can
 /// sign with one of the client's `schemes`; when none can, the first of them (the handshake then
@@ -192,23 +245,12 @@ fn choose<'a>(
     schemes: &[SignatureScheme],
     strict_sni: bool,
 ) -> Option<&'a LoadedEntry> {
-    // How well an entry fits the name: 0 exactly, 1 by a wildcard, 2 as an entry for any host.
-    let fit = |entry: &LoadedEntry| -> Option<u8> {
-        if entry.spec.hosts.is_empty() {
-            return Some(2);
-        }
-        let name = name?;
-        let mut by = entry.spec.hosts.iter().filter(|h| host_matches(h, name));
-        by.clone()
-            .any(|h| !h.starts_with("*."))
-            .then_some(0)
-            .or_else(|| by.next().map(|_| 1))
-    };
-    let best = loaded.iter().filter_map(fit).min();
+    let fits = |entry: &LoadedEntry| fit(&entry.spec.hosts, name);
+    let best = loaded.iter().filter_map(fits).min();
     if strict_sni && !matches!(best, Some(0 | 1)) {
         return None;
     }
-    let candidates = || loaded.iter().filter(move |e| best.is_none() || fit(e) == best);
+    let candidates = || loaded.iter().filter(move |e| best.is_none() || fits(e) == best);
     candidates()
         .find(|e| e.key.key.choose_scheme(schemes).is_some())
         .or_else(|| candidates().next())
@@ -375,6 +417,71 @@ mod tests {
             choose(&named, Some("other.test"), &[EC], false).is_some(),
             "not strict: the first"
         );
+    }
+
+    /// A resolver over `entries`, `files[i]` naming entry i's certificate files.
+    fn resolver(mut entries: Vec<LoadedEntry>, files: Vec<usize>, strict_sni: bool) -> CertResolver {
+        for (entry, file) in entries.iter_mut().zip(files) {
+            entry.spec.cert = PathBuf::from(format!("cert-{file}.pem"));
+            entry.spec.key = PathBuf::from(format!("cert-{file}.key"));
+        }
+        CertResolver {
+            loaded: RwLock::new(entries),
+            strict_sni,
+        }
+    }
+
+    #[test]
+    fn a_host_served_with_another_certificate_is_misdirected() {
+        let a = entry(&["a.test"], &rcgen::PKCS_ECDSA_P256_SHA256);
+        let b = entry(&["b.test"], &rcgen::PKCS_ECDSA_P256_SHA256);
+        // c.test: a site of its own, with a.test's certificate files.
+        let c = entry(&["c.test"], &rcgen::PKCS_ECDSA_P256_SHA256);
+        let wild = entry(&["*.w.test"], &rcgen::PKCS_ECDSA_P256_SHA256);
+        let any = entry(&[], &rcgen::PKCS_ECDSA_P256_SHA256);
+        let r = resolver(
+            vec![a.clone(), b.clone(), c.clone(), wild.clone(), any.clone()],
+            vec![0, 1, 0, 3, 4],
+            false,
+        );
+        assert!(r.same_certificate(Some("a.test"), "a.test"));
+        assert!(r.same_certificate(Some("a.test"), "A.TEST"), "case");
+        assert!(
+            !r.same_certificate(Some("a.test"), "b.test"),
+            "another site, another certificate"
+        );
+        assert!(
+            r.same_certificate(Some("a.test"), "c.test"),
+            "coalesced: the same certificate"
+        );
+        assert!(
+            r.same_certificate(Some("x.w.test"), "y.w.test"),
+            "one wildcard certificate"
+        );
+        assert!(!r.same_certificate(Some("x.w.test"), "a.test"));
+        assert!(
+            !r.same_certificate(Some("other.test"), "a.test"),
+            "the site for any host is not a.test"
+        );
+        assert!(
+            r.same_certificate(Some("other.test"), "else.test"),
+            "both for the site for any host"
+        );
+        assert!(
+            !r.same_certificate(None, "a.test"),
+            "no SNI: the site for any host's certificate"
+        );
+
+        // No site for any host: names no site serves go nowhere and pass; a site's name does not.
+        let r = resolver(vec![a.clone(), b.clone()], vec![0, 1], false);
+        assert!(r.same_certificate(Some("other.test"), "else.test"));
+        assert!(!r.same_certificate(Some("other.test"), "a.test"));
+        assert!(!r.same_certificate(None, "b.test"));
+
+        // Strict SNI: a host no site names is misdirected on any connection.
+        let r = resolver(vec![a, b, any], vec![0, 1, 2], true);
+        assert!(r.same_certificate(Some("a.test"), "a.test"));
+        assert!(!r.same_certificate(Some("a.test"), "else.test"));
     }
 
     /// Bytes the server sends until a handshake between these two is complete.

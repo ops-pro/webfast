@@ -116,6 +116,12 @@ async fn connection(
         }
     };
     drop(handshake);
+    // The name the handshake asked for, for the Host check (src/server.rs `misdirected`).
+    let sni = conn
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.server_name);
+    let served = served.with_sni(sni.as_deref());
     let quic = conn.clone();
     let activity = Activity::new();
     let mut h3 = h3::server::builder()

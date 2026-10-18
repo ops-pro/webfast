@@ -72,7 +72,7 @@ async fn upstream() -> SocketAddr {
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
                     // Reads the whole request body before answering (a stalled client is seen here).
-                    if req.uri().path() == "/api/slurp" {
+                    if req.uri().path().starts_with("/api/slurp") {
                         let size = match req.into_body().collect().await {
                             Ok(collected) => collected.to_bytes().len().to_string(),
                             Err(e) => format!("error: {e}"),
@@ -188,6 +188,10 @@ fn caddyfile(root: &Path, app: SocketAddr, ai: SocketAddr) -> String {
 			flush_interval -1
 		}}
 		respond /api/stream/* 404
+
+		request_body /api/slurp-limited {{
+			max_size 1KB
+		}}
 
 		encode zstd br gzip
 
@@ -691,6 +695,126 @@ async fn a_site_with_several_certificates_gives_each_client_one_it_can_verify() 
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+#[tokio::test]
+async fn request_bodies_over_their_limit_get_413() {
+    let h = start().await;
+    type Boxed = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+    let client: Client<HttpConnector, Boxed> = Client::builder(TokioExecutor::new()).build_http();
+    let post = |path: &str, body: Boxed| {
+        let request = Request::post(format!("{}{path}", h.base)).body(body).unwrap();
+        let sent = client.request(request);
+        async move {
+            let response = sent.await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let sized = |n: usize| Full::new(Bytes::from(vec![b'x'; n])).boxed();
+    // Without a length: chunked over HTTP/1.1.
+    let streamed = |chunks: usize, size: usize| {
+        let frames: Vec<Result<http_body::Frame<Bytes>, Infallible>> = (0..chunks)
+            .map(|_| Ok(http_body::Frame::data(Bytes::from(vec![b'x'; size]))))
+            .collect();
+        http_body_util::StreamBody::new(tokio_stream::iter(frames)).boxed()
+    };
+    // `max_size 1KB` is 1000 bytes, as Caddy reads it.
+    assert_eq!(
+        post("/api/slurp-limited", sized(1000)).await,
+        (StatusCode::OK, "1000".into())
+    );
+    assert_eq!(
+        post("/api/slurp-limited", sized(1001)).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        post("/api/slurp-limited", streamed(2, 500)).await,
+        (StatusCode::OK, "1000".into())
+    );
+    assert_eq!(
+        post("/api/slurp-limited", streamed(3, 600)).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    // Paths without a limit take any size.
+    assert_eq!(post("/api/slurp", sized(5000)).await, (StatusCode::OK, "5000".into()));
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+/// A self-signed certificate for `names`, written as `<file>.pem` / `<file>.key` into `dir`.
+fn certificate_for(dir: &Path, file: &str, names: &[&str]) -> rcgen::Certificate {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    std::fs::write(dir.join(format!("{file}.pem")), cert.pem()).unwrap();
+    std::fs::write(dir.join(format!("{file}.key")), key.serialize_pem()).unwrap();
+    cert
+}
+
+#[tokio::test]
+async fn a_host_served_with_another_certificate_gets_421() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = certificate_for(dir.path(), "a", &["a.test", "c.test"]);
+    let b = certificate_for(dir.path(), "b", &["b.test"]);
+    let d = dir.path().display();
+    let sites = format!(
+        "a.test:0, c.test:0 {{\n\ttls {d}/a.pem {d}/a.key\n\trespond \"site {{host}}\"\n}}\nb.test:0 {{\n\ttls {d}/b.pem {d}/b.key\n\trespond \"site {{host}}\"\n}}\n"
+    );
+    for check in ["", "{\n\tservers {\n\t\tstrict_sni_host insecure_off\n\t}\n}\n"] {
+        let file = webfast::caddyfile::parse_str(&format!("{check}{sites}"), Path::new("Caddyfile")).unwrap();
+        let running = server::start(webfast::load_parsed(&file, 1 << 20).unwrap())
+            .await
+            .unwrap();
+        let port = running.bound[0].1.port();
+        // One HTTP/2 connection opened for a.test, as a browser would, then requests for each host.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(a.der().clone()).unwrap();
+        roots.add(b.der().clone()).unwrap();
+        let mut config =
+            rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tls_stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect("a.test".try_into().unwrap(), tcp_stream)
+            .await
+            .unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut got = Vec::new();
+        for host in ["a.test", "c.test", "b.test"] {
+            let request = Request::get(format!("https://{host}:{port}/"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            got.push((status.as_u16(), String::from_utf8_lossy(&body).into_owned()));
+        }
+        let expected_b = if check.is_empty() {
+            (421, String::new())
+        } else {
+            (200, "site b.test".to_string())
+        };
+        assert_eq!(
+            got,
+            [
+                (200, "site a.test".to_string()),
+                (200, "site c.test".to_string()),
+                expected_b
+            ],
+            "{check:?}"
+        );
+        running.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
 /// How a TLS handshake with `server_name` (`None`: no SNI) ended: Ok, or the rustls error.
 async fn handshake(
     port: u16,
@@ -847,6 +971,7 @@ async fn through_chain(
         remote: "127.0.0.1:5000".parse().unwrap(),
         tls: false,
         trusted: false,
+        sni: None,
     });
     let (parts, body) = request_head(method, path, headers);
     let ctx = webfast::handler::Ctx::new(conn.clone(), parts, body, conn.remote.ip());

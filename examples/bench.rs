@@ -99,6 +99,7 @@ fn main() {
         remote,
         tls: false,
         trusted: false,
+        sni: None,
     });
     let answers = if std::env::var_os("BENCH_CHAIN").is_some() {
         None

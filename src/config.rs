@@ -3,12 +3,14 @@
 //! Supported (anything else is a startup error naming the file and line):
 //!   global options  auto_https off|disable_redirects|disable_certs, admin off, http_port, https_port,
 //!                   grace_period, debug, order, servers { trusted_proxies static …,
-//!                   trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }
+//!                   trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host,
+//!                   timeouts { read_header, idle } }
 //!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>
 //!                   (repeatable: e.g. an ECDSA and an RSA certificate, chosen per client), log,
 //!                   handle_errors [<status codes>]
-//!   directives      root, header, request_header, redir, rewrite, try_files, encode, route, handle,
-//!                   handle_path, error, respond, reverse_proxy, file_server
+//!   directives      root, header, request_header, request_body { max_size }, redir, rewrite,
+//!                   try_files, encode, route, handle, handle_path, error, respond, reverse_proxy,
+//!                   file_server
 //!   matchers        path, path_regexp, file, not, host, method, header, client_ip, remote_ip, protocol
 //!
 //! Directives outside `route` blocks are sorted like Caddy does: by its directive order, then — for
@@ -55,6 +57,11 @@ pub struct ServerConfig {
     /// without SNI or for another name ends before any certificate is sent (WEB_TLS_STRICT_SNI,
     /// src/main.rs; src/tls.rs).
     pub strict_sni: bool,
+    /// TLS: a request whose Host is served with another certificate than the one the connection
+    /// was opened for gets 421 Misdirected Request (RFC 9110 §15.5.20). On unless
+    /// `strict_sni_host insecure_off`; unlike Caddy, whose `on` wants Host to equal SNI and
+    /// answers 403, which coalesced HTTP/2 connections would not survive.
+    pub strict_host: bool,
     pub protocols: Protocols,
     pub trusted_proxies: Vec<IpNet>,
     pub trusted_strict: bool,
@@ -252,6 +259,7 @@ struct ServerOpts {
     strict: Option<bool>,
     client_ip_headers: Option<Vec<HeaderName>>,
     protocols: Option<Protocols>,
+    strict_host: Option<bool>,
     read_header: Option<Duration>,
     idle: Option<Duration>,
 }
@@ -430,6 +438,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     port: p.port,
                     tls: (!p.tls.is_empty()).then(Vec::new),
                     strict_sni: false,
+                    strict_host: opts.strict_host.unwrap_or(true),
                     protocols: opts.protocols.unwrap_or_default(),
                     trusted_proxies: opts.trusted.clone().unwrap_or_default(),
                     trusted_strict: opts.strict.unwrap_or(false),
@@ -516,6 +525,9 @@ fn server_opts(globals: &Globals, port: u16) -> ServerOpts {
         }
         if opts.protocols.is_some() {
             out.protocols = opts.protocols;
+        }
+        if opts.strict_host.is_some() {
+            out.strict_host = opts.strict_host;
         }
         if opts.read_header.is_some() {
             out.read_header = opts.read_header;
@@ -669,6 +681,13 @@ fn parse_server_opts(line: &Line) -> Result<ServerOpts> {
                 opts.trusted = Some(parse_ranges(&args[1..])?);
             }
             "trusted_proxies_strict" => opts.strict = Some(true),
+            "strict_sni_host" => {
+                opts.strict_host = Some(match args.first().map(|t| t.text.as_str()) {
+                    None | Some("on") if args.len() <= 1 => true,
+                    Some("insecure_off") if args.len() == 1 => false,
+                    _ => bail!(at_err(&sub.at, "strict_sni_host: `strict_sni_host [on|insecure_off]`")),
+                });
+            }
             "client_ip_headers" => {
                 let mut headers = Vec::new();
                 for t in args {
@@ -785,6 +804,31 @@ fn static_text(token: &Token) -> Result<String> {
 
 fn template(token: &Token) -> Result<Template> {
     Template::parse(&token.text).map_err(|e| token_err(token, e))
+}
+
+/// A size as Caddy reads it (go-humanize): `1MB` is 10^6 bytes, `1MiB` 2^20, `1.5 kB` 1500; a bare
+/// number is bytes.
+pub fn parse_bytes(text: &str) -> Option<u64> {
+    let text = text.trim().replace(',', "");
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let factor: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1e3,
+        "ki" | "kib" => 1024.0,
+        "m" | "mb" => 1e6,
+        "mi" | "mib" => 1_048_576.0,
+        "g" | "gb" => 1e9,
+        "gi" | "gib" => 1_073_741_824.0,
+        "t" | "tb" => 1e12,
+        "ti" | "tib" => 1_099_511_627_776.0,
+        _ => return None,
+    };
+    let bytes = (number * factor).round();
+    (bytes.is_finite() && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 /// Go-style durations (`300ms`, `30s`, `5m`, `1h30m`, `2d`); a bare number is seconds, `-1` is "never".
@@ -1189,6 +1233,36 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
             deferred |= ops.iter().any(HeaderOp::needs_defer);
             let dynamic = ops.iter().any(HeaderOp::is_dynamic);
             Ok(vec![entry(name, matcher, Handler::Header { ops, deferred, dynamic })])
+        }
+        "request_body" => {
+            let (matcher, start) = matcher_token(line, scope)?;
+            if line.tokens.len() != start {
+                bail!(at_err(
+                    &line.at,
+                    "request_body: `request_body [<matcher>] { max_size <size> }`"
+                ));
+            }
+            let mut max = None;
+            for sub in line.block.as_deref().unwrap_or(&[]) {
+                match sub.name() {
+                    "max_size" => {
+                        let text = one_arg(sub)?;
+                        let size = parse_bytes(&text).ok_or_else(|| {
+                            at_err(
+                                &sub.at,
+                                format!("request_body: invalid size {text:?} (e.g. 1MB, 512KiB)"),
+                            )
+                        })?;
+                        max = Some(size);
+                    }
+                    other => bail!(at_err(
+                        &sub.at,
+                        format!("request_body: unsupported option {other:?} (only max_size)")
+                    )),
+                }
+            }
+            let max = max.ok_or_else(|| at_err(&line.at, "request_body needs max_size"))?;
+            Ok(vec![entry(name, matcher, Handler::RequestBody(max))])
         }
         "redir" => {
             no_block(line)?;
@@ -2343,6 +2417,46 @@ mod tests {
         ] {
             let err = compile_text(text).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(err.contains(message), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn sizes_as_caddy_reads_them() {
+        assert_eq!(parse_bytes("1MB"), Some(1_000_000));
+        assert_eq!(parse_bytes("2MiB"), Some(2_097_152));
+        assert_eq!(parse_bytes("1.5 kB"), Some(1500));
+        assert_eq!(parse_bytes("512KiB"), Some(524_288));
+        assert_eq!(parse_bytes("100"), Some(100));
+        assert_eq!(parse_bytes("1,000b"), Some(1000));
+        assert_eq!(parse_bytes("1G"), Some(1_000_000_000));
+        assert_eq!(parse_bytes("ten"), None);
+        assert_eq!(parse_bytes("5 parsecs"), None);
+    }
+
+    #[test]
+    fn request_body_and_strict_sni_host() {
+        let config = compile_text(":80 {\n\trequest_body /api/* {\n\t\tmax_size 1MB\n\t}\n\trespond 1\n}\n").unwrap();
+        let routes = &config.servers[0].sites[0].routes;
+        assert!(matches!(routes[0].handler, Handler::RequestBody(1_000_000)));
+        assert!(config.servers[0].strict_host, "on by default");
+        for (text, message) in [
+            (":80 {\n\trequest_body {\n\t}\n}\n", "needs max_size"),
+            (":80 {\n\trequest_body {\n\t\tmax_size lots\n\t}\n}\n", "invalid size"),
+            (
+                ":80 {\n\trequest_body {\n\t\tread_timeout 1s\n\t}\n}\n",
+                "only max_size",
+            ),
+            (
+                "{\n\tservers {\n\t\tstrict_sni_host maybe\n\t}\n}\n:80 {\n}\n",
+                "strict_sni_host",
+            ),
+        ] {
+            let err = compile_text(text).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains(message), "{text:?}: {err}");
+        }
+        for (option, on) in [("", true), (" on", true), (" insecure_off", false)] {
+            let text = format!("{{\n\tservers {{\n\t\tstrict_sni_host{option}\n\t}}\n}}\n:80 {{\n}}\n");
+            assert_eq!(compile_text(&text).unwrap().servers[0].strict_host, on, "{option:?}");
         }
     }
 

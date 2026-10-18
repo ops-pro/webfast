@@ -15,7 +15,7 @@ use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -45,6 +45,9 @@ pub struct ServerState {
     retired: Mutex<Vec<Weak<Routing>>>,
     tls: bool,
     alt_svc: Option<HeaderValue>,
+    /// TLS with the Host check on (`strict_sni_host`, on unless `insecure_off`): the certificates,
+    /// to tell whether a request's Host is served with the connection's one.
+    host_check: Option<Arc<CertResolver>>,
 }
 
 /// A port's sites, and whose word on the client's address is taken.
@@ -86,6 +89,17 @@ impl ConnState {
             remote: self.info.remote,
             tls: self.info.tls,
             trusted,
+            sni: self.info.sni.clone(),
+        })
+    }
+
+    /// The same connection once its TLS handshake named `sni` (for the Host check).
+    pub fn with_sni(&self, sni: Option<&str>) -> Arc<ConnState> {
+        Arc::new(ConnState {
+            state: self.state.clone(),
+            info: Arc::new(self.info.with_sni(sni)),
+            pinned: self.pinned.clone(),
+            generation: self.generation,
         })
     }
 }
@@ -106,6 +120,18 @@ impl ServerState {
         all
     }
 
+    /// A request on this TLS connection for a host served with another certificate than the one
+    /// the connection was opened for (RFC 9110 §15.5.20: answered 421, the client asks again on a
+    /// connection of its own).
+    fn misdirected(&self, conn: &ConnInfo, parts: &http::request::Parts) -> bool {
+        match &self.host_check {
+            Some(certificates) if conn.tls => {
+                !certificates.same_certificate(conn.sni.as_deref(), strip_port(hostport_of(parts)))
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn tls(&self) -> bool {
         self.tls
     }
@@ -118,6 +144,7 @@ impl ServerState {
             remote,
             tls: self.tls,
             trusted: current.trusts(remote.ip()),
+            sni: None,
         });
         let generation = current.generation;
         let pinned = self.mode.pins().then(|| arc_swap::Guard::into_inner(current));
@@ -223,6 +250,8 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let (parts, body) = request.into_parts();
     let remote = connection.info.remote;
     let version = parts.version;
+    // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
+    let misdirected = connection.state.misdirected(&connection.info, &parts);
     // The site, in the connection's routing (WEB_RELOAD=lazy, drain) or in the port's as it is now; what
     // the request needs of it is taken out, so that nothing holds the routing across an await.
     let picked = {
@@ -256,6 +285,9 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let Some((conn, client_ip, log, way)) = picked else {
         // Like Caddy: a host no site serves gets an empty 200.
         let mut response = Response::new(crate::body::empty());
+        if misdirected {
+            *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
+        }
         common_headers(state, version, &mut response);
         return response;
     };
@@ -269,6 +301,13 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         uri: parts.uri.clone(),
         started,
     });
+    let way = if misdirected {
+        let mut response = Response::new(crate::body::empty());
+        *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
+        Way::Ready(response)
+    } else {
+        way
+    };
     let mut response = match way {
         Way::Ready(response) => response,
         Way::Chain(routes, errors) => {
@@ -647,6 +686,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         port,
         tls,
         strict_sni,
+        strict_host,
         protocols,
         trusted_proxies,
         trusted_strict,
@@ -672,10 +712,14 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
     let mut acceptor = None;
     let mut quic_resolver = None;
     let mut port_resolver = None;
+    let mut host_check = None;
     if let Some(specs) = tls {
         let resolver = Arc::new(CertResolver::new(specs, strict_sni, &tls::provider())?);
         tls::watch(resolver.clone());
         port_resolver = Some(resolver.clone());
+        if strict_host {
+            host_check = Some(resolver.clone());
+        }
         let mut alpn: Vec<&[u8]> = Vec::new();
         if protocols.h2 {
             alpn.push(b"h2");
@@ -703,6 +747,7 @@ async fn start_server(server: ServerConfig, running: &mut Running) -> Result<()>
         retired: Mutex::new(Vec::new()),
         tls: state_tls,
         alt_svc: None,
+        host_check,
     };
     let mut quic_endpoint = None;
     if let Some(resolver) = quic_resolver {
@@ -857,8 +902,10 @@ async fn accept_loop(
             // The connection's place: its requests carry it, and a WebSocket tunnel keeps it.
             let place = Place::new(permit, stop.clone());
             let ends = crate::guard::Ends { stop, retire };
-            let service = {
+            // The connection's requests, once what the connection is (its SNI) is known.
+            let service = |conn: Arc<ConnState>| {
                 let activity = activity.clone();
+                let place = place.clone();
                 // Per request only this connection's own reference counts change.
                 service_fn(move |mut request: Request<Incoming>| {
                     // The request counts as in progress until its response body ends.
@@ -883,7 +930,8 @@ async fn accept_loop(
                         _ if protocols.h1 => Mode::Http1,
                         _ => return,
                     };
-                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, ends).await;
+                    let conn = conn.with_sni(stream.get_ref().1.server_name());
+                    serve_connection(builder, TokioIo::new(stream), service(conn), mode, &activity, &limits, ends).await;
                 }
                 None => {
                     let mode = match (protocols.h1, protocols.h2c) {
@@ -891,7 +939,7 @@ async fn accept_loop(
                         (false, true) => Mode::Http2,
                         _ => Mode::Http1,
                     };
-                    serve_connection(builder, TokioIo::new(stream), service, mode, &activity, &limits, ends).await;
+                    serve_connection(builder, TokioIo::new(stream), service(conn), mode, &activity, &limits, ends).await;
                 }
             }
         });

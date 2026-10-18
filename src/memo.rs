@@ -199,6 +199,7 @@ impl Answers {
             remote: SocketAddr::from(([127, 0, 0, 1], 0)),
             tls,
             trusted: false,
+            sni: None,
         });
         let (signatures, accepts): (Vec<u16>, Vec<String>) = every_preference().into_iter().unzip();
         let accepts: Arc<[String]> = accepts.into();
@@ -430,6 +431,7 @@ fn decided_by_path(routes: &[Route]) -> bool {
                 Handler::Rewrite(to) => to.depends_on_path_only(),
                 Handler::Subroute(list) => decided_by_path(list),
                 Handler::Root(_)
+                | Handler::RequestBody(_)
                 | Handler::StripPrefix(_)
                 | Handler::Encode(_)
                 | Handler::Files(_)

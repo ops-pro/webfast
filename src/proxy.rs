@@ -7,7 +7,8 @@
 //! Unlike Caddy: the other headers that name a client — `X-Real-IP`, `CF-Connecting-IP`,
 //! `CF-IPCountry`, `Forwarded`, … (`CLIENT_IDENTITY_HEADERS`) — are dropped unless the peer is a
 //! trusted proxy, so an upstream that reads them cannot be fed a made-up address or country; a
-//! request body the client stops sending (src/guard.rs `StalledBody`) answers 408; and
+//! request body the client stops sending (src/guard.rs `StalledBody`) answers 408, one over its
+//! `request_body` limit 413 (at once when its length says so: the upstream is not called); and
 //! `response_header_timeout` has a default (src/config.rs).
 //!
 //! WebSocket (any `Connection: upgrade` over HTTP/1.1): the handshake goes to the upstream on a
@@ -16,7 +17,7 @@
 //! client connection's place (src/guard.rs `Place`), so it counts against the connection limits.
 
 use crate::body::{Body, boxed};
-use crate::guard::{BodyStalled, Place};
+use crate::guard::{BodyStalled, BodyTooLarge, Place};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use http::header::{CONNECTION, HOST, UPGRADE};
 use http::uri::{Authority, Scheme};
@@ -152,6 +153,11 @@ impl ReverseProxy {
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
             return ctx.status(StatusCode::BAD_GATEWAY);
         }
+        // `request_body`: a body whose length is over the limit is not sent anywhere.
+        let too_large = ctx.req.extensions.get::<BodyTooLarge>().cloned();
+        if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
+            return ctx.status(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         // The client's slot at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP), held until the
         // response ends.
         #[cfg(feature = "rate-limit")]
@@ -212,6 +218,11 @@ impl ReverseProxy {
             match result {
                 Ok(response) => break Ok(response),
                 Err((connect, timed_out)) => {
+                    // The body went over its `request_body` limit while it was being sent.
+                    if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
+                        tracing::debug!(upstream = %upstream, "the request body went over its limit");
+                        break Err(StatusCode::PAYLOAD_TOO_LARGE);
+                    }
                     // The client stopped sending its body: its fault, not the upstream's.
                     if body_stalled.as_ref().is_some_and(BodyStalled::happened) {
                         tracing::debug!(upstream = %upstream, "the client stopped sending the request body");
@@ -511,6 +522,7 @@ mod tests {
             remote: peer.parse().unwrap(),
             tls: false,
             trusted,
+            sni: None,
         });
         let mut builder = Request::get("/api/x").header("host", "example.test");
         for (name, value) in headers {
