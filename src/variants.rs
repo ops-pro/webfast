@@ -17,6 +17,7 @@
 //! itself, only what is asked for is.
 
 use crate::encode::{Encoding, compress_best};
+use crate::extensions::Lookup;
 use crate::files::{FileEntry, FileStore};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -104,16 +105,6 @@ pub fn on_change(callback: OnChange) {
     *ON_CHANGE.lock().unwrap_or_else(PoisonError::into_inner) = Some(callback);
 }
 
-/// What there is for `entry` in `encoding`.
-pub enum Lookup {
-    /// The variant.
-    Have(Arc<FileEntry>),
-    /// None yet; one can be made (`wanted`).
-    Missing,
-    /// None, and none will be: not compressible, too small or large, on disk, not worth it, or
-    /// variants are off.
-    No,
-}
 
 /// Whether `entry` may get variants at all.
 fn eligible(entry: &FileEntry) -> bool {
@@ -359,6 +350,19 @@ fn refresh(changed: &mut Vec<Weak<FileStore>>) {
     }
 }
 
+/// The variants as `file_server`'s hook (src/extensions.rs `Representation`; `Variants` is the store).
+pub struct Hook;
+
+impl crate::extensions::Representation for Hook {
+    fn lookup(&self, file: &FileEntry, encoding: Encoding) -> Lookup {
+        lookup(file, encoding)
+    }
+
+    fn wanted(&self, file: &Arc<FileEntry>, store: &Arc<FileStore>, encodings: &[Encoding]) {
+        wanted(file, store, encodings);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,3 +425,4 @@ mod tests {
         assert!(!eligible(&FileEntry::new("/tiny.js", b"1".to_vec(), None)), "too small");
     }
 }
+

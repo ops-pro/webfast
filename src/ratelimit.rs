@@ -120,16 +120,16 @@ pub struct UpstreamSlot {
 /// A client that has all its slots at the upstreams (the request is refused with 429).
 pub struct Refused;
 
-/// A slot at the upstreams for the request's client: `Ok(None)` when it is not limited (no
-/// limit, or a trusted proxy that names no client), `Refused` when the client has all its slots.
-/// With WEB_RATE_LIMIT_DRY_RUN a client over its limit is counted and logged, and goes on.
-pub fn upstream_slot(ctx: &Ctx) -> Result<Option<UpstreamSlot>, Refused> {
+/// A slot at the upstreams for the client at `ip`: `Ok(None)` when it is not limited (no limit, or
+/// `trusted_self`: a trusted proxy that names no client), `Refused` when the client has all its
+/// slots. With WEB_RATE_LIMIT_DRY_RUN a client over its limit is counted and logged, and goes on.
+fn upstream_slot(ip: IpAddr, trusted_self: bool) -> Result<Option<UpstreamSlot>, Refused> {
     let max = MAX_UPSTREAM.load(Ordering::Relaxed);
-    if max == 0 || (ctx.conn.trusted && ctx.client_ip == ctx.conn.remote.ip()) {
+    if max == 0 || trusted_self {
         return Ok(None);
     }
     let in_flight = &*IN_FLIGHT;
-    let key = in_flight.hasher.hash_one(crate::guard::address_key(ctx.client_ip));
+    let key = in_flight.hasher.hash_one(crate::guard::address_key(ip));
     let mut shard = in_flight.shards[(key as usize) % SHARDS]
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -528,6 +528,53 @@ fn random_fraction() -> f64 {
     (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// The client's slot at the upstreams as a hook at every `reverse_proxy` (src/extensions.rs
+/// `UpstreamCheck`, last in order: a request the checks refuse takes none). The slot is held with
+/// the response; a `cache` hit (`At::Hit`) takes none, since no upstream is called.
+pub struct UpstreamLimit;
+
+impl crate::extensions::UpstreamCheck for UpstreamLimit {
+    type Held = Option<UpstreamSlot>;
+
+    async fn check(
+        &self,
+        _: &mut http::request::Parts,
+        body: crate::body::Body,
+        client: crate::extensions::Client<'_>,
+        _: &[http::uri::Authority],
+    ) -> Result<(crate::body::Body, Self::Held), http::Response<crate::body::Body>> {
+        if client.at == crate::extensions::At::Hit {
+            return Ok((body, None));
+        }
+        let trusted_self = client.conn.trusted && client.ip == client.conn.remote.ip();
+        match upstream_slot(client.ip, trusted_self) {
+            Ok(slot) => Ok((body, slot)),
+            Err(Refused) => {
+                let mut response = http::Response::new(crate::body::empty());
+                *response.status_mut() = http::StatusCode::TOO_MANY_REQUESTS;
+                response.extensions_mut().insert(crate::extensions::ErrorPage);
+                Err(response)
+            }
+        }
+    }
+
+    fn bound(&self) -> bool {
+        MAX_UPSTREAM.load(Ordering::Relaxed) != 0
+    }
+
+    fn upstreams(&self, _: &mut Vec<(http::uri::Authority, &'static str)>) {}
+}
+
+impl crate::extensions::Held for UpstreamSlot {
+    fn nothing() -> Self {
+        unreachable!("a slot is taken or not; `Option<UpstreamSlot>` is what a hook holds")
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,3 +639,4 @@ mod tests {
         assert_eq!(retry_after(Duration::from_secs(20)), "20");
     }
 }
+

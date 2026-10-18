@@ -816,7 +816,7 @@ impl crate::extensions::RequestCheck for JwtAuth {
         &self,
         req: &mut http::request::Parts,
         body: Body,
-        client: crate::extensions::Client,
+        client: crate::extensions::Client<'_>,
     ) -> crate::extensions::Checked {
         if !self.hidden_params.is_empty() {
             req.extensions
@@ -827,18 +827,20 @@ impl crate::extensions::RequestCheck for JwtAuth {
 }
 
 impl crate::extensions::UpstreamCheck for JwtAuth {
+    type Held = ();
+
     async fn check(
         &self,
         req: &mut http::request::Parts,
         body: Body,
-        client: crate::extensions::Client,
+        client: crate::extensions::Client<'_>,
         upstreams: &[Authority],
-    ) -> crate::extensions::Checked {
+    ) -> Result<(Body, ()), Response<Body>> {
         if !self.hidden_params.is_empty() && req.extensions.get::<crate::eventlog::HiddenParams>().is_none() {
             req.extensions
                 .insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
         }
-        self.check_upstream(req, client.ip, upstreams).await.map(|()| body)
+        self.check_upstream(req, client.ip, upstreams).await.map(|()| (body, ()))
     }
 
     fn bound(&self) -> bool {

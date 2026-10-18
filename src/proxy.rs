@@ -20,7 +20,7 @@
 //! request as it goes to that upstream, before anything is sent.
 
 use crate::body::{Body, boxed};
-use crate::extensions::UpstreamCheck;
+use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, UpstreamHeld};
 use crate::guard::{BodyStalled, BodyTooLarge, Place};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use http::header::{CONNECTION, HOST, UPGRADE};
@@ -162,52 +162,34 @@ impl ReverseProxy {
         if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
             return ctx.status(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        // Request checks bound to these upstreams (src/jwt, src/apifw: `upstreams`), on the request
-        // as it goes there.
-        if let Some(hooks) = ctx.upstream_hooks.take() {
-            let body = ctx.body.take().unwrap_or_else(crate::body::empty);
-            match hooks
-                .check(
-                    &mut ctx.req,
-                    body,
-                    crate::extensions::Client { ip: ctx.client_ip },
-                    &self.upstreams,
-                )
-                .await
-            {
-                Ok(body) => ctx.body = Some(body),
-                Err(response) => return ctx.respond(response),
+        // The checks bound to these upstreams (src/extensions.rs), on the request as it goes there,
+        // and what they keep for the response's life (the client's slot at the upstreams).
+        let held = match ctx.upstream_hooks.take() {
+            Some(hooks) => {
+                let body = ctx.body.take().unwrap_or_else(crate::body::empty);
+                let client = crate::extensions::Client {
+                    ip: ctx.client_ip,
+                    conn: &ctx.conn,
+                    at: crate::extensions::At::Upstream,
+                };
+                match hooks.check(&mut ctx.req, body, client, &self.upstreams).await {
+                    Ok((body, held)) => {
+                        ctx.body = Some(body);
+                        held
+                    }
+                    Err(response) => return refusal(&mut ctx, response),
+                }
             }
-        }
-        // The client's slot at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP), held until the
-        // response ends.
-        #[cfg(feature = "rate-limit")]
-        let slot = match crate::ratelimit::upstream_slot(&ctx) {
-            Ok(slot) => slot,
-            Err(_) => return ctx.fail(StatusCode::TOO_MANY_REQUESTS, None),
+            None => UpstreamHeld::nothing(),
         };
-        #[cfg(not(feature = "rate-limit"))]
-        let slot: Slot = None;
-        // A `cache` the request passed: the response may be kept (src/cache.rs).
-        #[cfg(feature = "proxy-cache")]
-        let mut miss = ctx.req.extensions.remove::<crate::cache::PendingMiss>().map(|m| m.0);
-        #[cfg(feature = "proxy-cache")]
-        if let Some(miss) = miss.as_mut() {
-            // The site's `encode` the request passed: what a kept answer is compressed with.
-            miss.encode = ctx.encode.clone();
-        }
-        #[cfg(feature = "proxy-cache")]
-        if let Some(miss) = miss.as_mut()
-            && ctx.req.extensions.get::<crate::handler::Credentialed>().is_some()
-        {
-            miss.credentialed = true;
-        }
+        // What the observers take from the request before the upstream is called (a cache miss).
+        let mut pending = PROXY.begin(&mut ctx);
         // A WebSocket handshake on a connection that can be handed over (HTTP/1.1); anything else
         // goes on as an ordinary request, its Upgrade dropped as hop-by-hop.
         if let Some(protocol) = upgrade_of(&ctx.req.headers)
             && let Some(client) = ctx.req.extensions.remove::<OnUpgrade>()
         {
-            return self.tunnel(ctx, protocol, client, slot).await;
+            return self.tunnel(ctx, protocol, client, held).await;
         }
         let headers = self.upstream_headers(&ctx);
         let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
@@ -280,22 +262,22 @@ impl ReverseProxy {
                 for op in &rendered_down {
                     op.apply(&mut parts.headers);
                 }
-                #[cfg(feature = "proxy-cache")]
-                if let Some(mut miss) = miss {
-                    if parts.status.is_server_error()
-                        && let Some(stale) = miss.fallback(&mut ctx, parts.status)
-                    {
-                        return stale;
-                    }
-                    let pq = path_and_query.as_ref().map_or("/", |pq| pq.as_str());
-                    let body = miss.tee(self, pq, &headers, &rendered_down, &mut parts, boxed(incoming));
-                    return ctx.respond_appending(Response::from_parts(parts, holding(body, slot)));
+                if parts.status.is_server_error()
+                    && let Some(stale) = PROXY.fallback(&mut pending, &mut ctx, parts.status)
+                {
+                    return stale;
                 }
-                ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), slot)))
+                let sent = Sent {
+                    proxy: self,
+                    path_and_query: path_and_query.as_ref().map_or("/", |pq| pq.as_str()),
+                    headers: &headers,
+                    header_down: &rendered_down,
+                };
+                let body = PROXY.observe(pending, sent, &mut parts, boxed(incoming));
+                ctx.respond_appending(Response::from_parts(parts, holding(body, held)))
             }
             Err(status) => {
-                #[cfg(feature = "proxy-cache")]
-                if let Some(stale) = miss.as_mut().and_then(|miss| miss.fallback(&mut ctx, status)) {
+                if let Some(stale) = PROXY.fallback(&mut pending, &mut ctx, status) {
                     return stale;
                 }
                 ctx.fail(status, None)
@@ -348,7 +330,7 @@ impl ReverseProxy {
     /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own;
     /// when it answers 101, the client's connection and that one become a tunnel, copied both ways
     /// until either side closes. Any other answer is passed on as it is, with no tunnel.
-    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade, slot: Slot) -> Response<Body> {
+    async fn tunnel(&self, mut ctx: Ctx, protocol: HeaderValue, client: OnUpgrade, held: UpstreamHeld) -> Response<Body> {
         let mut headers = self.upstream_headers(&ctx);
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, protocol);
@@ -394,7 +376,7 @@ impl ReverseProxy {
             for op in &rendered_down {
                 op.apply(&mut parts.headers);
             }
-            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), slot)));
+            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), held)));
         }
         // A tunnel counts as the connection it came from (src/guard.rs), not as a request: its
         // slot is given back with this answer.
@@ -434,34 +416,32 @@ impl ReverseProxy {
     }
 }
 
-/// A request's slot at the upstreams (src/ratelimit.rs, WEB_MAX_UPSTREAM_REQUESTS_PER_IP).
-#[cfg(feature = "rate-limit")]
-type Slot = Option<crate::ratelimit::UpstreamSlot>;
-#[cfg(not(feature = "rate-limit"))]
-type Slot = Option<std::convert::Infallible>;
-
-/// A response body that holds the request's slot at the upstreams until it ends (or is dropped).
-#[cfg(feature = "rate-limit")]
-fn holding(body: Body, slot: Slot) -> Body {
-    match slot {
-        Some(slot) => crate::body::boxed(Holding { body, slot: Some(slot) }),
-        None => body,
+/// A hook's refusal: through the site's error routes when it says so (`ErrorPage`), else as it is.
+fn refusal(ctx: &mut Ctx, response: Response<Body>) -> Response<Body> {
+    if response.extensions().get::<crate::extensions::ErrorPage>().is_some() {
+        let response = ctx.respond(response);
+        ctx.failed(response, None)
+    } else {
+        ctx.respond(response)
     }
 }
 
-#[cfg(not(feature = "rate-limit"))]
-fn holding(body: Body, _: Slot) -> Body {
-    body
+/// A response body that keeps what the upstream checks hold (a slot at the upstreams) until it
+/// ends or is dropped; a body as it is when there is nothing to keep.
+fn holding<H: Held>(body: Body, held: H) -> Body {
+    if held.is_empty() {
+        body
+    } else {
+        crate::body::boxed(Holding { body, held: Some(held) })
+    }
 }
 
-#[cfg(feature = "rate-limit")]
-struct Holding {
+struct Holding<H> {
     body: Body,
-    slot: Option<crate::ratelimit::UpstreamSlot>,
+    held: Option<H>,
 }
 
-#[cfg(feature = "rate-limit")]
-impl http_body::Body for Holding {
+impl<H: Held> http_body::Body for Holding<H> {
     type Data = bytes::Bytes;
     type Error = crate::body::BoxError;
 
@@ -471,7 +451,7 @@ impl http_body::Body for Holding {
     ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.body).poll_frame(cx);
         if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
-            self.slot = None;
+            self.held = None;
         }
         polled
     }

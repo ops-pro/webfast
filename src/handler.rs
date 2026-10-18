@@ -147,7 +147,7 @@ pub struct Ctx {
     pub error: Option<Arc<HandlerError>>,
     /// The extensions' checks bound to upstreams (src/extensions.rs), for the proxy to run before it
     /// sends the request on; `None`: there are none, or the server asks itself.
-    pub(crate) upstream_hooks: Option<Arc<crate::extensions::UpstreamChecks>>,
+    pub(crate) upstream_hooks: Option<&'static crate::extensions::UpstreamChecks>,
 }
 
 /// A change to the response recorded on the way down the chain.

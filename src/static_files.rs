@@ -6,6 +6,7 @@
 
 use crate::body::{Body, empty, full};
 use crate::encode::Encoding;
+use crate::extensions::{Lookup, REPRESENTATIONS, Representation};
 use crate::files::{FileEntry, FileStore};
 use crate::handler::{Ctx, Next};
 use crate::matcher::{clean_path, needs_clean};
@@ -147,10 +148,8 @@ impl FileServer {
             .append(VARY, HeaderValue::from_static("Accept-Encoding"));
         // The representation sent: the file, a precompressed sibling, or — for a file without one —
         // a compressed variant made in the background (src/variants.rs); body, ETag, length are its.
-        #[cfg(feature = "compress-files")]
         let mut variant: Option<Arc<FileEntry>> = None;
         // Encodings the client prefers to the one it gets, which a variant could give it.
-        #[cfg(feature = "compress-files")]
         let mut wanted = [None::<crate::encode::Encoding>; 3];
         let mut chosen: &Arc<FileEntry> = &entry;
         let mut chosen_encoding = None;
@@ -164,23 +163,20 @@ impl FileServer {
                 chosen_encoding = Some(encoding);
                 break;
             }
-            #[cfg(feature = "compress-files")]
-            match crate::variants::lookup(&entry, encoding) {
-                crate::variants::Lookup::Have(made) => {
+            match REPRESENTATIONS.lookup(&entry, encoding) {
+                Lookup::Have(made) => {
                     variant = Some(made);
                     chosen_encoding = Some(encoding);
                     break;
                 }
-                crate::variants::Lookup::Missing => {
+                Lookup::Missing => {
                     if let Some(slot) = wanted.iter_mut().find(|slot| slot.is_none()) {
                         *slot = Some(encoding);
                     }
                 }
-                crate::variants::Lookup::No => {}
+                Lookup::No => {}
             }
         }
-        #[cfg(feature = "compress-files")]
-        {
             if let Some(made) = &variant {
                 chosen = made;
             }
@@ -190,10 +186,9 @@ impl FileServer {
                     ctx.req.extensions.insert(crate::memo::Unkept);
                 } else if ctx.req.method == Method::GET || ctx.req.method == Method::HEAD {
                     let encodings: Vec<_> = wanted.iter().flatten().copied().collect();
-                    crate::variants::wanted(&entry, &store, &encodings);
+                    REPRESENTATIONS.wanted(&entry, &store, &encodings);
                 }
             }
-        }
         // The delta, when it is smaller than the best the client could get otherwise.
         if let Some((delta, etag)) = delta
             && delta.len() < chosen.len()

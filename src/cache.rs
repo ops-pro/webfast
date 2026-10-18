@@ -395,19 +395,23 @@ impl Cache {
 /// `upstreams`): a stored answer goes only to a request that would have passed them on its way
 /// there. `Some`: the refusal to answer with.
 async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
-    let hooks = ctx.upstream_hooks.clone()?;
+    let hooks = ctx.upstream_hooks?;
     let body = ctx.body.take().unwrap_or_else(crate::body::empty);
-    let client_ip = ctx.client_ip;
+    let client = crate::extensions::Client {
+        ip: ctx.client_ip,
+        conn: &ctx.conn,
+        at: crate::extensions::At::Hit,
+    };
     match hooks
         .check(
             &mut ctx.req,
             body,
-            crate::extensions::Client { ip: client_ip },
+            client,
             &entry.fetch.proxy.upstreams,
         )
         .await
     {
-        Ok(body) => {
+        Ok((body, _held)) => {
             ctx.body = Some(body);
             None
         }
@@ -1218,6 +1222,43 @@ async fn revalidate(entry: Arc<Entry>) {
     }
 }
 
+/// The cache at a `reverse_proxy` (src/extensions.rs `ProxyObserver`): takes the miss the `cache`
+/// directive left on the request, answers stale for a failing upstream, and keeps the response.
+pub struct Observer;
+
+impl crate::extensions::ProxyObserver for Observer {
+    type Pending = Option<Box<Miss>>;
+
+    fn begin(&self, ctx: &mut Ctx) -> Self::Pending {
+        let mut miss = ctx.req.extensions.remove::<PendingMiss>().map(|m| m.0);
+        if let Some(miss) = miss.as_mut() {
+            // The site's `encode` the request passed: what a kept answer is compressed with.
+            miss.encode = ctx.encode.clone();
+            if ctx.req.extensions.get::<crate::handler::Credentialed>().is_some() {
+                miss.credentialed = true;
+            }
+        }
+        miss
+    }
+
+    fn fallback(&self, pending: &mut Self::Pending, ctx: &mut Ctx, status: StatusCode) -> Option<Response<Body>> {
+        pending.as_mut().and_then(|miss| miss.fallback(ctx, status))
+    }
+
+    fn observe(
+        &self,
+        pending: Self::Pending,
+        sent: crate::extensions::Sent<'_>,
+        parts: &mut http::response::Parts,
+        body: Body,
+    ) -> Body {
+        match pending {
+            Some(miss) => miss.tee(sent.proxy, sent.path_and_query, sent.headers, sent.header_down, parts, body),
+            None => body,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,3 +1363,4 @@ mod tests {
         }
     }
 }
+

@@ -9,7 +9,7 @@
 use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
-use crate::extensions::{Client, Hooks, RequestCheck};
+use crate::extensions::{At, Client, Hooks, RequestCheck};
 use crate::guard::{Activity, Admission, Place, Tracked};
 use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, hostport_of, strip_port};
 use crate::matcher::host_matches;
@@ -51,7 +51,7 @@ pub struct ServerState {
     host_check: Option<Arc<CertResolver>>,
     /// The extensions' hooks (src/extensions.rs): the checks before the routes, and those bound to
     /// upstreams for the proxies.
-    hooks: Hooks,
+    hooks: &'static Hooks,
 }
 
 /// A port's sites, and whose word on the client's address is taken.
@@ -332,12 +332,12 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
         (Way::Ready(response), crate::body::empty())
     } else if !internal {
-        match state
-            .hooks
-            .request
-            .check(&mut parts, body, Client { ip: client_ip })
-            .await
-        {
+        let client = Client {
+            ip: client_ip,
+            conn: &conn,
+            at: At::Routes,
+        };
+        match state.hooks.request.check(&mut parts, body, client).await {
             Ok(body) => (way, body),
             Err(response) => (Way::Ready(response), crate::body::empty()),
         }
@@ -351,7 +351,7 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
             let kept = errors.map(|errors| (errors, request_head(&parts), conn.clone()));
             let mut ctx = Ctx::new(conn, parts, body, client_ip);
             if !internal {
-                ctx.upstream_hooks = state.hooks.upstream.clone();
+                ctx.upstream_hooks = state.hooks.upstream.as_ref();
             }
             let response = Next::start(routes).run(ctx).await;
             match (kept, response.extensions().get::<Failed>()) {
@@ -658,7 +658,7 @@ pub async fn start(config: Config) -> Result<Running> {
         jwt.start()?;
     }
     for server in config.servers {
-        start_server(server, &mut running, hooks.clone()).await?;
+        start_server(server, &mut running, hooks).await?;
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
     // Specs given as a uri are read once the server runs (a path: through the first port's routes).
@@ -751,7 +751,7 @@ fn bind_quic(port: u16, config: quinn::ServerConfig) -> Result<quinn::Endpoint> 
     .with_context(|| format!("cannot serve HTTP/3 on UDP port {port}"))
 }
 
-async fn start_server(server: ServerConfig, running: &mut Running, hooks: Hooks) -> Result<()> {
+async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'static Hooks) -> Result<()> {
     let shape = Shape::of(&server);
     let ServerConfig {
         port,

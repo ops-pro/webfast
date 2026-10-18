@@ -949,21 +949,23 @@ impl crate::extensions::RequestCheck for ApiFirewall {
         &self,
         req: &mut http::request::Parts,
         body: Body,
-        client: crate::extensions::Client,
+        client: crate::extensions::Client<'_>,
     ) -> crate::extensions::Checked {
         ApiFirewall::check(self, req, body, client.ip).await
     }
 }
 
 impl crate::extensions::UpstreamCheck for ApiFirewall {
+    type Held = ();
+
     async fn check(
         &self,
         req: &mut http::request::Parts,
         body: Body,
-        client: crate::extensions::Client,
+        client: crate::extensions::Client<'_>,
         upstreams: &[Authority],
-    ) -> crate::extensions::Checked {
-        self.check_upstream(req, body, client.ip, upstreams).await
+    ) -> std::result::Result<(Body, ()), Response<Body>> {
+        self.check_upstream(req, body, client.ip, upstreams).await.map(|body| (body, ()))
     }
 
     fn bound(&self) -> bool {
