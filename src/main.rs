@@ -23,6 +23,8 @@
 //! (256; 0: no limit): a client's requests at the upstreams at once (src/ratelimit.rs).
 //! With the cargo feature proxy-cache: WEB_PROXY_CACHE_MEMORY (64MiB; `off`), what the proxied
 //! responses kept by `cache` may take (src/cache.rs).
+//! With the cargo feature compress-files: WEB_COMPRESSED_FILES_MEMORY (64MiB; `off`), what the
+//! compressed variants of the site files may take (src/variants.rs).
 //! SIGHUP reads the Caddyfile again and puts it in place without dropping a connection —
 //! WEB_RELOAD (`immediate`: open connections take it for their next request; `lazy`: they keep
 //! the configuration they were accepted with until they close; `drain`: as lazy, and each is
@@ -135,6 +137,18 @@ fn main() -> ExitCode {
     #[cfg(feature = "proxy-cache")]
     if let Err(e) = webfast::cache::configure_from_env() {
         eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    #[cfg(feature = "compress-files")]
+    if let Err(e) = webfast::variants::configure_from_env() {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    #[cfg(not(feature = "compress-files"))]
+    if std::env::var_os("WEB_COMPRESSED_FILES_MEMORY").is_some() {
+        eprintln!(
+            "WEB_COMPRESSED_FILES_MEMORY: this webfast was built without compressed variants (cargo feature compress-files)"
+        );
         return ExitCode::from(2);
     }
     #[cfg(not(feature = "proxy-cache"))]

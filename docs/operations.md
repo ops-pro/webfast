@@ -226,6 +226,30 @@ background thread (`web-cache`) compresses at the highest levels, so a stored an
 once, there and not on the connections' threads; a full queue of answers to store (64) drops the
 newest, logged once a minute.
 
+### Compressed variants
+
+A compressible file (text, scripts, styles, SVG, JSON, fonts: `encode`'s list) of 512 bytes to
+8 MiB that `file_server { precompressed … }` finds no `.br`, `.zst` or `.gz` sibling for gets one
+made when it is asked for (cargo feature `compress-files`). The first requests are answered as
+before — by `encode` on the fly, or as the file is — and queue the file for a background thread
+(`webfast-compress`, at a lower priority), which compresses it at the encoding's highest level.
+From then on the variant is answered like a sibling: an ETag of its own, 304s and ranges, ready
+answers (worked out again for the sites reading the file, at most every 2 s). Nothing is
+compressed at startup or after a rescan: only what clients ask for.
+
+- `WEB_COMPRESSED_FILES_MEMORY` (64 MiB; `off`: no variants) bounds what they take, apart from
+  `WEB_MAX_MEMORY`: the files are needed, the variants are not. Past it, the variants not asked for
+  since the eviction last passed go first (CLOCK), and are made again when asked for.
+- A variant goes with its file (changed, removed, a root a reload dropped), within a minute. Its
+  memory is free once the ready answers holding it are worked out again and the responses sending
+  it have ended.
+- A variant is kept only when it saves at least a tenth; one that does not is not tried again.
+  A full queue (256 files) takes nothing more: a later request asks again.
+- Once a minute, when anything happened: `compressed variants of the site files` (variants,
+  memory, made, evicted, not queued).
+- A file named by its hash and served `immutable` keeps, in a browser that got it first, the
+  `encode` version until it expires there; the next browsers get the variant.
+
 ## Logs
 
 The server's own log is JSON lines on stderr (`LOG_LEVEL`). At startup it says what was loaded and

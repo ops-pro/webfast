@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compressed variants: a compressible file without a `.br`, `.zst` or `.gz` sibling gets one made
+  in the background when it is first asked for (cargo feature `compress-files`), at the highest
+  level, then answered like a sibling (its own ETag, 304s, ranges, ready answers). Bounded by
+  `WEB_COMPRESSED_FILES_MEMORY` (64 MiB; CLOCK eviction); a variant goes with its file.
 - Request checks, each a cargo feature on by default and used only when its YAML file is named:
   JWT validation (`WEB_JWT_CONFIG`, after Istio's RequestAuthentication: providers with JWKS by
   URL, inline or file, rules by host, path and method, verified tokens cached) and OpenAPI request

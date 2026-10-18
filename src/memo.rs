@@ -123,6 +123,8 @@ impl Answers {
         let signature = AcceptEncoding::parse(headers).signature();
         let variant = self.signatures.iter().position(|s| *s == signature)?;
         let answer = answers[variant].as_ref()?;
+        // A compressed variant (src/variants.rs) answered from here counts as asked for.
+        answer.file.touch();
         if let Some(if_none_match) = headers.get(IF_NONE_MATCH) {
             // What browsers send back is the ETag they got; anything else takes the long way.
             let (Some(etag), Some(not_modified)) = (&answer.etag, &answer.not_modified) else {

@@ -33,6 +33,8 @@ pub mod server;
 pub mod sockets;
 pub mod static_files;
 pub mod tls;
+#[cfg(feature = "compress-files")]
+pub mod variants;
 pub mod watch;
 
 use std::path::Path;

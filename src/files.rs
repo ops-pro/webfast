@@ -26,6 +26,7 @@ use http::HeaderValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
@@ -167,6 +168,10 @@ pub struct FileEntry {
     /// SHA-256 of its bytes, for files in memory: a client that holds the file as a compression
     /// dictionary names it by this (RFC 9842, src/static_files.rs).
     pub sha256: Option<[u8; 32]>,
+    /// A compressed variant's mark for the eviction (src/variants.rs); `None` for a file.
+    touched: Option<Arc<AtomicBool>>,
+    /// Of a type worth compressing (src/encode.rs `compressible`), worked out once.
+    pub compressible: bool,
 }
 
 impl FileEntry {
@@ -198,6 +203,8 @@ impl FileEntry {
             meta: Some(meta),
             chunk: None,
             sha256: None,
+            touched: None,
+            compressible: false,
         }
     }
 
@@ -221,6 +228,31 @@ impl FileEntry {
             meta: self.meta,
             chunk: Some(chunk),
             sha256: self.sha256,
+            touched: self.touched.clone(),
+            compressible: self.compressible,
+        }
+    }
+
+    /// A compressed variant made for a file that has no precompressed sibling (src/variants.rs):
+    /// its bytes as they are sent, with an ETag of its own (not interned: variants come and go).
+    pub fn variant(body: Bytes, content_type: Option<HeaderValue>, touched: Arc<AtomicBool>) -> FileEntry {
+        FileEntry {
+            etag: HeaderValue::from_str(&etag_of(&body)).expect("a hash in quotes"),
+            length: HeaderValue::from(body.len()),
+            stored: Stored::Plain(body),
+            content_type,
+            meta: None,
+            chunk: None,
+            sha256: None,
+            touched: Some(touched),
+            compressible: false,
+        }
+    }
+
+    /// Marks a variant as asked for, for the eviction (src/variants.rs); nothing for a file.
+    pub fn touch(&self) {
+        if let Some(touched) = &self.touched {
+            touched.store(true, Ordering::Relaxed);
         }
     }
 
@@ -280,7 +312,9 @@ impl FileEntry {
     ) -> FileEntry {
         let etag = HeaderValue::from_static(intern(&prepared.etag));
         let length = HeaderValue::from_static(intern(&prepared.len.to_string()));
-        let content_type = content_type(path).map(HeaderValue::from_static);
+        let content_type = content_type(path);
+        let compressible = content_type.is_some_and(crate::encode::compressible);
+        let content_type = content_type.map(HeaderValue::from_static);
         let stored = if prepared.lz4 {
             Stored::Lz4 {
                 block: stored,
@@ -297,6 +331,8 @@ impl FileEntry {
             meta,
             chunk,
             sha256: Some(prepared.sha256),
+            touched: None,
+            compressible,
         }
     }
 }

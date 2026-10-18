@@ -20,7 +20,10 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall"]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files"]
+# Compressed variants of the site files that have no precompressed sibling, made in the background
+# when asked for (src/variants.rs).
+compress-files = []
 # `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
 rate-limit = []
 # `cache`: proxied responses kept in memory, in the cache-handler plugin's syntax (src/cache.rs).

@@ -803,6 +803,12 @@ pub async fn start(config: Config) -> Result<Running> {
     if let Some(firewall) = &checks.api_firewall {
         firewall.start(states.first().cloned().map(local_fetch))?;
     }
+    // Compressed variants added or dropped: the ready answers of the sites reading their files.
+    #[cfg(feature = "compress-files")]
+    {
+        let states: Vec<std::sync::Weak<ServerState>> = states.iter().map(Arc::downgrade).collect();
+        crate::variants::on_change(Arc::new(move |changed| crate::watch::prepare_answers(&states, changed)));
+    }
     running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
     running.stores = config.stores;
     Ok(running)

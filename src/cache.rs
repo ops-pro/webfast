@@ -39,7 +39,7 @@ use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
@@ -967,7 +967,7 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
                 Some(theirs) => Some(theirs),
                 None => {
                     let input = identity.clone();
-                    tokio::task::spawn_blocking(move || compress(encoding, &input))
+                    tokio::task::spawn_blocking(move || crate::encode::compress_best(encoding, &input))
                         .await
                         .ok()
                         .and_then(Result::ok)
@@ -1049,27 +1049,6 @@ fn decode(encoding: Encoding, data: &[u8], cap: usize) -> Option<Bytes> {
         Encoding::Zstd => zstd::stream::read::Decoder::new(data).and_then(|d| d.take(limit).read_to_end(&mut out)),
     };
     (read.is_ok() && out.len() <= cap).then(|| Bytes::from(out))
-}
-
-/// Compresses at the encoding's highest level (the worker has the time).
-fn compress(encoding: Encoding, data: &[u8]) -> std::io::Result<Bytes> {
-    let out = match encoding {
-        Encoding::Gzip => {
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-            encoder.write_all(data)?;
-            encoder.finish()?
-        }
-        Encoding::Zstd => zstd::stream::encode_all(data, 19)?,
-        Encoding::Br => {
-            let mut out = Vec::new();
-            {
-                let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
-                writer.write_all(data)?;
-            }
-            out
-        }
-    };
-    Ok(Bytes::from(out))
 }
 
 /// The upstream's own body in `encoding`, when it has one that decodes to the same content.
@@ -1320,7 +1299,7 @@ mod tests {
     fn bodies_decode_within_the_cap() {
         let text = "hello ".repeat(1000);
         for encoding in [Encoding::Gzip, Encoding::Br, Encoding::Zstd] {
-            let packed = compress(encoding, text.as_bytes()).unwrap();
+            let packed = crate::encode::compress_best(encoding, text.as_bytes()).unwrap();
             assert!(packed.len() < text.len());
             assert_eq!(decode(encoding, &packed, 1 << 20).unwrap(), text.as_bytes());
             assert!(decode(encoding, &packed, 100).is_none(), "{encoding:?} past the cap");

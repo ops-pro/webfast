@@ -145,7 +145,13 @@ impl FileServer {
         response
             .headers_mut()
             .append(VARY, HeaderValue::from_static("Accept-Encoding"));
-        // The representation sent: the file or a precompressed sibling (body, ETag, length are its).
+        // The representation sent: the file, a precompressed sibling, or — for a file without one —
+        // a compressed variant made in the background (src/variants.rs); body, ETag, length are its.
+        #[cfg(feature = "compress-files")]
+        let mut variant: Option<Arc<FileEntry>> = None;
+        // Encodings the client prefers to the one it gets, which a variant could give it.
+        #[cfg(feature = "compress-files")]
+        let mut wanted = [None::<crate::encode::Encoding>; 3];
         let mut chosen: &Arc<FileEntry> = &entry;
         let mut chosen_encoding = None;
         let mut sidecar_key = String::with_capacity(file.len() + 4);
@@ -157,6 +163,35 @@ impl FileServer {
                 chosen = sidecar;
                 chosen_encoding = Some(encoding);
                 break;
+            }
+            #[cfg(feature = "compress-files")]
+            match crate::variants::lookup(&entry, encoding) {
+                crate::variants::Lookup::Have(made) => {
+                    variant = Some(made);
+                    chosen_encoding = Some(encoding);
+                    break;
+                }
+                crate::variants::Lookup::Missing => {
+                    if let Some(slot) = wanted.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some(encoding);
+                    }
+                }
+                crate::variants::Lookup::No => {}
+            }
+        }
+        #[cfg(feature = "compress-files")]
+        {
+            if let Some(made) = &variant {
+                chosen = made;
+            }
+            if wanted[0].is_some() && ctx.error.is_none() {
+                if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
+                    // Not a ready answer: live requests come here and ask for the variant.
+                    ctx.req.extensions.insert(crate::memo::Unkept);
+                } else if ctx.req.method == Method::GET || ctx.req.method == Method::HEAD {
+                    let encodings: Vec<_> = wanted.iter().flatten().copied().collect();
+                    crate::variants::wanted(&entry, &store, &encodings);
+                }
             }
         }
         // The delta, when it is smaller than the best the client could get otherwise.

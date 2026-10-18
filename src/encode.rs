@@ -18,7 +18,7 @@ use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Zstd,
     Br,
@@ -356,6 +356,34 @@ pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
         Some(prefix) => content_type.starts_with(prefix),
         None => content_type == pattern || content_type.starts_with(&format!("{pattern};")),
     }
+}
+
+/// Compresses at the encoding's highest level, for work done once in the background (the proxy
+/// cache's worker, src/cache.rs; the files' compressed variants, src/variants.rs).
+pub fn compress_best(encoding: Encoding, data: &[u8]) -> std::io::Result<Bytes> {
+    let out = match encoding {
+        Encoding::Gzip => {
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(data)?;
+            encoder.finish()?
+        }
+        Encoding::Zstd => zstd::stream::encode_all(data, 19)?,
+        Encoding::Br => {
+            let mut out = Vec::new();
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
+                writer.write_all(data)?;
+            }
+            out
+        }
+    };
+    Ok(Bytes::from(out))
+}
+
+/// Whether a body of `content_type` is worth compressing: Caddy's list (`DEFAULT_TYPES`), never
+/// an event stream.
+pub fn compressible(content_type: &str) -> bool {
+    !content_type.starts_with("text/event-stream") && DEFAULT_TYPES.iter().any(|t| type_matches(t, content_type))
 }
 
 pub fn has_vary(headers: &HeaderMap, field: &str) -> bool {

@@ -303,7 +303,7 @@ fn forget_answers(states: &[Weak<ServerState>], store: &Arc<FileStore>) {
     });
 }
 
-fn prepare_answers(states: &[Weak<ServerState>], changed: &[Arc<FileStore>]) {
+pub(crate) fn prepare_answers(states: &[Weak<ServerState>], changed: &[Arc<FileStore>]) {
     sites_reading(states, changed, false, |state, site| {
         let started = Instant::now();
         let answers = crate::memo::Answers::prepare(&site.routes, state.tls());
