@@ -291,18 +291,17 @@ impl ApiFirewall {
 
     /// Before the routes: checks a request against the first API without `upstreams` it is
     /// under. `Ok` with its body to go on (the same bytes if it was read), or the response to
-    /// answer with. A violation is written to the event log, without the values of
-    /// `hidden_params` (the query parameters the JWT module reads tokens from).
+    /// answer with. A violation is written to the event log (without the values of the query
+    /// parameters a JWT check before it named, src/eventlog.rs `HiddenParams`).
     #[allow(clippy::result_large_err)]
     pub async fn check(
         &self,
         parts: &mut http::request::Parts,
         body: Body,
         client_ip: IpAddr,
-        hidden_params: &[String],
     ) -> std::result::Result<Body, Response<Body>> {
         match self.api_for(parts, None) {
-            Some(api) => self.check_api(api, parts, body, client_ip, hidden_params).await,
+            Some(api) => self.check_api(api, parts, body, client_ip).await,
             None => Ok(body),
         }
     }
@@ -315,11 +314,10 @@ impl ApiFirewall {
         parts: &mut http::request::Parts,
         body: Body,
         client_ip: IpAddr,
-        hidden_params: &[String],
         upstreams: &[Authority],
     ) -> std::result::Result<Body, Response<Body>> {
         match self.api_for(parts, Some(upstreams)) {
-            Some(api) => self.check_api(api, parts, body, client_ip, hidden_params).await,
+            Some(api) => self.check_api(api, parts, body, client_ip).await,
             None => Ok(body),
         }
     }
@@ -331,7 +329,6 @@ impl ApiFirewall {
         parts: &mut http::request::Parts,
         body: Body,
         client_ip: IpAddr,
-        hidden_params: &[String],
     ) -> std::result::Result<Body, Response<Body>> {
         if api.mode == Mode::Off && api.endpoints.iter().all(|(_, _, m)| *m == Mode::Off) {
             return Ok(body);
@@ -350,7 +347,6 @@ impl ApiFirewall {
             parts,
             reason: &violation.reason,
             detail: &violation.detail,
-            hidden_params,
         });
         if !refused {
             return Ok(body);
@@ -947,3 +943,34 @@ fn ambiguous(raw: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::extensions::RequestCheck for ApiFirewall {
+    async fn check(
+        &self,
+        req: &mut http::request::Parts,
+        body: Body,
+        client: crate::extensions::Client,
+    ) -> crate::extensions::Checked {
+        ApiFirewall::check(self, req, body, client.ip).await
+    }
+}
+
+impl crate::extensions::UpstreamCheck for ApiFirewall {
+    async fn check(
+        &self,
+        req: &mut http::request::Parts,
+        body: Body,
+        client: crate::extensions::Client,
+        upstreams: &[Authority],
+    ) -> crate::extensions::Checked {
+        self.check_upstream(req, body, client.ip, upstreams).await
+    }
+
+    fn bound(&self) -> bool {
+        self.bound_to_upstreams()
+    }
+
+    fn upstreams(&self, out: &mut Vec<(Authority, &'static str)>) {
+        out.extend(ApiFirewall::upstreams(self).map(|u| (u.clone(), "API firewall")));
+    }
+}

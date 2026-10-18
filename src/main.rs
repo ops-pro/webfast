@@ -292,7 +292,7 @@ fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
             "WEB_API_FIREWALL_CONFIG={path}: this build has no `api-firewall` feature"
         ));
     }
-    webfast::server::check_bindings(config).map_err(|e| format!("{e:#}"))?;
+    webfast::extensions::check_bindings(config).map_err(|e| format!("{e:#}"))?;
     for line in &loaded {
         tracing::info!("request checks: {line}");
     }

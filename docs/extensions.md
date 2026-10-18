@@ -30,19 +30,19 @@ a named field. Adding an extension means finding each of those places again.
 ### One trait per hook point, not one trait for everything
 
 An extension is not one object that implements every possible hook. It implements the traits of
-the points it needs, and registers an object for each. Small traits keep each one honest
-(interface segregation): the proxy cache needs the response as it streams, the JWT check does not;
-nothing implements methods it does not use.
+the points it needs. Small traits keep each one honest (interface segregation): the proxy cache
+needs the response as it streams, the JWT check does not; nothing implements methods it does not
+use.
 
 ```rust
 /// Before the site's routes and ready answers: refuse, or let through (perhaps changed).
 pub trait RequestCheck: Send + Sync {
-    fn check<'a>(&'a self, req: &'a mut Head, body: Body, client: Client<'a>) -> Checked<'a>;
+    async fn check(&self, req: &mut Head, body: Body, client: Client<'_>) -> Result<Body, Response<Body>>;
 }
 
 /// At a reverse_proxy, on the request as it goes to one of `upstreams`.
 pub trait UpstreamCheck: Send + Sync {
-    fn check<'a>(&'a self, req: &'a mut Head, body: Body, client: Client<'a>, upstreams: &'a [Authority]) -> Checked<'a>;
+    async fn check(&self, req: &mut Head, body: Body, client: Client<'_>, upstreams: &[Authority]) -> Result<Body, Response<Body>>;
 }
 
 /// Decides what a file_server answers when a file has no precompressed sibling.
@@ -56,69 +56,106 @@ pub trait ResponseObserver: Send + Sync {
 }
 ```
 
-`Checked<'a>` is a boxed future of `Result<Body, Response<Body>>`: the body to go on with, or the
-answer that refuses. That is exactly what `Checks::check` returns today; the trait only names it.
+`Result<Body, Response<Body>>` is the body to go on with, or the answer that refuses: exactly what
+`Checks::check` returns today; the trait only names it. The methods are `async fn` in traits
+(Rust 1.75; the MSRV is 1.88), so no future is boxed.
 
-### Hooks are owned by the place they run
+### Hooks are composed at compile time, not listed at run time
 
-The core keeps a registry per hook point, not one global list:
+The set of extensions is known when the binary is built, so the hooks of a point are a type, not
+a vector of trait objects. Each trait is implemented for the empty tuple (nothing to do), for a
+pair (first one, then the other) and for `Option` (built, but not configured):
 
 ```rust
-pub struct Hooks {
-    pub request: Vec<Arc<dyn RequestCheck>>,
-    pub upstream: Vec<Arc<dyn UpstreamCheck>>,
-    pub representation: Vec<Arc<dyn Representation>>,
-    pub response: Vec<Arc<dyn ResponseObserver>>,
+impl RequestCheck for () {
+    async fn check(&self, _: &mut Head, body: Body, _: Client<'_>) -> Result<Body, Response<Body>> {
+        Ok(body)
+    }
+}
+
+impl<A: RequestCheck, B: RequestCheck> RequestCheck for (A, B) {
+    async fn check(&self, req: &mut Head, body: Body, client: Client<'_>) -> Result<Body, Response<Body>> {
+        let body = self.0.check(req, body, client).await?;
+        self.1.check(req, body, client).await
+    }
+}
+
+impl<T: RequestCheck> RequestCheck for Option<T> {
+    async fn check(&self, req: &mut Head, body: Body, client: Client<'_>) -> Result<Body, Response<Body>> {
+        match self {
+            Some(check) => check.check(req, body, client).await,
+            None => Ok(body),
+        }
+    }
 }
 ```
 
-`ServerState` holds one `Arc<Hooks>` and gives `Ctx` the parts it needs (`Ctx::upstream_hooks`
-replaces `Ctx::upstream_checks` and `Ctx::cache_miss`: one field, any extension). Every hook point
-in the core is one loop over its list, written once:
+What this costs on the request path, for each hook point:
 
-```rust
-for check in &hooks.request {
-    body = check.check(&mut parts, body, client).await?;
-}
-```
+- **No extension built:** the hooks are `()`. The call compiles to nothing: no branch, no load.
+- **Built, not configured:** one test of an `Option`, as `checks.any()` is today.
+- **Configured:** a direct call, inlined where the compiler sees fit; the future lives on the
+  caller's stack. The same cost as today's hand-written call.
 
-With no extension built the lists are empty and the loop is skipped by one length test. That is
-the cost of the design on the request path: one branch per hook point, the same as today's
-`checks.any()`. Nothing is dispatched through a trait object unless an extension is registered,
-and an extension that is built but not configured registers nothing.
+The order of the hooks is the order in the type, fixed by the core: JWT before the API firewall,
+because the firewall sees the claim headers the JWT check set. An extension cannot put itself
+first, and the order cannot drift at run time.
 
-Order within a list is the registration order, and registration order is fixed by the core
-(`src/extensions.rs`), not by the extensions: JWT before the API firewall, because the firewall
-sees the claim headers the JWT check set. An extension cannot put itself first.
+### Composition in one place
 
-### Registration in one place
-
-The `cfg` knowledge lives in a single file:
+The `cfg` knowledge lives in a single file. Each extension occupies a slot of a nested pair, and
+`()` fills the slot when the feature is off, so the number of `cfg` arms grows with the extensions
+and not with their combinations:
 
 ```rust
 // src/extensions.rs
-pub fn register(config: &Config, hooks: &mut Hooks) -> Result<()> {
-    #[cfg(feature = "jwt")]
-    if let Some(jwt) = &config.jwt {
-        hooks.request.push(jwt.clone());
-        hooks.upstream.push(jwt.clone());
-    }
-    #[cfg(feature = "api-firewall")]
-    if let Some(fw) = &config.api_firewall {
-        hooks.request.push(fw.clone());
-        hooks.upstream.push(fw.clone());
-    }
-    #[cfg(feature = "compress-files")]
-    hooks.representation.push(Arc::new(crate::variants::Variants));
-    Ok(())
+#[cfg(feature = "jwt")]
+type Jwt = Option<Arc<crate::jwt::JwtAuth>>;
+#[cfg(not(feature = "jwt"))]
+type Jwt = ();
+
+#[cfg(feature = "api-firewall")]
+type ApiFirewall = Option<Arc<crate::apifw::ApiFirewall>>;
+#[cfg(not(feature = "api-firewall"))]
+type ApiFirewall = ();
+
+/// The checks before the routes, in order; `()` where a feature is off.
+pub type RequestChecks = (Jwt, (ApiFirewall, ()));
+
+pub fn request_checks(config: &Config) -> RequestChecks {
+    (
+        #[cfg(feature = "jwt")]
+        config.jwt.clone(),
+        #[cfg(not(feature = "jwt"))]
+        (),
+        (
+            #[cfg(feature = "api-firewall")]
+            config.api_firewall.clone(),
+            #[cfg(not(feature = "api-firewall"))]
+            (),
+            (),
+        ),
+    )
 }
+```
+
+`ServerState` holds a `Hooks { request: RequestChecks, upstream: UpstreamChecks, … }` and gives
+`Ctx` a reference to what the chain needs. Every hook point in the core is one call, written once:
+
+```rust
+let body = state.hooks.request.check(&mut parts, body, client).await?;
 ```
 
 `main.rs` keeps the environment the same way: one `extensions::configure_from_env()` that calls
 each extension's, and one list of the variables an unbuilt extension would have read, so that
 `WEB_PROXY_CACHE_MEMORY` on a build without `proxy-cache` still stops the start. Startup logging
-of what an extension loaded goes through one `Describe` trait (`fn describe(&self) -> String`),
-so `validate` and the `started` line print every extension the same way.
+of what an extension loaded goes through one `Describe` trait (`fn describe(&self) -> String`,
+implemented for `()`, pairs and `Option` the same way), so `validate` and the `started` line print
+every extension alike.
+
+When a hook must be chosen at run time — extensions configured per site, say — the same traits
+take a `Vec<Arc<dyn …>>` behind an object-safe wrapper; nothing in the core needs that today, and
+the static form stays the default.
 
 ### Request-scoped state through typed extensions
 
@@ -176,10 +213,14 @@ copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch
 
 ## The patterns, and why these
 
-- **Traits per hook point** (not one `Extension` trait with optional methods): Rust's trait
-  objects cost a dynamic call per hook, so the fewer and more specific the better, and a trait with
-  one method is implemented in ten lines. `Send + Sync` on each because hooks run on every worker.
-- **Registration in the core, by the core:** inventory-style self-registration (`linkme`,
+- **Traits per hook point** (not one `Extension` trait with optional methods): a trait with one
+  method is implemented in ten lines, and a hook point's signature says exactly what a hook may
+  touch. `Send + Sync` on each because hooks run on every worker.
+- **Static composition over trait objects:** the set of extensions is fixed at build time, so
+  `()`, pairs and `Option` compose it with no dynamic dispatch, no boxed future and nothing at all
+  for a feature that is off. A `Vec<Arc<dyn …>>` would cost a vtable call and a heap allocation per
+  hook, and could not be optimised away.
+- **Composition in the core, by the core:** inventory-style self-registration (`linkme`,
   `inventory`) was considered and rejected. It hides the order, needs link-time tricks, and buys
   nothing here: the set of extensions is known at build time.
 - **Typed request extensions instead of fields on `Ctx`:** `http::Extensions` is the crate's own
@@ -188,14 +229,15 @@ copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch
   vary in behaviour, only in the job type, so generics (monomorphised, no dynamic dispatch) fit,
   and the extension supplies a closure.
 - **No `cfg` outside `extensions.rs`, the parser and the modules themselves:** the request path
-  reads as one thing. A reviewer sees the hook loop, not five extensions' branches.
+  reads as one thing. A reviewer sees one call per hook point, not five extensions' branches.
 
 ## Writing an extension, then
 
 1. Add the feature in `Cargo.toml` and the gated module in `src/lib.rs`.
 2. Give the module a config type and `configure_from_env` / `load`, and a `describe`.
 3. Implement the trait of each hook point it needs; put request-scoped state in a type of its own.
-4. Register it in `src/extensions.rs`, in order, and name the environment variables it reads.
+4. Give it a slot in `src/extensions.rs`: its type alias with the `cfg` pair, its place in the
+   tuple, its value in the constructor; name the environment variables it reads.
 5. Background work: `Worker::start`; bounded memory: `Budget`.
 6. Tests: the module's own, one end-to-end test through the server, and the feature alone under
    clippy (`scripts/check.sh` runs each feature by itself).
@@ -206,9 +248,10 @@ copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch
 
 In steps that each leave the tests green, roughly in this order:
 
-1. `src/extensions.rs` with `Hooks`, the four traits and `register`; `Checks` becomes the
-   `request` and `upstream` lists; `Ctx::upstream_checks` becomes `Ctx::hooks`. The behaviour is
-   the same; `server.rs` and `proxy.rs` lose their `jwt` / `api-firewall` branches.
+1. `src/extensions.rs` with the traits, their `()` / pair / `Option` implementations, the
+   composed types and their constructors; `Checks` becomes `Hooks { request, upstream }`;
+   `Ctx::upstream_checks` becomes a reference to the upstream hooks. The behaviour is the same;
+   `server.rs` and `proxy.rs` lose their `jwt` / `api-firewall` branches.
 2. `Credentialed` and the cache miss move to `http::Extensions`; `Ctx::cache_miss` goes.
 3. The cache's three calls in `reverse_proxy` become one `ResponseObserver` and one
    `RequestCheck`-shaped hit check; the rate limit's upstream slot becomes an `UpstreamCheck`
@@ -216,5 +259,7 @@ In steps that each leave the tests green, roughly in this order:
 4. `Worker` and `Budget`, with the cache and the variants moved onto them.
 5. `Describe` and one `configure_from_env` in `main.rs`.
 
-Each step is a commit of its own with the `cfg` count in the core going down; the end state is
-`cfg` in `extensions.rs`, `config.rs` (directive arms), `lib.rs` and `main.rs` only.
+Each step is a commit of its own, measured with `examples/bench.rs` before and after: with no
+extension built the numbers must not move; with the checks configured, by at most a percent. The
+`cfg` count in the core goes down with each step; the end state is `cfg` in `extensions.rs`,
+`config.rs` (directive arms), `lib.rs` and `main.rs` only.

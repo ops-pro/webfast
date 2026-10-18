@@ -90,6 +90,10 @@ async fn run(
         builder = builder.header(*name, *value);
     }
     let (mut parts, ()) = builder.body(()).unwrap().into_parts();
+    // As the JWT check before it would leave them.
+    parts
+        .extensions
+        .insert(crate::eventlog::HiddenParams(std::sync::Arc::from(vec!["access_token".to_string()])));
     let body = if body.is_empty() {
         crate::body::empty()
     } else {
@@ -100,7 +104,6 @@ async fn run(
             &mut parts,
             body,
             "203.0.113.7".parse().unwrap(),
-            &["access_token".to_string()],
         )
         .await
     {
@@ -751,7 +754,7 @@ async fn at_upstream(fw: &ApiFirewall, upstream: &str, uri: &str) -> std::result
         .into_parts();
     let upstreams = [crate::config::upstream_authority(upstream).unwrap()];
     let client_ip = "203.0.113.7".parse().unwrap();
-    match fw.check_upstream(&mut parts, empty(), client_ip, &[], &upstreams).await {
+    match fw.check_upstream(&mut parts, empty(), client_ip, &upstreams).await {
         Ok(_) => Ok(()),
         Err(response) => Err((
             response.status().as_u16(),

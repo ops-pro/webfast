@@ -9,6 +9,7 @@
 use crate::accesslog::{LoggedBody, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
+use crate::extensions::{Client, Hooks, RequestCheck};
 use crate::guard::{Activity, Admission, Place, Tracked};
 use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, hostport_of, strip_port};
 use crate::matcher::host_matches;
@@ -48,156 +49,9 @@ pub struct ServerState {
     /// TLS with the Host check on (`strict_sni_host`, on unless `insecure_off`): the certificates,
     /// to tell whether a request's Host is served with the connection's one.
     host_check: Option<Arc<CertResolver>>,
-    checks: Checks,
-    /// The same checks when some are bound to upstreams, for the proxies (src/proxy.rs); `None`:
-    /// requests carry nothing for them.
-    upstream_checks: Option<Arc<Checks>>,
-}
-
-/// What every request is checked by before its site's routes and ready answers, when configured:
-/// its JWT (src/jwt), then the OpenAPI spec of the API it is for (src/apifw).
-#[derive(Clone, Default)]
-pub(crate) struct Checks {
-    #[cfg(feature = "jwt")]
-    jwt: Option<Arc<crate::jwt::JwtAuth>>,
-    #[cfg(feature = "api-firewall")]
-    api_firewall: Option<Arc<crate::apifw::ApiFirewall>>,
-}
-
-impl Checks {
-    fn from_config(config: &Config) -> Checks {
-        let _ = config;
-        Checks {
-            #[cfg(feature = "jwt")]
-            jwt: config.jwt.clone(),
-            #[cfg(feature = "api-firewall")]
-            api_firewall: config.api_firewall.clone(),
-        }
-    }
-
-    /// Whether any check is configured (none: requests skip this step whole).
-    fn any(&self) -> bool {
-        #[allow(unused_mut)]
-        let mut any = false;
-        #[cfg(feature = "jwt")]
-        {
-            any |= self.jwt.is_some();
-        }
-        #[cfg(feature = "api-firewall")]
-        {
-            any |= self.api_firewall.is_some();
-        }
-        any
-    }
-
-    /// `Ok` with the body to go on with (the same bytes, when a check read it), or the answer
-    /// that refuses the request.
-    #[allow(clippy::result_large_err)]
-    async fn check(
-        &self,
-        parts: &mut http::request::Parts,
-        body: Body,
-        client_ip: IpAddr,
-    ) -> std::result::Result<Body, Response<Body>> {
-        let _ = client_ip;
-        let _ = &parts;
-        #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.jwt {
-            jwt.check(parts, client_ip).await?;
-        }
-        #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.api_firewall {
-            #[cfg(feature = "jwt")]
-            let hidden = self.jwt.as_ref().map_or(&[][..], |jwt| jwt.hidden_params());
-            #[cfg(not(feature = "jwt"))]
-            let hidden: &[String] = &[];
-            return firewall.check(parts, body, client_ip, hidden).await;
-        }
-        Ok(body)
-    }
-
-    /// Whether a rule or an API is bound to upstreams: the proxies then check too (src/proxy.rs).
-    fn bound_to_upstreams(&self) -> bool {
-        #[allow(unused_mut)]
-        let mut bound = false;
-        #[cfg(feature = "jwt")]
-        {
-            bound |= self.jwt.as_ref().is_some_and(|jwt| jwt.bound_to_upstreams());
-        }
-        #[cfg(feature = "api-firewall")]
-        {
-            bound |= self.api_firewall.as_ref().is_some_and(|fw| fw.bound_to_upstreams());
-        }
-        bound
-    }
-
-    /// At a `reverse_proxy` about to send the request to one of `upstreams`: the JWT rules and
-    /// the APIs bound to them, as `check` does before the routes.
-    #[allow(clippy::result_large_err)]
-    pub(crate) async fn check_upstream(
-        &self,
-        parts: &mut http::request::Parts,
-        body: Body,
-        client_ip: IpAddr,
-        upstreams: &[http::uri::Authority],
-    ) -> std::result::Result<Body, Response<Body>> {
-        let _ = (client_ip, upstreams, &parts);
-        #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.jwt {
-            jwt.check_upstream(parts, client_ip, upstreams).await?;
-        }
-        #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.api_firewall {
-            #[cfg(feature = "jwt")]
-            let hidden = self.jwt.as_ref().map_or(&[][..], |jwt| jwt.hidden_params());
-            #[cfg(not(feature = "jwt"))]
-            let hidden: &[String] = &[];
-            return firewall.check_upstream(parts, body, client_ip, hidden, upstreams).await;
-        }
-        Ok(body)
-    }
-}
-
-/// Refuses request checks bound to an upstream no `reverse_proxy` of `config` sends to: a typo,
-/// or routes changed since, would otherwise leave the requests going there unchecked.
-pub fn check_bindings(config: &Config) -> Result<()> {
-    Checks::from_config(config).bound_within(&config.upstreams())
-}
-
-impl Checks {
-    /// `Ok` when every upstream these checks are bound to is one of `known` (the upstreams the
-    /// `reverse_proxy`s send to): at startup, and for a reloaded Caddyfile, which keeps the checks.
-    fn bound_within(&self, known: &[http::uri::Authority]) -> Result<()> {
-        let _ = known;
-        #[allow(unused_mut)]
-        let mut missing: Vec<String> = Vec::new();
-        #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.jwt {
-            for upstream in jwt.upstreams().filter(|u| !known.contains(u)) {
-                missing.push(format!("{upstream} (JWT)"));
-            }
-        }
-        #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.api_firewall {
-            for upstream in firewall.upstreams().filter(|u| !known.contains(u)) {
-                missing.push(format!("{upstream} (API firewall)"));
-            }
-        }
-        missing.dedup();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let known: Vec<String> = known.iter().map(|u| u.to_string()).collect();
-        anyhow::bail!(
-            "request checks bound to upstreams no reverse_proxy sends to: {}; the Caddyfile's are: {}",
-            missing.join(", "),
-            if known.is_empty() {
-                "none".to_string()
-            } else {
-                known.join(", ")
-            }
-        )
-    }
+    /// The extensions' hooks (src/extensions.rs): the checks before the routes, and those bound to
+    /// upstreams for the proxies.
+    hooks: Hooks,
 }
 
 /// A port's sites, and whose word on the client's address is taken.
@@ -477,8 +331,8 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         let mut response = Response::new(crate::body::empty());
         *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
         (Way::Ready(response), crate::body::empty())
-    } else if !internal && state.checks.any() {
-        match state.checks.check(&mut parts, body, client_ip).await {
+    } else if !internal {
+        match state.hooks.request.check(&mut parts, body, Client { ip: client_ip }).await {
             Ok(body) => (way, body),
             Err(response) => (Way::Ready(response), crate::body::empty()),
         }
@@ -492,7 +346,7 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
             let kept = errors.map(|errors| (errors, request_head(&parts), conn.clone()));
             let mut ctx = Ctx::new(conn, parts, body, client_ip);
             if !internal {
-                ctx.upstream_checks = state.upstream_checks.clone();
+                ctx.upstream_hooks = state.hooks.upstream.clone();
             }
             let response = Next::start(routes).run(ctx).await;
             match (kept, response.extensions().get::<Failed>()) {
@@ -665,7 +519,7 @@ impl Running {
         // The request checks stay as they started: the new routes must still send to the upstreams
         // they are bound to.
         if let Some(port) = self.ports.first() {
-            port.state.checks.bound_within(&config.upstreams())?;
+            port.state.hooks.bound_within(&config.upstreams())?;
         }
         let Config {
             servers,
@@ -788,19 +642,23 @@ pub async fn start(config: Config) -> Result<Running> {
         stores: Vec::new(),
         watcher: None,
     };
-    check_bindings(&config)?;
-    let checks = Checks::from_config(&config);
+    crate::extensions::check_bindings(&config)?;
     #[cfg(feature = "jwt")]
-    if let Some(jwt) = &checks.jwt {
+    let jwt = config.jwt.clone();
+    #[cfg(feature = "api-firewall")]
+    let firewall = config.api_firewall.clone();
+    let hooks = Hooks::new(&config);
+    #[cfg(feature = "jwt")]
+    if let Some(jwt) = &jwt {
         jwt.start()?;
     }
     for server in config.servers {
-        start_server(server, &mut running, checks.clone()).await?;
+        start_server(server, &mut running, hooks.clone()).await?;
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
     // Specs given as a uri are read once the server runs (a path: through the first port's routes).
     #[cfg(feature = "api-firewall")]
-    if let Some(firewall) = &checks.api_firewall {
+    if let Some(firewall) = &firewall {
         firewall.start(states.first().cloned().map(local_fetch))?;
     }
     // Compressed variants added or dropped: the ready answers of the sites reading their files.
@@ -888,7 +746,7 @@ fn bind_quic(port: u16, config: quinn::ServerConfig) -> Result<quinn::Endpoint> 
     .with_context(|| format!("cannot serve HTTP/3 on UDP port {port}"))
 }
 
-async fn start_server(server: ServerConfig, running: &mut Running, checks: Checks) -> Result<()> {
+async fn start_server(server: ServerConfig, running: &mut Running, hooks: Hooks) -> Result<()> {
     let shape = Shape::of(&server);
     let ServerConfig {
         port,
@@ -956,8 +814,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, checks: Check
         tls: state_tls,
         alt_svc: None,
         host_check,
-        upstream_checks: checks.bound_to_upstreams().then(|| Arc::new(checks.clone())),
-        checks,
+        hooks,
     };
     let mut quic_endpoint = None;
     if let Some(resolver) = quic_resolver {

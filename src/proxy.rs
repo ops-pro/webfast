@@ -21,6 +21,7 @@
 
 use crate::body::{Body, boxed};
 use crate::guard::{BodyStalled, BodyTooLarge, Place};
+use crate::extensions::UpstreamCheck;
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use http::header::{CONNECTION, HOST, UPGRADE};
 use http::uri::{Authority, Scheme};
@@ -163,10 +164,10 @@ impl ReverseProxy {
         }
         // Request checks bound to these upstreams (src/jwt, src/apifw: `upstreams`), on the request
         // as it goes there.
-        if let Some(checks) = ctx.upstream_checks.take() {
+        if let Some(hooks) = ctx.upstream_hooks.take() {
             let body = ctx.body.take().unwrap_or_else(crate::body::empty);
-            match checks
-                .check_upstream(&mut ctx.req, body, ctx.client_ip, &self.upstreams)
+            match hooks
+                .check(&mut ctx.req, body, crate::extensions::Client { ip: ctx.client_ip }, &self.upstreams)
                 .await
             {
                 Ok(body) => ctx.body = Some(body),

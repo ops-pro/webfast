@@ -274,7 +274,7 @@ pub struct JwtAuth {
     /// Request headers that only a verified token may set.
     reserved: Vec<HeaderName>,
     /// Query parameters a token may come in: the event log does not write their values.
-    hidden_params: Vec<String>,
+    hidden_params: Arc<[String]>,
     cache: cache::TokenCache<Verified>,
     log: crate::eventlog::EventLog,
 }
@@ -353,7 +353,7 @@ impl JwtAuth {
             providers,
             rules,
             reserved,
-            hidden_params,
+            hidden_params: Arc::from(hidden_params),
             cache: cache::TokenCache::new(file.cache.tokens),
             log: crate::eventlog::EventLog::new("jwt", file.log.as_ref(), base),
         })
@@ -459,7 +459,6 @@ impl JwtAuth {
             parts,
             reason: failure.code(),
             detail: "",
-            hidden_params: &self.hidden_params,
         });
         if refused { Err(refusal(failure)) } else { Ok(()) }
     }
@@ -811,3 +810,40 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::extensions::RequestCheck for JwtAuth {
+    async fn check(
+        &self,
+        req: &mut http::request::Parts,
+        body: Body,
+        client: crate::extensions::Client,
+    ) -> crate::extensions::Checked {
+        if !self.hidden_params.is_empty() {
+            req.extensions.insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
+        }
+        JwtAuth::check(self, req, client.ip).await.map(|()| body)
+    }
+}
+
+impl crate::extensions::UpstreamCheck for JwtAuth {
+    async fn check(
+        &self,
+        req: &mut http::request::Parts,
+        body: Body,
+        client: crate::extensions::Client,
+        upstreams: &[Authority],
+    ) -> crate::extensions::Checked {
+        if !self.hidden_params.is_empty() && req.extensions.get::<crate::eventlog::HiddenParams>().is_none() {
+            req.extensions.insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
+        }
+        self.check_upstream(req, client.ip, upstreams).await.map(|()| body)
+    }
+
+    fn bound(&self) -> bool {
+        self.bound_to_upstreams()
+    }
+
+    fn upstreams(&self, out: &mut Vec<(Authority, &'static str)>) {
+        out.extend(JwtAuth::upstreams(self).map(|u| (u.clone(), "JWT")));
+    }
+}

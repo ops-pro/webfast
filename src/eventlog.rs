@@ -13,6 +13,7 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,11 @@ pub struct EventLog {
 }
 
 /// One request that did not pass a check.
+/// Query parameters whose values the event log does not write (a JWT given as `?access_token=…`):
+/// the JWT check leaves the names on the request for every log that follows.
+#[derive(Debug, Clone)]
+pub struct HiddenParams(pub Arc<[String]>);
+
 pub struct Event<'a> {
     /// Refused (answered with `status`), or let through (`log_only`).
     pub refused: bool,
@@ -40,8 +46,6 @@ pub struct Event<'a> {
     /// Short and fixed: `expired`, `request-body:application/json`…
     pub reason: &'a str,
     pub detail: &'a str,
-    /// Query parameters whose values are not written: a JWT given as `?access_token=…`.
-    pub hidden_params: &'a [String],
 }
 
 impl EventLog {
@@ -55,7 +59,7 @@ impl EventLog {
     pub fn record(&self, event: &Event<'_>) {
         let uri = redacted(
             event.parts.uri.path_and_query().map_or("/", |pq| pq.as_str()),
-            event.hidden_params,
+            event.parts.extensions.get::<HiddenParams>().map_or(&[][..], |h| &h.0),
         );
         match self.output {
             None if event.refused => tracing::info!(
@@ -157,12 +161,12 @@ mod tests {
             }),
             dir.path(),
         );
-        let (parts, ()) = http::Request::get("/api/x?q=1&access%5Ftoken=a.b.c&n=2")
+        let (mut parts, ()) = http::Request::get("/api/x?q=1&access%5Ftoken=a.b.c&n=2")
             .header("host", "api.test")
             .body(())
             .unwrap()
             .into_parts();
-        let hidden = ["access_token".to_string()];
+        parts.extensions.insert(HiddenParams(Arc::from(vec!["access_token".to_string()])));
         let event = |refused, reason| Event {
             refused,
             status: 401,
@@ -170,7 +174,6 @@ mod tests {
             parts: &parts,
             reason,
             detail: "line\nbreak \"quoted\"",
-            hidden_params: &hidden,
         };
         log.record(&event(true, "expired"));
         crate::accesslog::flush_all(std::time::Duration::from_secs(2));

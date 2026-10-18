@@ -145,9 +145,9 @@ pub struct Ctx {
     /// A `cache` the request passed without an answer: for the proxy, which keeps its response.
     #[cfg(feature = "proxy-cache")]
     pub cache_miss: Option<Box<crate::cache::Miss>>,
-    /// Request checks bound to upstreams (src/jwt, src/apifw), for the proxy to run before it
+    /// The extensions' checks bound to upstreams (src/extensions.rs), for the proxy to run before it
     /// sends the request on; `None`: there are none, or the server asks itself.
-    pub(crate) upstream_checks: Option<Arc<crate::server::Checks>>,
+    pub(crate) upstream_hooks: Option<Arc<crate::extensions::UpstreamChecks>>,
 }
 
 /// A change to the response recorded on the way down the chain.
@@ -209,7 +209,7 @@ impl Ctx {
             error: None,
             #[cfg(feature = "proxy-cache")]
             cache_miss: None,
-            upstream_checks: None,
+            upstream_hooks: None,
         }
     }
 

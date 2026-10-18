@@ -24,6 +24,7 @@
 
 use crate::body::{Body, BoxError};
 use crate::encode::{Encode, Encoding, has_vary, type_matches};
+use crate::extensions::UpstreamCheck;
 use crate::handler::{Ctx, RenderedOp};
 use crate::proxy::ReverseProxy;
 use bytes::{Bytes, BytesMut};
@@ -384,11 +385,11 @@ impl Cache {
 /// `upstreams`): a stored answer goes only to a request that would have passed them on its way
 /// there. `Some`: the refusal to answer with.
 async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
-    let checks = ctx.upstream_checks.clone()?;
+    let hooks = ctx.upstream_hooks.clone()?;
     let body = ctx.body.take().unwrap_or_else(crate::body::empty);
     let client_ip = ctx.client_ip;
-    match checks
-        .check_upstream(&mut ctx.req, body, client_ip, &entry.fetch.proxy.upstreams)
+    match hooks
+        .check(&mut ctx.req, body, crate::extensions::Client { ip: client_ip }, &entry.fetch.proxy.upstreams)
         .await
     {
         Ok(body) => {
