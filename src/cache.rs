@@ -22,6 +22,7 @@
 //! WEB_PROXY_CACHE_MEMORY (64 MiB) bounds what the entries take; past it, the entries not asked
 //! for since the last round go first (CLOCK). The store outlives a reload.
 
+use crate::background::{Budget, Seen, Worker};
 use crate::body::{Body, BoxError};
 use crate::encode::{Encode, Encoding, has_vary, type_matches};
 use crate::extensions::UpstreamCheck;
@@ -38,11 +39,10 @@ use http_body::{Frame, SizeHint};
 use http_body_util::BodyExt;
 use regex::Regex;
 use rustc_hash::FxHashMap;
-use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
@@ -249,16 +249,14 @@ impl Directives {
 struct Store {
     hasher: std::hash::RandomState,
     shards: Vec<Mutex<FxHashMap<u64, Arc<Entry>>>>,
-    used: AtomicUsize,
-    /// The order entries came in, for eviction.
-    order: Mutex<VecDeque<Weak<Entry>>>,
+    /// The order entries came in and what they take (src/background.rs: CLOCK eviction).
+    budget: Mutex<Budget<Weak<Entry>>>,
 }
 
 static STORE: LazyLock<Store> = LazyLock::new(|| Store {
     hasher: std::hash::RandomState::new(),
     shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
-    used: AtomicUsize::new(0),
-    order: Mutex::new(VecDeque::new()),
+    budget: Mutex::new(Budget::new()),
 });
 
 /// What the worker does.
@@ -277,31 +275,36 @@ struct Pending {
     fetch: Arc<Fetch>,
 }
 
-/// The worker's queue, and its end until the worker takes it.
-struct Queue {
-    jobs: tokio::sync::mpsc::Sender<Job>,
-    taken: Mutex<Option<tokio::sync::mpsc::Receiver<Job>>>,
-}
-
-static JOBS: LazyLock<Queue> = LazyLock::new(|| {
-    let (jobs, taken) = tokio::sync::mpsc::channel(QUEUE);
-    Queue {
-        jobs,
-        taken: Mutex::new(Some(taken)),
-    }
+/// The worker (src/background.rs): stores answers and revalidates entries, and once a minute
+/// drops the entries past every window and says how many jobs its queue could not take.
+static WORKER: LazyLock<Worker<Job>> = LazyLock::new(|| {
+    Worker::start(
+        "web-cache",
+        QUEUE,
+        0,
+        Duration::from_secs(60),
+        |job| async move {
+            match job {
+                Job::Store(pending, pieces) => store(*pending, pieces).await,
+                Job::Revalidate(entry) => revalidate(entry).await,
+            }
+        },
+        |dropped| {
+            STORE.sweep(Instant::now());
+            if dropped > 0 {
+                tracing::warn!(dropped, "proxy cache: answers not stored or revalidated, its queue was full");
+            }
+        },
+    )
 });
-/// Jobs (answers to store, revalidations) not taken because the queue was full, since the last summary.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn submit(job: Job) {
-    if JOBS.jobs.try_send(job).is_err() {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
+    let _ = WORKER.submit(job);
 }
 
 impl Cache {
     pub fn new(settings: Settings) -> Cache {
-        start_worker();
+        LazyLock::force(&WORKER);
         Cache {
             settings: Arc::new(settings),
         }
@@ -708,64 +711,86 @@ impl Store {
     }
 
     fn remove(&self, hash: u64, https: bool, hostport: &str, uri: &str) {
-        let mut shard = self.shard(hash);
-        if shard.get(&hash).is_some_and(|e| e.key.is(https, hostport, uri))
-            && let Some(old) = shard.remove(&hash)
-        {
-            self.used.fetch_sub(old.size, Ordering::Relaxed);
+        let removed = {
+            let mut shard = self.shard(hash);
+            if shard.get(&hash).is_some_and(|e| e.key.is(https, hostport, uri)) {
+                shard.remove(&hash)
+            } else {
+                None
+            }
+        };
+        if let Some(old) = removed {
+            self.release(old.size);
         }
     }
 
-    /// Removes `entry` if it is still the one stored under its key.
+    /// Takes `entry` out, when it is still the one in place.
     fn evict(&self, entry: &Arc<Entry>) {
+        if self.take(entry) {
+            self.release(entry.size);
+        }
+    }
+
+    /// Removes `entry` from its shard when it is still the one in place; the budget is told by
+    /// the caller (never under the shard's lock: the budget's pass takes shards itself).
+    fn take(&self, entry: &Arc<Entry>) -> bool {
         let mut shard = self.shard(entry.key.hash);
         if shard.get(&entry.key.hash).is_some_and(|e| Arc::ptr_eq(e, entry)) {
             shard.remove(&entry.key.hash);
-            self.used.fetch_sub(entry.size, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
-    /// Puts an entry in place (replacing its key's), then evicts until the entries fit.
+    fn release(&self, size: usize) {
+        self.budget.lock().unwrap_or_else(PoisonError::into_inner).release(size);
+    }
+
+    /// Puts an entry in place (replacing its key's), then evicts until the entries fit
+    /// (src/background.rs `Budget`: CLOCK, an entry asked for since the last pass gets another
+    /// round).
     fn insert(&self, entry: Arc<Entry>) {
         let max = MAX_MEMORY.load(Ordering::Relaxed);
         if entry.size > max {
             return;
         }
-        if let Some(old) = self.shard(entry.key.hash).insert(entry.key.hash, entry.clone()) {
-            self.used.fetch_sub(old.size, Ordering::Relaxed);
+        let replaced = self.shard(entry.key.hash).insert(entry.key.hash, entry.clone());
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = replaced {
+            budget.release(old.size);
         }
-        self.used.fetch_add(entry.size, Ordering::Relaxed);
-        let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
-        order.push_back(Arc::downgrade(&entry));
-        // CLOCK: an entry asked for since the last pass gets another round.
-        let mut passes = order.len() * 2;
-        while self.used.load(Ordering::Relaxed) > max && passes > 0 {
-            passes -= 1;
-            let Some(weak) = order.pop_front() else { break };
-            let Some(candidate) = weak.upgrade() else { continue };
-            if candidate.touched.swap(false, Ordering::Relaxed) {
-                order.push_back(weak);
-                continue;
+        budget.add(Arc::downgrade(&entry), entry.size);
+        budget.evict(max, |weak| match weak.upgrade() {
+            None => Seen::Gone,
+            Some(candidate) if candidate.touched.swap(false, Ordering::Relaxed) => Seen::Marked,
+            Some(candidate) => {
+                if self.take(&candidate) {
+                    Seen::Evicted(candidate.size)
+                } else {
+                    Seen::Gone
+                }
             }
-            self.evict(&candidate);
-        }
+        });
     }
 
     /// Drops the entries past every window, and the order's dead references.
     fn sweep(&self, now: Instant) {
+        let mut released = 0;
         for shard in &self.shards {
             let mut shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
             shard.retain(|_, entry| {
                 let keep = entry.age(now)
                     < entry.freshness.fresh + entry.freshness.while_revalidating.max(entry.freshness.if_error);
                 if !keep {
-                    self.used.fetch_sub(entry.size, Ordering::Relaxed);
+                    released += entry.size;
                 }
                 keep
             });
         }
-        let mut order = self.order.lock().unwrap_or_else(PoisonError::into_inner);
-        order.retain(|weak| weak.strong_count() > 0);
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        budget.release(released);
+        budget.retain(|weak| weak.strong_count() > 0);
     }
 }
 
@@ -876,56 +901,14 @@ impl Entry {
     /// Starts a background revalidation unless one is under way (or the queue is full: then a
     /// later request tries again).
     fn revalidate(self: &Arc<Self>) {
-        if !self.revalidating.swap(true, Ordering::AcqRel) && JOBS.jobs.try_send(Job::Revalidate(self.clone())).is_err()
+        if !self.revalidating.swap(true, Ordering::AcqRel) && WORKER.submit(Job::Revalidate(self.clone())).is_err()
         {
             self.revalidating.store(false, Ordering::Release);
-            DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 /// The worker: a thread with a runtime of its own, storing and revalidating one job at a time.
-fn start_worker() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        let Some(mut jobs) = JOBS.taken.lock().unwrap_or_else(PoisonError::into_inner).take() else {
-            return;
-        };
-        let spawned = std::thread::Builder::new().name("web-cache".into()).spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(e) => {
-                    tracing::error!(error = %e, "the proxy cache cannot start its worker: nothing is stored");
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                let mut sweep = tokio::time::interval(Duration::from_secs(60));
-                sweep.tick().await;
-                loop {
-                    tokio::select! {
-                        job = jobs.recv() => match job {
-                            Some(Job::Store(pending, pieces)) => store(*pending, pieces).await,
-                            Some(Job::Revalidate(entry)) => revalidate(entry).await,
-                            None => return,
-                        },
-                        _ = sweep.tick() => {
-                            STORE.sweep(Instant::now());
-                            let dropped = DROPPED.swap(0, Ordering::Relaxed);
-                            if dropped > 0 {
-                                tracing::warn!(dropped, "proxy cache: answers not stored or revalidated, its queue was full");
-                            }
-                        }
-                    }
-                }
-            });
-        });
-        if let Err(e) = spawned {
-            tracing::error!(error = %e, "the proxy cache cannot start its worker: nothing is stored");
-        }
-    });
-}
-
 /// A whole response from the tee: decoded, encoded as the site's `encode` lists, stored.
 async fn store(pending: Pending, pieces: Vec<Bytes>) {
     let raw = join(pieces);

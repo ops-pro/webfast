@@ -5,6 +5,7 @@
 pub mod accesslog;
 #[cfg(feature = "api-firewall")]
 pub mod apifw;
+pub mod background;
 pub mod body;
 #[cfg(feature = "proxy-cache")]
 pub mod cache;

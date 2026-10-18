@@ -9,21 +9,21 @@
 //!
 //! What the variants take is bounded by WEB_COMPRESSED_FILES_MEMORY (64 MiB; `off`: none are
 //! made), apart from the files' own WEB_MAX_MEMORY: the files are needed, the variants are not.
-//! Past it, the variants not asked for since the eviction last passed go first (CLOCK). A variant
-//! goes when its file does (changed, removed, a root a reload dropped). Its memory is free once the
-//! ready answers holding it are worked out again and the responses sending it have ended.
+//! Past it, the variants not asked for since the eviction last passed go first (CLOCK,
+//! src/background.rs `Budget`). A variant goes when its file does (changed, removed, a root a
+//! reload dropped). Its memory is free once the ready answers holding it are worked out again and
+//! the responses sending it have ended.
 //!
 //! Nothing is made while ready answers are prepared: a startup or a rescan compresses nothing by
 //! itself, only what is asked for is.
 
+use crate::background::{Budget, Seen, Worker};
 use crate::encode::{Encoding, compress_best};
 use crate::extensions::Lookup;
 use crate::files::{FileEntry, FileStore};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// The default of WEB_COMPRESSED_FILES_MEMORY.
@@ -78,12 +78,11 @@ struct Slot {
     size: usize,
 }
 
+/// The variants kept, and their budget (the CLOCK order and what they take).
 #[derive(Default)]
 struct Variants {
     slots: FxHashMap<Key, Slot>,
-    /// CLOCK order (keys of variants evicted otherwise are skipped when they come round).
-    order: VecDeque<Key>,
-    used: usize,
+    budget: Budget<Key>,
 }
 
 static VARIANTS: LazyLock<RwLock<Variants>> = LazyLock::new(Default::default);
@@ -91,10 +90,11 @@ static VARIANTS: LazyLock<RwLock<Variants>> = LazyLock::new(Default::default);
 static PENDING: LazyLock<Mutex<FxHashSet<Key>>> = LazyLock::new(Default::default);
 /// Made and found not worth keeping (they save less than a tenth): not asked for again.
 static USELESS: LazyLock<Mutex<FxHashSet<Key>>> = LazyLock::new(Default::default);
+/// The stores whose variants came or went since the ready answers were last worked out again.
+static CHANGED: Mutex<Vec<Weak<FileStore>>> = Mutex::new(Vec::new());
 
 static MADE: AtomicU64 = AtomicU64::new(0);
 static EVICTED: AtomicU64 = AtomicU64::new(0);
-static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// What the server does when variants were added or dropped: work out again the ready answers of
 /// the sites reading these stores (src/server.rs sets it).
@@ -104,7 +104,6 @@ static ON_CHANGE: Mutex<Option<OnChange>> = Mutex::new(None);
 pub fn on_change(callback: OnChange) {
     *ON_CHANGE.lock().unwrap_or_else(PoisonError::into_inner) = Some(callback);
 }
-
 
 /// Whether `entry` may get variants at all.
 fn eligible(entry: &FileEntry) -> bool {
@@ -136,7 +135,44 @@ struct Job {
     encodings: Vec<Encoding>,
 }
 
-static QUEUE_SENDER: OnceLock<SyncSender<Job>> = OnceLock::new();
+/// The worker (src/background.rs): makes the variants asked for, at a lower priority; every
+/// quarter second it works out the ready answers again when variants came or went (at most every
+/// REFRESH_EVERY), and once a minute drops the variants of files gone and logs a summary.
+static WORKER: LazyLock<Worker<Job>> = LazyLock::new(|| {
+    let mut refreshed = Instant::now();
+    let mut swept = Instant::now();
+    let mut logged = (0, 0);
+    Worker::start(
+        "webfast-compress",
+        QUEUE,
+        10,
+        Duration::from_millis(250),
+        |job| async move { make(job) },
+        move |dropped| {
+            if swept.elapsed() >= SWEEP_EVERY {
+                sweep();
+                swept = Instant::now();
+                let now = (MADE.load(Ordering::Relaxed), EVICTED.load(Ordering::Relaxed));
+                if now != logged || dropped > 0 {
+                    let (variants, used) = stored();
+                    tracing::info!(
+                        variants,
+                        memory_kib = used / 1024,
+                        made = now.0 - logged.0,
+                        evicted = now.1 - logged.1,
+                        not_queued = dropped,
+                        "compressed variants of the site files"
+                    );
+                }
+                logged = now;
+            }
+            if refreshed.elapsed() >= REFRESH_EVERY {
+                refresh();
+                refreshed = Instant::now();
+            }
+        },
+    )
+});
 
 /// Asks for `entry`'s variants in `encodings` (those `lookup` found missing): queued once, made in
 /// the background. A full queue takes nothing (a later request asks again).
@@ -151,14 +187,12 @@ pub fn wanted(entry: &Arc<FileEntry>, store: &Arc<FileStore>, encodings: &[Encod
     if fresh.is_empty() {
         return;
     }
-    let sender = QUEUE_SENDER.get_or_init(start_worker);
     let job = Job {
         source: entry.clone(),
         store: Arc::downgrade(store),
         encodings: fresh,
     };
-    if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) = sender.try_send(job) {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
+    if let Err(job) = WORKER.submit(job) {
         let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
         for &encoding in &job.encodings {
             if let Some(key) = key_of(&job.source, encoding) {
@@ -171,69 +205,10 @@ pub fn wanted(entry: &Arc<FileEntry>, store: &Arc<FileStore>, encodings: &[Encod
 /// The variants kept and what they take (for the log, tests and diagnostics).
 pub fn stored() -> (usize, usize) {
     let variants = VARIANTS.read().unwrap_or_else(PoisonError::into_inner);
-    (variants.slots.len(), variants.used)
+    (variants.slots.len(), variants.budget.used())
 }
 
-fn start_worker() -> SyncSender<Job> {
-    let (sender, jobs) = sync_channel::<Job>(QUEUE);
-    let spawned = std::thread::Builder::new()
-        .name("webfast-compress".into())
-        .spawn(move || {
-            lower_priority();
-            let mut changed: Vec<Weak<FileStore>> = Vec::new();
-            let mut refreshed = Instant::now();
-            let mut swept = Instant::now();
-            let mut logged = (0, 0, 0);
-            loop {
-                match jobs.recv_timeout(Duration::from_millis(250)) {
-                    Ok(job) => make(job, &mut changed),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-                if swept.elapsed() >= SWEEP_EVERY {
-                    sweep(&mut changed);
-                    swept = Instant::now();
-                    let now = (
-                        MADE.load(Ordering::Relaxed),
-                        EVICTED.load(Ordering::Relaxed),
-                        DROPPED.swap(0, Ordering::Relaxed),
-                    );
-                    if (now.0, now.1) != (logged.0, logged.1) || now.2 > 0 {
-                        let (variants, used) = stored();
-                        tracing::info!(
-                            variants,
-                            memory_kib = used / 1024,
-                            made = now.0 - logged.0,
-                            evicted = now.1 - logged.1,
-                            not_queued = now.2,
-                            "compressed variants of the site files"
-                        );
-                    }
-                    logged = now;
-                }
-                if !changed.is_empty() && refreshed.elapsed() >= REFRESH_EVERY {
-                    refresh(&mut changed);
-                    refreshed = Instant::now();
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "the compressed variants' thread cannot start: none are made");
-    }
-    sender
-}
-
-/// Compression waits for the requests: the thread runs at a lower priority (Linux: a nice value of
-/// its own).
-fn lower_priority() {
-    #[cfg(target_os = "linux")]
-    // SAFETY: setpriority on the calling thread (who = 0 names it on Linux) changes only its nice.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-    }
-}
-
-fn make(job: Job, changed: &mut Vec<Weak<FileStore>>) {
+fn make(job: Job) {
     let body = job.source.body();
     for &encoding in &job.encodings {
         let Some(key) = key_of(&job.source, encoding) else {
@@ -256,24 +231,21 @@ fn make(job: Job, changed: &mut Vec<Weak<FileStore>>) {
                     touched.clone(),
                 ));
                 let mut variants = VARIANTS.write().unwrap_or_else(PoisonError::into_inner);
-                if let Some(old) = variants.slots.insert(
-                    key,
-                    Slot {
-                        variant,
-                        touched,
-                        source: Arc::downgrade(&job.source),
-                        store: job.store.clone(),
-                        size,
-                    },
-                ) {
-                    variants.used -= old.size;
+                let slot = Slot {
+                    variant,
+                    touched,
+                    source: Arc::downgrade(&job.source),
+                    store: job.store.clone(),
+                    size,
+                };
+                if let Some(old) = variants.slots.insert(key, slot) {
+                    variants.budget.release(old.size);
                 }
-                variants.used += size;
-                variants.order.push_back(key);
-                evict(&mut variants, max, changed);
+                variants.budget.add(key, size);
+                evict(&mut variants, max);
                 drop(variants);
                 MADE.fetch_add(1, Ordering::Relaxed);
-                note(changed, &job.store);
+                note(&job.store);
             }
             Some(_) => {
                 let mut useless = USELESS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -288,63 +260,68 @@ fn make(job: Job, changed: &mut Vec<Weak<FileStore>>) {
     }
 }
 
-/// CLOCK: past `max`, a variant asked for since the last pass gets another round, the first that
-/// was not goes.
-fn evict(variants: &mut Variants, max: usize, changed: &mut Vec<Weak<FileStore>>) {
-    while variants.used > max {
-        let Some(key) = variants.order.pop_front() else {
-            break;
-        };
-        let Some(slot) = variants.slots.get(&key) else {
-            continue;
-        };
-        if slot.touched.swap(false, Ordering::Relaxed) {
-            variants.order.push_back(key);
-            continue;
-        }
-        if let Some(gone) = variants.slots.remove(&key) {
-            variants.used -= gone.size;
+/// The budget's CLOCK pass over the variants: past `max`, a variant asked for since the last pass
+/// gets another round, the first that was not goes.
+fn evict(variants: &mut Variants, max: usize) {
+    let Variants { slots, budget } = variants;
+    budget.evict(max, |key| match slots.get(key) {
+        None => Seen::Gone,
+        Some(slot) if slot.touched.swap(false, Ordering::Relaxed) => Seen::Marked,
+        Some(_) => {
+            let gone = slots.remove(key).expect("looked up just now");
             EVICTED.fetch_add(1, Ordering::Relaxed);
-            note(changed, &gone.store);
+            note(&gone.store);
+            Seen::Evicted(gone.size)
         }
-    }
+    });
 }
 
 /// Drops the variants of files that are gone; past a lowered WEB_COMPRESSED_FILES_MEMORY, some
 /// more.
-fn sweep(changed: &mut Vec<Weak<FileStore>>) {
+fn sweep() {
     let mut variants = VARIANTS.write().unwrap_or_else(PoisonError::into_inner);
+    let mut released = 0;
     let mut gone = Vec::new();
     variants.slots.retain(|_, slot| {
         let keep = slot.source.strong_count() > 0;
         if !keep {
-            gone.push((slot.size, slot.store.clone()));
+            released += slot.size;
+            gone.push(slot.store.clone());
         }
         keep
     });
-    for (size, store) in gone {
-        variants.used -= size;
-        note(changed, &store);
+    for store in &gone {
+        note(store);
     }
-    let Variants { slots, order, .. } = &mut *variants;
-    order.retain(|key| slots.contains_key(key));
+    let Variants { slots, budget } = &mut *variants;
+    budget.release(released);
+    budget.retain(|key| slots.contains_key(key));
     let max = MAX_MEMORY.load(Ordering::Relaxed);
-    evict(&mut variants, max, changed);
+    evict(&mut variants, max);
 }
 
-fn note(changed: &mut Vec<Weak<FileStore>>, store: &Weak<FileStore>) {
-    if store.strong_count() > 0 && !changed.iter().any(|s| s.ptr_eq(store)) {
+/// A store whose variants changed: its sites' ready answers are worked out again (`refresh`).
+fn note(store: &Weak<FileStore>) {
+    if store.strong_count() == 0 {
+        return;
+    }
+    let mut changed = CHANGED.lock().unwrap_or_else(PoisonError::into_inner);
+    if !changed.iter().any(|s| s.ptr_eq(store)) {
         changed.push(store.clone());
     }
 }
 
 /// The ready answers of the sites reading the stores whose variants changed, worked out again.
-fn refresh(changed: &mut Vec<Weak<FileStore>>) {
-    let stores: Vec<Arc<FileStore>> = changed.drain(..).filter_map(|s| s.upgrade()).collect();
+fn refresh() {
+    let stores: Vec<Arc<FileStore>> = std::mem::take(&mut *CHANGED.lock().unwrap_or_else(PoisonError::into_inner))
+        .into_iter()
+        .filter_map(|s| s.upgrade())
+        .collect();
+    if stores.is_empty() {
+        return;
+    }
     let callback = ON_CHANGE.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    if let Some(callback) = callback
-        && !stores.is_empty()
-    {
+    if let Some(callback) = callback {
         callback(&stores);
         crate::release_free_memory();
     }
@@ -386,8 +363,7 @@ mod tests {
                     size,
                 },
             );
-            variants.order.push_back(key);
-            variants.used += size;
+            variants.budget.add(key, size);
         }
         variants
     }
@@ -397,19 +373,17 @@ mod tests {
         let mut variants = variants_of(&[100, 100, 100, 100]);
         // 1 and 3 were asked for since the last pass.
         for i in [1u128, 3] {
-            variants.slots[&(i, Encoding::Br)]
-                .touched
-                .store(true, Ordering::Relaxed);
+            variants.slots[&(i, Encoding::Br)].touched.store(true, Ordering::Relaxed);
         }
-        evict(&mut variants, 250, &mut Vec::new());
+        evict(&mut variants, 250);
         let mut kept: Vec<u128> = variants.slots.keys().map(|k| k.0).collect();
         kept.sort_unstable();
         assert_eq!(kept, [1, 3]);
-        assert_eq!(variants.used, 200);
+        assert_eq!(variants.budget.used(), 200);
         // Their marks are spent: the next pass may take them.
-        evict(&mut variants, 100, &mut Vec::new());
+        evict(&mut variants, 100);
         assert_eq!(variants.slots.len(), 1);
-        assert_eq!(variants.used, 100);
+        assert_eq!(variants.budget.used(), 100);
     }
 
     #[test]
@@ -425,4 +399,3 @@ mod tests {
         assert!(!eligible(&FileEntry::new("/tiny.js", b"1".to_vec(), None)), "too small");
     }
 }
-

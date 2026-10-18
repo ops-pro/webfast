@@ -466,60 +466,64 @@ impl ZoneState {
 
 /// The thread that sweeps the zones and logs what they limited, each at its `sweep_interval`,
 /// and the requests refused at the upstreams once a minute.
-fn start_sweeper() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        let spawned = std::thread::Builder::new().name("web-ratelimit".into()).spawn(|| {
-            let mut last: FxHashMap<usize, Instant> = FxHashMap::default();
-            let mut upstream_logged = Instant::now();
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                if upstream_logged.elapsed() >= Duration::from_secs(60) {
-                    upstream_logged = Instant::now();
-                    let refused = IN_FLIGHT.refused.swap(0, Ordering::Relaxed);
-                    if refused > 0 {
-                        let message = if DRY_RUN.load(Ordering::Relaxed) {
-                            "requests would be refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP, WEB_RATE_LIMIT_DRY_RUN)"
-                        } else {
-                            "requests refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP)"
-                        };
-                        tracing::warn!(refused, "{message}");
-                    }
+/// The sweeper (src/background.rs `Worker`, without jobs): every second the zones due are swept
+/// and what was refused is logged, per zone and for the upstreams once a minute.
+static SWEEPER: LazyLock<crate::background::Worker<std::convert::Infallible>> = LazyLock::new(|| {
+    let mut last: FxHashMap<usize, Instant> = FxHashMap::default();
+    let mut upstream_logged = Instant::now();
+    crate::background::Worker::start(
+        "web-ratelimit",
+        1,
+        0,
+        Duration::from_secs(1),
+        |never| async move { match never {} },
+        move |_| {
+            if upstream_logged.elapsed() >= Duration::from_secs(60) {
+                upstream_logged = Instant::now();
+                let refused = IN_FLIGHT.refused.swap(0, Ordering::Relaxed);
+                if refused > 0 {
+                    let message = if DRY_RUN.load(Ordering::Relaxed) {
+                        "requests would be refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP, WEB_RATE_LIMIT_DRY_RUN)"
+                    } else {
+                        "requests refused at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP)"
+                    };
+                    tracing::warn!(refused, "{message}");
                 }
-                let zones: Vec<Arc<ZoneState>> = {
-                    let mut zones = ZONES.lock().unwrap_or_else(PoisonError::into_inner);
-                    zones.retain(|zone| zone.strong_count() > 0);
-                    zones.iter().filter_map(Weak::upgrade).collect()
-                };
-                for zone in zones {
-                    let id = Arc::as_ptr(&zone) as usize;
-                    let due = last.get(&id).is_none_or(|at| at.elapsed() >= zone.sweep_every);
-                    if !due {
-                        continue;
-                    }
-                    last.insert(id, Instant::now());
-                    let keys = zone.sweep(now_nanos());
-                    let limited = zone.limited.swap(0, Ordering::Relaxed);
-                    if limited > 0 {
-                        let seen = std::mem::take(&mut *zone.keys_seen.lock().unwrap_or_else(PoisonError::into_inner));
-                        let message = if DRY_RUN.load(Ordering::Relaxed) {
-                            "requests would be limited (WEB_RATE_LIMIT_DRY_RUN)"
-                        } else {
-                            "requests limited"
-                        };
-                        if zone.log_key {
-                            tracing::warn!(zone = %zone.name, limited, keys, ?seen, "{message}");
-                        } else {
-                            tracing::warn!(zone = %zone.name, limited, keys, "{message}");
-                        }
+            }
+            let zones: Vec<Arc<ZoneState>> = {
+                let mut zones = ZONES.lock().unwrap_or_else(PoisonError::into_inner);
+                zones.retain(|zone| zone.strong_count() > 0);
+                zones.iter().filter_map(Weak::upgrade).collect()
+            };
+            for zone in zones {
+                let id = Arc::as_ptr(&zone) as usize;
+                let due = last.get(&id).is_none_or(|at| at.elapsed() >= zone.sweep_every);
+                if !due {
+                    continue;
+                }
+                last.insert(id, Instant::now());
+                let keys = zone.sweep(now_nanos());
+                let limited = zone.limited.swap(0, Ordering::Relaxed);
+                if limited > 0 {
+                    let seen = std::mem::take(&mut *zone.keys_seen.lock().unwrap_or_else(PoisonError::into_inner));
+                    let message = if DRY_RUN.load(Ordering::Relaxed) {
+                        "requests would be limited (WEB_RATE_LIMIT_DRY_RUN)"
+                    } else {
+                        "requests limited"
+                    };
+                    if zone.log_key {
+                        tracing::warn!(zone = %zone.name, limited, keys, ?seen, "{message}");
+                    } else {
+                        tracing::warn!(zone = %zone.name, limited, keys, "{message}");
                     }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            tracing::error!(error = %e, "cannot start the rate limit sweeper; keys are swept when a zone is full");
-        }
-    });
+        },
+    )
+});
+
+fn start_sweeper() {
+    LazyLock::force(&SWEEPER);
 }
 
 /// A number in [0, 1), different on every call.
