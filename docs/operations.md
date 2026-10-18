@@ -61,8 +61,10 @@ with, and no connection is cut by a reload. What the connections already open ge
   are looked at again at once, as at startup); new roots are loaded, and what all of them take
   must fit `WEB_MAX_MEMORY`.
 - What only a restart can change is refused: other ports, TLS on or off on a port, `protocols`,
-  `timeouts`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at startup). The `debug`
-  option takes effect on a restart.
+  `timeouts`, `strict_sni_host`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at
+  startup); the request checks (`WEB_JWT_CONFIG`, `WEB_API_FIREWALL_CONFIG`) are read at startup
+  and kept, and a Caddyfile whose routes no longer send to an upstream they are bound to is
+  refused. The `debug` option takes effect on a restart.
 - A reload that fails — a syntax error, a root that is missing, a certificate that cannot be read,
   one of the above — changes nothing: the log says `configuration not reloaded; the running one
   stays` with the reason. A reload that succeeds says `configuration reloaded`.
@@ -122,7 +124,18 @@ example.com, www.example.com {
 ```
 
 - rustls on aws-lc-rs: TLS 1.3 and 1.2, the post-quantum key exchange X25519MLKEM768 preferred,
-  ML-DSA certificates accepted; the certificate is chosen by SNI.
+  ML-DSA certificates accepted; the certificate is chosen by SNI. A site may list several (`tls`
+  repeated, an ECDSA and an RSA certificate, say): a handshake gets the first, in Caddyfile order,
+  that the client can verify, as Caddy chooses.
+- Certificate compression (RFC 8879, brotli and zlib) for the clients that offer it: each chain is
+  compressed once and kept.
+- `WEB_TLS_STRICT_SNI=on`: a handshake without SNI, or for a name no site names exactly or by a
+  wildcard, gets no certificate and ends with an alert, as Cloudflare does; a scan of the address
+  learns nothing of the sites.
+- A request whose Host is served with another certificate than the one the connection was opened
+  for (by its SNI) gets `421 Misdirected Request` (RFC 9110 §15.5.20), and the client asks again
+  on a connection of its own; a browser that coalesced HTTP/2 connections for names of one
+  certificate is answered as before. `servers { strict_sni_host insecure_off }` turns it off.
 - The PEM files are looked at every minute and re-read when they change (renewals); there is no
   ACME client — certbot, lego or acme.sh write the files.
 - HTTP/2 over TLS; HTTP/3 (QUIC) on the same port number over UDP, advertised with `Alt-Svc`.
@@ -248,6 +261,10 @@ request`) or a console line. Request headers are not logged (they carry cookies)
 in batches (`WEB_LOG_FLUSH_MS`); a full queue drops lines instead of slowing requests, and says how
 many.
 
+The request checks (docs/configuration.md, Request checks) write what they refuse, and what
+`log_only` lets through, to event logs of their own: JSON lines in a file, which logrotate may
+move, or the server's log.
+
 ## Limits
 
 What keeps one client from holding the server:
@@ -262,6 +279,8 @@ What keeps one client from holding the server:
 | Idle keep-alive connections                           | `timeouts { idle }` (5 min, Caddy's default) with no request in progress: graceful close (GOAWAY); one that has not finished 10 s later is cut                    |
 | Slow reader: a response the client stops taking       | `WEB_STALL_TIMEOUT` (30 s) with the socket accepting nothing (HTTP/3: the stream) cuts the connection; a slow but moving download is fine                         |
 | Slow sender: a request body the client stops sending  | `WEB_STALL_TIMEOUT` with no body data arriving ends the body; the proxy answers 408 and the upstream connection is freed                                          |
+| Large request bodies                                  | `request_body { max_size }` (as Caddy's): a Content-Length over it gets 413 before the upstream is called; a body that grows past it ends there, 413              |
+| A connection opened for one site, asking another      | TLS: a Host served with another certificate than the connection's gets 421 (`strict_sni_host`)                                                                    |
 | Hung upstream (headers never come)                    | `reverse_proxy` `response_header_timeout`, 60 s by default (Caddy: none; `0` restores that): 504                                                                  |
 | Range header asking for thousands of parts            | more than 64 ranges, or overlapping ones, are ignored and the whole file is sent (200), as Go does for ranges adding up to more than the file                     |
 | Redirect targets built from the path                  | `redir` and the canonical trailing-slash redirect turn a leading `//host` or `/\host` into `/host`, so no path can send a browser off the site                    |

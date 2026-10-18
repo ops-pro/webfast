@@ -14,9 +14,9 @@ Docker image starts with it.
 | Kind           | Supported                                                                                                                                                                                                                                                                                                                                      |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                                                    |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, timeouts { read_header, idle } }`, `cache { … }` (Proxy cache)                                                                                  |
-| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>`; `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
-| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
+| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host [on|insecure_off], timeouts { read_header, idle } }`, `cache { … }` (Proxy cache)                                                                           |
+| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify); `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
+| Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `request_body { max_size }`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
 | reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                                                      |
 | file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
@@ -241,6 +241,188 @@ example.com {
   `badger`, `nuts`, `otter`, `olric`, `etcd`: the cache is in memory), `cdn`, `api`, `key`,
   `cache_keys` and the other modes.
 
+### Request checks: JWT and OpenAPI
+
+
+Two modules check requests: their JWT ([`src/jwt`](../src/jwt)), then the OpenAPI spec of the API
+they are for ([`src/apifw`](../src/apifw)). Each is a Cargo feature (`jwt`, `api-firewall`, both in
+the default build; without one, none of its code or dependencies is built) and is used only when
+its YAML file is named — the Caddyfile stays Caddy's. A file that does not load stops the server
+at startup with the reason; `webfast validate` loads them too and says what it found. A
+refused request is answered, and logged in the site's access log, like any other. Each module
+also writes what it refused, and what `log_only` let through, to its own event log (below).
+
+**What a check covers** is set in the module's own file, never in the Caddyfile, so an edit there
+cannot switch a check off. A JWT rule or an API covers requests in one of two ways:
+
+- **By host, path and method**, checked before the site's routes and ready answers, so no file or
+  proxied path is served past it.
+- **By upstream**, with `upstreams: [app:8787]`: what the routes send to that upstream, checked
+  by the `reverse_proxy` just before the request goes, as it goes there (after any `rewrite` or
+  `handle_path`). Host, path and method narrow it further. This follows the routes: the app's
+  spec bound to `app:8787` with `base_path: /api` covers the app's API, but neither an
+  event-streaming service under `/api/stream/*` nor the pages the app renders outside `/api`.
+
+Upstreams are written as `reverse_proxy` takes them. One that no `reverse_proxy` sends to stops
+the server at startup, and `validate` says so, so a typo or a changed route cannot leave requests
+unchecked. Among the rules, or the APIs, of one kind the first that matches decides; a request
+can meet one of each kind.
+
+With `cache` (Proxy cache), a stored answer goes only to a request that passes the checks bound
+to the upstream it came from, and the answer to a request whose token was verified is kept only
+when it says it may be shared (`public`, `s-maxage`, `must-revalidate`), as for a request with
+`Authorization`: the token may not reach the upstream. The checks are read at startup; a reload
+(SIGHUP) keeps them, and refuses a Caddyfile whose routes no longer send to an upstream they are
+bound to.
+
+**JWT** (`WEB_JWT_CONFIG`), after Istio's RequestAuthentication and Envoy's jwt_authn:
+
+```yaml
+mode: block # block | log_only; a rule may set its own
+log: { output: /var/log/web/jwt.log } # see "Event logs" below; none: the server's log
+providers:
+  keycloak:
+    issuer: https://id.example.com/realms/main
+    audiences: [api] # the token's aud must name one (403 otherwise)
+    jwks_uri: https://id.example.com/realms/main/protocol/openid-connect/certs # or jwks / jwks_file
+    # from_headers: [{name: Authorization, prefix: "Bearer "}]   the default
+    # from_params: [access_token]   from_cookies: [session]
+    output_claim_to_headers:
+      [{ header: X-User, claim: sub }, { header: X-Roles, claim: realm_access.roles }]
+    # output_payload_to_header: X-Jwt-Payload   forward_original_token: false   clock_skew: 60s
+    # require_expiration: true   max_lifetime: 24h   jwks_cache_duration: 10m   jwks_fetch_timeout: 5s
+rules: # the first that matches decides; none: the request is not looked at
+  - match: { paths: ['/api/public/*'] } # no providers: not checked
+  - match: { paths: ['/api/v2/*'] }
+    providers: [keycloak]
+    mode: log_only # tried on live traffic first: failures are written down, requests go on
+  - match: { paths: ['/api/*'], methods: [POST, PUT, DELETE] }
+    providers: [keycloak]
+  - match: { paths: ['/api/*'] }
+    providers: [keycloak]
+    allow_missing: true # as Istio: no token passes, a bad one does not
+  - match: { upstreams: [stream:8800] } # what the routes send to the streaming service
+    providers: [keycloak]
+cache: { tokens: 10000 }
+```
+
+- Paths match as the `path` matcher does (decoded, cleaned, case-insensitive). Missing token: 401
+  `Jwt is missing`; bad signature, wrong issuer, expired, not yet valid: 401; audience: 403
+  (Envoy's answers, with `WWW-Authenticate: Bearer`).
+- In `log_only` a failed check is written to the event log and the request goes on as it came:
+  the token left in place, no claim headers. That way a rule can run on live traffic before it
+  refuses anything.
+- Accepted: RS256/384/512, PS256/384/512, ES256, ES384, EdDSA. Not: `none`, HMAC (a shared secret
+  has no place at the edge, and refusing it rules out algorithm confusion), RSA under 2048 bits,
+  tokens with `crit`, tokens over 16 KiB.
+- Keys are parsed into aws-lc-rs keys once; a `jwks_uri` (HTTPS with the Mozilla roots built in) or
+  `jwks_file` is read again every `jwks_cache_duration` in the background, sooner after a failure.
+  A token signed with a key id not known yet asks for an early read and waits for it — at most one
+  every 30 s, so made-up key ids cannot make the server hammer the issuer.
+- The headers claims are written to are taken off every request first: a client cannot send
+  `X-User` itself, also on paths no rule covers.
+- Verified tokens are kept (by their BLAKE3 hash; 16 shards, two generations): a token seen again
+  costs 0.6–0.85 µs, a new one 20 µs (RS256), 43 µs (EdDSA) or 68 µs (ES256) — release build.
+
+**OpenAPI** (`WEB_API_FIREWALL_CONFIG`), after Wallarm API Firewall:
+
+```yaml
+log: { output: /var/log/web/api-firewall.log } # see "Event logs" below; none: the server's log
+apis:
+  - spec: openapi.yaml # relative to this file; YAML or JSON, OpenAPI 3.0 or 3.1; or a source, below
+    upstreams: [app:8787] # what the routes send to the app; none: checked before the routes
+    base_path: /api # the spec's paths are under it; hosts: [api.example.com] to narrow it
+    mode: block # block | log_only | off
+    unknown_query_params: block # block | allow
+    strict_bodies: false # true: objects may not carry properties their schema does not name
+    max_body_size: 1MB
+    # block_status: 403   reason_header: false   pass_options: false
+    endpoints: # per operation: the spec's path template, the method optional
+      - { method: POST, path: /orders, mode: log_only }
+```
+
+- Every request under the base must be an operation of the spec, with its path, query, header
+  and cookie parameters and its body as the spec says, and the credentials its `security` asks
+  for present (presence only: the JWT module verifies tokens). In `block` a violation answers 403
+  with an empty body (`reason_header: true` adds `apifw-validation-status`); in `log_only` it is
+  written to the event log and the request goes on. A body over `max_body_size` gets 413 and a
+  compressed one 415, in any mode.
+- The spec is compiled once: a trie of path segments to operations, typed readers for the
+  parameters, JSON Schema 2020-12 validators (OpenAPI 3.0 schemas converted: `nullable`, boolean
+  exclusive bounds, `int32` ranges, `readOnly` properties refused in requests; patterns with the
+  linear-time `regex` engine; formats checked). A request costs 32 ns outside any API, 1.1 µs for a
+  GET with three parameters, 1.5 µs for a POST with a small JSON body.
+- Where Wallarm's source showed gaps, this does otherwise: the body is read once and exactly those
+  bytes go upstream; paths and query strings are decoded once and strictly (a broken escape, an
+  encoded `/`, dot segments, `//`, a parameter that is not an array given twice are violations);
+  whether a request is under an API is decided on the path as the matchers see it, so `/API/x` or
+  `/x/../api/y` do not slip past; compressed bodies are refused, not inflated; nothing fails open
+  (an undeclared body type is a violation).
+- Not done yet: request bodies declared as multipart, binary or XML are checked for their type and
+  size only; responses are not validated; references to other files are not followed.
+
+`spec` is a file name, read once at startup, or a source kept current while the server runs:
+
+```yaml
+spec:
+  uri: /api/openapi.json # a path, asked of this server's own routes in process; or an http(s) URL
+  # file: openapi.yaml   instead of uri: a file, read again when it changes
+  refresh: 1m # how often to look again; 1m for a uri by default, a file only when set
+  ttl: 24h # how long the last good spec holds while its source fails; by default for ever
+  timeout: 5s
+  headers: { Authorization: 'Bearer ${SPEC_TOKEN}' } # a uri only; ${VAR} from the environment
+```
+
+- A path goes through the site's routes as a request would: a file the server serves, or the app
+  it proxies to. It is marked so that the request checks skip it, so the spec can sit under the
+  API's own base path without being in the spec. The same path asked from outside is checked
+  like any other.
+- Each look is a conditional request (`If-None-Match`, `If-Modified-Since`; for a file its size,
+  time and inode). An unchanged spec costs a 304 and nothing is compiled. A changed one is
+  compiled off the request threads and replaces the old one whole; requests in flight keep the
+  one they found.
+- A source that cannot be read, or a spec that does not compile, leaves the last good one in place
+  and is tried again sooner: after 1 s, then doubling, at most `refresh` or 60 s. Until there is a
+  spec, or once `ttl` passes without a good look, the API's requests get 503 `spec:unavailable`
+  in `block` and go on in `log_only`. The rest of the site is not held up.
+
+**Event logs.** With `log: { output: … }` in a module's file, what it refused, and what `log_only`
+let through, goes there as one JSON line per request: to a file (relative to the module's file,
+appended to and opened again when logrotate moves it), `stdout`, `stderr` or `discard`. The access
+log's writer threads write the lines in batches, so no request waits for the disk. Without `log`
+the events go to the server's own log. In a read-only container a file needs a writable mount for
+its directory.
+
+```json
+{
+  "level": "info",
+  "ts": 1760788800.123,
+  "logger": "jwt",
+  "msg": "request refused",
+  "request": {
+    "client_ip": "203.0.113.7",
+    "method": "GET",
+    "host": "api.example.com",
+    "uri": "/api/orders?limit=10&access_token=REDACTED"
+  },
+  "reason": "expired",
+  "detail": "",
+  "status": 401
+}
+```
+
+- A request let through has `"level": "warn"` and `"msg": "request let through (log_only)"`, with
+  the status it would have got.
+- `reason` is short and fixed. The JWT module gives `missing`, `malformed`, `unknown-issuer`,
+  `unsupported-algorithm`, `unknown-key`, `bad-signature`, `no-expiration`, `expired`,
+  `not-yet-valid`, `lifetime-too-long` or `audience`. The API firewall gives what
+  `apifw-validation-status` carries, such as `request:unknown-operation`,
+  `request-parameter:query:limit`, `request-body:application/json` or `spec:unavailable`, with
+  the particulars in `detail`.
+- Tokens are not written: the values of the query parameters a JWT may come in show as
+  `REDACTED`. A schema error says where and which keyword failed, such as `/password: minLength`,
+  never the value. The rest of the URI is as the access log has it.
+
 ## Differences from Caddy
 
 Those an answer shows are checked by `compat/`:
@@ -269,6 +451,13 @@ Those an answer shows are checked by `compat/`:
   multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
+- `strict_sni_host` is on by default and answers 421 to a request whose Host is served with
+  another certificate than the connection's (RFC 9110 §15.5.20); Caddy's `on` wants the Host to
+  equal the SNI name and answers 403, which coalesced HTTP/2 connections do not survive.
+  `insecure_off` turns it off. `WEB_TLS_STRICT_SNI=on` gives no certificate to a handshake without
+  SNI or for a name no site names (Caddy: the default certificate).
+- JWT validation and OpenAPI request validation are built in (Request checks) and configured
+  outside the Caddyfile; Caddy needs plugins for either.
 - Compression dictionaries (`dcz`): Caddy has none; the `Use-As-Dictionary` header is just a
   header to it.
 - Early Hints (`respond 103`) go out over HTTP/3 only (Caddy: over every protocol); a file's ready
@@ -313,6 +502,9 @@ Those an answer shows are checked by `compat/`:
 | `WEB_RATE_LIMIT_DRY_RUN`           | `off`       | `on`: `rate_limit` refuses nothing, its zones only count and log what they would refuse                                                                                                                                                                            |
 | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` | `256`       | a client's requests at the upstreams at once (`reverse_proxy`, until the response ends; behind a trusted proxy, the client it names); more are refused with 429; `0`: no limit (docs/configuration.md, Rate limits)                                                |
 | `WEB_PROXY_CACHE_MEMORY`           | `64MiB`     | what the answers kept by `cache` may take, every encoding counted; past it the least asked for go first; `off`: nothing is kept (docs/configuration.md, Proxy cache)                                                                                               |
+| `WEB_TLS_STRICT_SNI`               | `off`       | `on`: a TLS handshake without SNI, or for a name no site names exactly or by a wildcard, gets no certificate and ends with an alert (docs/operations.md, TLS and HTTP/3) |
+| `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
+| `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
 | `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
 | `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |
 | `WEB_STALL_TIMEOUT`                | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                                                                                                      |

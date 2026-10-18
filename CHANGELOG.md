@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Request checks, each a cargo feature on by default and used only when its YAML file is named:
+  JWT validation (`WEB_JWT_CONFIG`, after Istio's RequestAuthentication: providers with JWKS by
+  URL, inline or file, rules by host, path and method, verified tokens cached) and OpenAPI request
+  validation (`WEB_API_FIREWALL_CONFIG`, after Wallarm API Firewall: the spec compiled once,
+  parameters, bodies and security requirements checked). A rule or an API can be bound to an
+  upstream (`upstreams: [app:8787]`): it then covers what the routes send there, checked by the
+  `reverse_proxy` before anything is sent, and by `cache` before a stored answer is given; an
+  upstream no `reverse_proxy` sends to stops the startup, and a reload. `mode: log_only` lets
+  failures through and writes them down; `log: { output }` gives each module an event log of its
+  own, without tokens or the values that failed a schema. An API's spec can come from a URL or a
+  path of the server itself, looked at again with conditional requests (`refresh`, `ttl`).
+- `cache` keeps the answer to a request whose JWT was verified only when the answer says it may be
+  shared, as for a request with `Authorization`.
+- TLS: several certificates per site (`tls` repeated; each client gets the first it can verify),
+  certificate compression (RFC 8879), `WEB_TLS_STRICT_SNI=on` (no certificate without SNI or for a
+  name no site names), and 421 for a Host served with another certificate than the connection's
+  (`strict_sni_host`, on by default; RFC 9110 §15.5.20).
+- `request_body { max_size }`: 413 before the upstream is called for a body over the limit.
+- Redirects built from the path stay on the site also with a tab or a newline between the slashes.
 - WebSocket through `reverse_proxy`: a `Connection: upgrade` handshake over HTTP/1.1 goes to the
   upstream, and its 101 joins the two connections into a tunnel. Tunnels count against the
   connection limits and close when the server stops.

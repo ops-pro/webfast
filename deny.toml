@@ -27,6 +27,9 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.9
+# webpki-roots: Mozilla's root certificates as data, for the JWKS and API specs fetched over HTTPS
+# (src/fetch.rs; the image has no CA store). CDLA-Permissive-2.0 is a permissive license for data.
+exceptions = [{ crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] }]
 
 [bans]
 multiple-versions = "warn"
