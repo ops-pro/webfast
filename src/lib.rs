@@ -12,9 +12,9 @@ pub mod caddyfile;
 pub mod config;
 pub mod date;
 pub mod encode;
-pub mod extensions;
 #[cfg(any(feature = "jwt", feature = "api-firewall"))]
 pub mod eventlog;
+pub mod extensions;
 #[cfg(any(feature = "jwt", feature = "api-firewall"))]
 pub mod fetch;
 pub mod files;

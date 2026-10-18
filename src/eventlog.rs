@@ -13,8 +13,8 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -166,7 +166,9 @@ mod tests {
             .body(())
             .unwrap()
             .into_parts();
-        parts.extensions.insert(HiddenParams(Arc::from(vec!["access_token".to_string()])));
+        parts
+            .extensions
+            .insert(HiddenParams(Arc::from(vec!["access_token".to_string()])));
         let event = |refused, reason| Event {
             refused,
             status: 401,

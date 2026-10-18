@@ -140,11 +140,11 @@ pub struct Ctx {
     pub pre_headers: HeaderMap,
     /// What deferred `header` and `encode` will do to the response, outermost first.
     hooks: Vec<Hook>,
+    /// The site's `encode` the request passed, if any: what a kept proxied answer is compressed
+    /// with (src/proxy.rs, src/cache.rs). An `Arc` clone: no allocation.
+    pub encode: Option<Arc<Encode>>,
     /// In `handle_errors` routes: the failure they answer for.
     pub error: Option<Arc<HandlerError>>,
-    /// A `cache` the request passed without an answer: for the proxy, which keeps its response.
-    #[cfg(feature = "proxy-cache")]
-    pub cache_miss: Option<Box<crate::cache::Miss>>,
     /// The extensions' checks bound to upstreams (src/extensions.rs), for the proxy to run before it
     /// sends the request on; `None`: there are none, or the server asks itself.
     pub(crate) upstream_hooks: Option<Arc<crate::extensions::UpstreamChecks>>,
@@ -206,9 +206,8 @@ impl Ctx {
             file_match: None,
             pre_headers: HeaderMap::new(),
             hooks: Vec::new(),
+            encode: None,
             error: None,
-            #[cfg(feature = "proxy-cache")]
-            cache_miss: None,
             upstream_hooks: None,
         }
     }
@@ -808,10 +807,8 @@ impl Next {
                     continue;
                 }
                 Handler::Encode(encode) => {
-                    #[cfg(feature = "proxy-cache")]
-                    if let Some(miss) = ctx.cache_miss.as_mut() {
-                        miss.encode = Some(encode.clone());
-                    }
+                    // The site's `encode`, for a proxied answer kept by `cache` (src/proxy.rs).
+                    ctx.encode = Some(encode.clone());
                     let accept = ctx.accept_encoding();
                     if let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) {
                         let head = ctx.req.method == http::Method::HEAD;
@@ -992,10 +989,7 @@ impl Handler {
                 ctx.respond(response)
             }
             Handler::Encode(encode) => {
-                #[cfg(feature = "proxy-cache")]
-                if let Some(miss) = ctx.cache_miss.as_mut() {
-                    miss.encode = Some(encode.clone());
-                }
+                ctx.encode = Some(encode.clone());
                 let accept = ctx.accept_encoding();
                 let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) else {
                     return next.run(ctx).await;

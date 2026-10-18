@@ -20,8 +20,8 @@
 //! request as it goes to that upstream, before anything is sent.
 
 use crate::body::{Body, boxed};
-use crate::guard::{BodyStalled, BodyTooLarge, Place};
 use crate::extensions::UpstreamCheck;
+use crate::guard::{BodyStalled, BodyTooLarge, Place};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use http::header::{CONNECTION, HOST, UPGRADE};
 use http::uri::{Authority, Scheme};
@@ -167,7 +167,12 @@ impl ReverseProxy {
         if let Some(hooks) = ctx.upstream_hooks.take() {
             let body = ctx.body.take().unwrap_or_else(crate::body::empty);
             match hooks
-                .check(&mut ctx.req, body, crate::extensions::Client { ip: ctx.client_ip }, &self.upstreams)
+                .check(
+                    &mut ctx.req,
+                    body,
+                    crate::extensions::Client { ip: ctx.client_ip },
+                    &self.upstreams,
+                )
                 .await
             {
                 Ok(body) => ctx.body = Some(body),
@@ -185,7 +190,12 @@ impl ReverseProxy {
         let slot: Slot = None;
         // A `cache` the request passed: the response may be kept (src/cache.rs).
         #[cfg(feature = "proxy-cache")]
-        let mut miss = ctx.cache_miss.take();
+        let mut miss = ctx.req.extensions.remove::<crate::cache::PendingMiss>().map(|m| m.0);
+        #[cfg(feature = "proxy-cache")]
+        if let Some(miss) = miss.as_mut() {
+            // The site's `encode` the request passed: what a kept answer is compressed with.
+            miss.encode = ctx.encode.clone();
+        }
         #[cfg(feature = "proxy-cache")]
         if let Some(miss) = miss.as_mut()
             && ctx.req.extensions.get::<crate::handler::Credentialed>().is_some()

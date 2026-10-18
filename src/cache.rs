@@ -114,6 +114,16 @@ pub struct Cache {
     settings: Arc<Settings>,
 }
 
+/// A `Miss` on the request (`http::Extensions`), from the `cache` directive to the `reverse_proxy`
+/// that takes it; `Clone` is required of extensions, never used (a miss is taken, not copied).
+pub struct PendingMiss(pub Box<Miss>);
+
+impl Clone for PendingMiss {
+    fn clone(&self) -> Self {
+        unreachable!("a pending cache miss is taken by the proxy, never cloned")
+    }
+}
+
 /// A request the cache did not answer, on its way to `reverse_proxy` (src/proxy.rs `tee`).
 pub struct Miss {
     key: Key,
@@ -363,7 +373,7 @@ impl Cache {
             return Some(ctx.status(StatusCode::GATEWAY_TIMEOUT));
         }
         let store = method == Method::GET && !asked.no_store;
-        ctx.cache_miss = Some(Box::new(Miss {
+        ctx.req.extensions.insert(PendingMiss(Box::new(Miss {
             key: Key {
                 hash,
                 https,
@@ -376,7 +386,7 @@ impl Cache {
             credentialed: ctx.req.extensions.get::<crate::handler::Credentialed>().is_some(),
             encode: None,
             fallback,
-        }));
+        })));
         None
     }
 }
@@ -389,7 +399,12 @@ async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
     let body = ctx.body.take().unwrap_or_else(crate::body::empty);
     let client_ip = ctx.client_ip;
     match hooks
-        .check(&mut ctx.req, body, crate::extensions::Client { ip: client_ip }, &entry.fetch.proxy.upstreams)
+        .check(
+            &mut ctx.req,
+            body,
+            crate::extensions::Client { ip: client_ip },
+            &entry.fetch.proxy.upstreams,
+        )
         .await
     {
         Ok(body) => {

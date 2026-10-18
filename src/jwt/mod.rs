@@ -819,7 +819,8 @@ impl crate::extensions::RequestCheck for JwtAuth {
         client: crate::extensions::Client,
     ) -> crate::extensions::Checked {
         if !self.hidden_params.is_empty() {
-            req.extensions.insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
+            req.extensions
+                .insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
         }
         JwtAuth::check(self, req, client.ip).await.map(|()| body)
     }
@@ -834,7 +835,8 @@ impl crate::extensions::UpstreamCheck for JwtAuth {
         upstreams: &[Authority],
     ) -> crate::extensions::Checked {
         if !self.hidden_params.is_empty() && req.extensions.get::<crate::eventlog::HiddenParams>().is_none() {
-            req.extensions.insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
+            req.extensions
+                .insert(crate::eventlog::HiddenParams(self.hidden_params.clone()));
         }
         self.check_upstream(req, client.ip, upstreams).await.map(|()| body)
     }

@@ -29,12 +29,8 @@ pub type Checked = std::result::Result<Body, Response<Body>>;
 
 /// Before the site's routes and ready answers: refuse, or let through (perhaps changed).
 pub trait RequestCheck: Send + Sync {
-    fn check(
-        &self,
-        req: &mut http::request::Parts,
-        body: Body,
-        client: Client,
-    ) -> impl Future<Output = Checked> + Send;
+    fn check(&self, req: &mut http::request::Parts, body: Body, client: Client)
+    -> impl Future<Output = Checked> + Send;
 }
 
 /// At a `reverse_proxy` (and a `cache` hit), on the request as it goes to one of `upstreams`.
@@ -213,7 +209,6 @@ impl Hooks {
     }
 }
 
-
 /// The checks of `config` in their slots (cheap: `Arc`s cloned, `()` where a feature is off).
 fn compose(config: &Config) -> (Jwt, (ApiFirewall, ())) {
     let _ = config;
@@ -277,7 +272,11 @@ mod tests {
     async fn hooks_compose_in_order_and_stop_at_a_refusal() {
         let (mut parts, ()) = http::Request::get("/").body(()).unwrap().into_parts();
         let empty: ((), ((), ())) = ((), ((), ()));
-        assert!(RequestCheck::check(&empty, &mut parts, crate::body::empty(), client()).await.is_ok());
+        assert!(
+            RequestCheck::check(&empty, &mut parts, crate::body::empty(), client())
+                .await
+                .is_ok()
+        );
 
         let pass_then_refuse = (Some(counting(false)), (counting(true), (counting(false), ())));
         let refused = RequestCheck::check(&pass_then_refuse, &mut parts, crate::body::empty(), client())
@@ -286,10 +285,18 @@ mod tests {
         assert_eq!(refused.status(), http::StatusCode::FORBIDDEN);
         assert_eq!(pass_then_refuse.0.as_ref().unwrap().calls.load(Ordering::Relaxed), 1);
         assert_eq!((pass_then_refuse.1).0.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(((pass_then_refuse.1).1).0.calls.load(Ordering::Relaxed), 0, "not reached");
+        assert_eq!(
+            ((pass_then_refuse.1).1).0.calls.load(Ordering::Relaxed),
+            0,
+            "not reached"
+        );
 
         let unconfigured: Option<Counting> = None;
-        assert!(RequestCheck::check(&unconfigured, &mut parts, crate::body::empty(), client()).await.is_ok());
+        assert!(
+            RequestCheck::check(&unconfigured, &mut parts, crate::body::empty(), client())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

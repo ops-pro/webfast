@@ -93,20 +93,15 @@ async fn run(
     // As the JWT check before it would leave them.
     parts
         .extensions
-        .insert(crate::eventlog::HiddenParams(std::sync::Arc::from(vec!["access_token".to_string()])));
+        .insert(crate::eventlog::HiddenParams(std::sync::Arc::from(vec![
+            "access_token".to_string(),
+        ])));
     let body = if body.is_empty() {
         crate::body::empty()
     } else {
         crate::body::full(body.to_string())
     };
-    match fw
-        .check(
-            &mut parts,
-            body,
-            "203.0.113.7".parse().unwrap(),
-        )
-        .await
-    {
+    match fw.check(&mut parts, body, "203.0.113.7".parse().unwrap()).await {
         Ok(body) => Ok(String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap()),
         Err(response) => Err((
             response.status().as_u16(),

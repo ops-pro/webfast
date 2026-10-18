@@ -332,7 +332,12 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
         (Way::Ready(response), crate::body::empty())
     } else if !internal {
-        match state.hooks.request.check(&mut parts, body, Client { ip: client_ip }).await {
+        match state
+            .hooks
+            .request
+            .check(&mut parts, body, Client { ip: client_ip })
+            .await
+        {
             Ok(body) => (way, body),
             Err(response) => (Way::Ready(response), crate::body::empty()),
         }
