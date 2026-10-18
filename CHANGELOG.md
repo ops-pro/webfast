@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Extensions (docs/extensions.md): the optional pieces plug into the core through hook traits
+  composed at compile time (`src/extensions.rs`), with nothing on the request path for a feature
+  that is off and a direct call for one that is on; one `Worker` and one `Budget`
+  (`src/background.rs`) for their background threads and bounded memory. No change in behaviour;
+  the chain benchmark and the allocations per request are the same.
 - Compressed variants: a compressible file without a `.br`, `.zst` or `.gz` sibling gets one made
   in the background when it is first asked for (cargo feature `compress-files`), at the highest
   level, then answered like a sibling (its own ETag, 304s, ranges, ready answers). Bounded by

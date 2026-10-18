@@ -253,19 +253,6 @@ enum Way {
 #[derive(Debug, Clone, Copy)]
 pub struct InternalRequest;
 
-/// Requests to this server's own routes, as a client on the loopback would make them.
-#[cfg(feature = "api-firewall")]
-fn local_fetch(state: Arc<ServerState>) -> crate::apifw::LocalFetch {
-    Arc::new(move |mut request: Request<Body>| {
-        let state = state.clone();
-        Box::pin(async move {
-            request.extensions_mut().insert(InternalRequest);
-            let conn = state.connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
-            handle(conn, request).await
-        })
-    })
-}
-
 /// Handles one request on any protocol.
 pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Response<Body> {
     let started = Instant::now();
@@ -648,30 +635,15 @@ pub async fn start(config: Config) -> Result<Running> {
         watcher: None,
     };
     crate::extensions::check_bindings(&config)?;
-    #[cfg(feature = "jwt")]
-    let jwt = config.jwt.clone();
-    #[cfg(feature = "api-firewall")]
-    let firewall = config.api_firewall.clone();
     let hooks = Hooks::new(&config);
-    #[cfg(feature = "jwt")]
-    if let Some(jwt) = &jwt {
-        jwt.start()?;
-    }
+    // What the extensions do once the server runs (src/extensions.rs): begun before the servers
+    // take the configuration, finished with their states.
+    let started = crate::extensions::Started::begin(&config)?;
     for server in config.servers {
         start_server(server, &mut running, hooks).await?;
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
-    // Specs given as a uri are read once the server runs (a path: through the first port's routes).
-    #[cfg(feature = "api-firewall")]
-    if let Some(firewall) = &firewall {
-        firewall.start(states.first().cloned().map(local_fetch))?;
-    }
-    // Compressed variants added or dropped: the ready answers of the sites reading their files.
-    #[cfg(feature = "compress-files")]
-    {
-        let states: Vec<std::sync::Weak<ServerState>> = states.iter().map(Arc::downgrade).collect();
-        crate::variants::on_change(Arc::new(move |changed| crate::watch::prepare_answers(&states, changed)));
-    }
+    started.finish(&states)?;
     running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
     running.stores = config.stores;
     Ok(running)

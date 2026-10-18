@@ -1,29 +1,30 @@
 # Extensions
 
-A design for how optional pieces of webfast plug into the core, so that the next one is written
+How the optional pieces of webfast plug into the core, so that the next one is written
 against a small, named set of hook points instead of edits scattered through the request path.
-Extensions stay cargo features: an extension that is not built costs nothing, not even a branch
-on the request path. This document says what exists today, what the target looks like, and how to
-get there without a rewrite.
+Extensions are cargo features: an extension that is not built costs nothing, not even a branch
+on the request path. This document says where it started, what the design is, and how the
+migration to it was done.
 
-## Today
+## Where it started
 
-Every extension gates its own module (`#[cfg(feature = …)] pub mod …` in `src/lib.rs`), reads its
-environment in a `configure_from_env`, and runs its background work on a thread of its own. Those
-are conventions; the ways they reach the request path are not:
+Before the migration (October 2026), every extension gated its own module
+(`#[cfg(feature = …)] pub mod …` in `src/lib.rs`), read its environment in a `configure_from_env`,
+and ran its background work on a thread of its own. Those were conventions; the ways they reached
+the request path were not:
 
-| Extension        | How it takes part                                                                                                                         |
+| Extension        | How it took part                                                                                                                          |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `rate-limit`     | a `Handler` variant made by the Caddyfile parser; a call inside `reverse_proxy` for the per-client slot                                    |
-| `proxy-cache`    | a `Handler` variant; a field on `Ctx` (`cache_miss`) the proxy takes; calls at three points of `reverse_proxy`                              |
+| `proxy-cache`    | a `Handler` variant; a field on `Ctx` (`cache_miss`) the proxy took; calls at three points of `reverse_proxy`                               |
 | `jwt`            | a field on `Checks` in `server.rs`, called before the routes; a call inside `reverse_proxy` (`check_upstream`) and inside `cache` on a hit |
 | `api-firewall`   | the same as `jwt`, with the body passed through; `local_fetch` and `InternalRequest` in `server.rs` for specs read from the server itself  |
-| `compress-files` | calls inside `file_server`; a callback the server installs so variants can redo ready answers                                             |
+| `compress-files` | calls inside `file_server`; a callback the server installed so variants could redo ready answers                                          |
 
-Some seventy `#[cfg]` sites in five core files. Each extension knows the core, and the core knows
-each extension by name: `Checks` has a field per check and `cfg`-paired branches in five methods,
-the proxy has a `Slot` type alias with a `cfg` on each arm, `Ctx` carries one extension's state as
-a named field. Adding an extension means finding each of those places again.
+Seventy-six `#[cfg]` sites in the core. Each extension knew the core, and the core knew each
+extension by name: `Checks` had a field per check and `cfg`-paired branches in five methods, the
+proxy a `Slot` type alias with a `cfg` on each arm, `Ctx` carried one extension's state as a named
+field. Adding an extension meant finding each of those places again.
 
 ## The target
 
@@ -146,12 +147,15 @@ pub fn request_checks(config: &Config) -> RequestChecks {
 let body = state.hooks.request.check(&mut parts, body, client).await?;
 ```
 
-`main.rs` keeps the environment the same way: one `extensions::configure_from_env()` that calls
-each extension's, and one list of the variables an unbuilt extension would have read, so that
-`WEB_PROXY_CACHE_MEMORY` on a build without `proxy-cache` still stops the start. Startup logging
-of what an extension loaded goes through one `Describe` trait (`fn describe(&self) -> String`,
-implemented for `()`, pairs and `Option` the same way), so `validate` and the `started` line print
-every extension alike.
+Startup goes through the same file. `extensions::configure_from_env()` reads each built
+extension's `WEB_*` variables and stops the start on a variable of one that is not built (so
+`WEB_PROXY_CACHE_MEMORY` on a build without `proxy-cache` is an error, as a misspelt variable
+would be). `extensions::load_checks(&mut config)` loads the files `WEB_JWT_CONFIG` and
+`WEB_API_FIREWALL_CONFIG` name and gives back one line per extension for the startup log and
+`validate`. `extensions::Started` does what runs once the server does: `begin` before the servers
+take the configuration (the JWT keys start being read), `finish` with the ports' states (API specs
+given as a path are read through the first port's routes; the variants get the callback that redoes
+ready answers). `server.rs` and `main.rs` call these four and name no extension.
 
 When a hook must be chosen at run time — extensions configured per site, say — the same traits
 take a `Vec<Arc<dyn …>>` behind an object-safe wrapper; nothing in the core needs that today, and
@@ -185,22 +189,40 @@ by name from `reverse_proxy`.
 
 ### Background work through one worker shape
 
-Three extensions run a thread: the cache's `web-cache`, the variants' `webfast-compress`, the
-JWKS and spec refreshers on the tokio runtime. They share a shape — a bounded queue, a job type,
-a drop counter, a periodic sweep, a summary line — and should share the code:
+Three extensions run a thread: the cache's `web-cache`, the variants' `webfast-compress`, the rate
+limit's `web-ratelimit`; the JWKS and spec refreshers run on the tokio runtime. The threads share
+a shape, and the code, in `src/background.rs`:
 
 ```rust
 pub struct Worker<J> { … }
 impl<J: Send + 'static> Worker<J> {
-    pub fn start(name: &'static str, queue: usize, nice: i32, run: impl FnMut(J) + Send + 'static) -> Worker<J>;
-    pub fn submit(&self, job: J) -> bool;   // false: the queue was full, counted
-    pub fn every(&self, period: Duration, tick: impl FnMut() + Send + 'static);
+    /// A thread `name` with a current-thread runtime: `run` on each job, `tick` every `every`
+    /// with the jobs not taken since the last; `nice` below the requests' threads (Linux).
+    pub fn start(name: &'static str, queue: usize, nice: i32, every: Duration, run: R, tick: T) -> Worker<J>;
+    /// A full queue (or a worker that could not start) gives the job back and counts it.
+    pub fn submit(&self, job: J) -> Result<(), J>;
 }
 ```
 
-The same for bounded memory with CLOCK eviction, which the cache and the variants each have a
-copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch`, `evict_to`,
-`sweep`, and the counters the summary line prints.
+Each is a `static WORKER: LazyLock<Worker<Job>>` in its module; the rate limit's has no jobs
+(`Worker<Infallible>`) and only ticks. The same for bounded memory with CLOCK eviction, which the
+cache and the variants each had a copy of:
+
+```rust
+pub struct Budget<K> { … }              // the order entries came in, and the sum of their sizes
+pub enum Seen { Gone, Marked, Evicted(usize) }
+impl<K> Budget<K> {
+    pub fn add(&mut self, key: K, size: usize);
+    pub fn release(&mut self, size: usize);  // removed by the owner (replaced, swept)
+    pub fn evict(&mut self, max: usize, look: impl FnMut(&K) -> Seen);  // the CLOCK pass
+    pub fn retain(&mut self, keep: impl FnMut(&K) -> bool);
+}
+```
+
+The budget keeps the order and the sum; the owner keeps the entries and their marks however its
+readers need them (the cache in sharded maps read lock-free of the budget, the variants under one
+`RwLock`), and answers for each entry when its turn comes. Nothing of either is on the request
+path but a `try_send` and an atomic mark.
 
 ### What stays as it is
 
@@ -234,7 +256,8 @@ copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch
 ## Writing an extension, then
 
 1. Add the feature in `Cargo.toml` and the gated module in `src/lib.rs`.
-2. Give the module a config type and `configure_from_env` / `load`, and a `describe`.
+2. Give the module a config type and `configure_from_env` / `load`; its startup line goes in
+   `load_checks`, its variables in `configure_from_env`.
 3. Implement the trait of each hook point it needs; put request-scoped state in a type of its own.
 4. Give it a slot in `src/extensions.rs`: its type alias with the `cfg` pair, its place in the
    tuple, its value in the constructor; name the environment variables it reads.
@@ -244,22 +267,28 @@ copy of today (`Store` and `Variants`): one `Budget<K, V>` with `insert`, `touch
 7. Docs: a section in `docs/configuration.md` or `docs/operations.md`, a row in the features table
    of `docs/overview.md`, a CHANGELOG line.
 
-## Getting there
+## How it was done
 
-In steps that each leave the tests green, roughly in this order:
+In five commits, each leaving the tests green and measured with `examples/bench.rs` before and
+after (release, the chain in process; with no extension built the numbers did not move, with
+every extension built they stayed within the run-to-run noise, and the allocations per request
+were the same at every step):
 
-1. `src/extensions.rs` with the traits, their `()` / pair / `Option` implementations, the
-   composed types and their constructors; `Checks` becomes `Hooks { request, upstream }`;
-   `Ctx::upstream_checks` becomes a reference to the upstream hooks. The behaviour is the same;
-   `server.rs` and `proxy.rs` lose their `jwt` / `api-firewall` branches.
-2. `Credentialed` and the cache miss move to `http::Extensions`; `Ctx::cache_miss` goes.
-3. The cache's three calls in `reverse_proxy` become one `ResponseObserver` and one
-   `RequestCheck`-shaped hit check; the rate limit's upstream slot becomes an `UpstreamCheck`
-   whose body is a guard dropped with the response.
-4. `Worker` and `Budget`, with the cache and the variants moved onto them.
-5. `Describe` and one `configure_from_env` in `main.rs`.
+1. `src/extensions.rs` with `RequestCheck` and `UpstreamCheck`, composed as types; `Checks`
+   became `Hooks`. The API firewall stopped knowing the JWT module: the query parameters the
+   event log hides are left on the request by the JWT check (`eventlog::HiddenParams`).
+2. The cache miss became a typed request extension (`cache::PendingMiss`); `Ctx::cache_miss`
+   went. The site's `encode` a request passed is a plain field on `Ctx` (a core directive): a
+   first try through `http::Extensions` cost three allocations per request and was taken back.
+3. `ProxyObserver` (the cache in the proxy), `Representation` (the variants in `file_server`), and
+   the rate limit's slot as an `UpstreamCheck` with a `Held` guard; hooks `&'static`, one per
+   process, so a request copies a pointer and touches no `Arc`.
+4. `Worker` and `Budget`, with the three threads and the two evictions moved onto them.
+5. `configure_from_env`, `load_checks` and `Started` in `extensions.rs`; `server.rs` and
+   `main.rs` lost their last extension branches.
 
-Each step is a commit of its own, measured with `examples/bench.rs` before and after: with no
-extension built the numbers must not move; with the checks configured, by at most a percent. The
-`cfg` count in the core goes down with each step; the end state is `cfg` in `extensions.rs`,
-`config.rs` (directive arms), `lib.rs` and `main.rs` only.
+`#[cfg]` sites in the core went from 76 to 24: the Caddyfile parser's directive arms and the two
+fields on `Config` (`config.rs`, 13), the `Handler` variants of the two directives and their
+dispatch (`handler.rs`, 7, and `memo.rs`, 2), one proxy method only the cache calls, the module
+list in `lib.rs` and the allocator in `main.rs`. `extensions.rs` holds the rest (43), which is the
+point.

@@ -515,6 +515,155 @@ pub fn check_bindings(config: &Config) -> Result<()> {
     within(&bound, &config.upstreams())
 }
 
+
+// Startup: the environment, the files, and what runs once the server does.
+
+/// The extensions' environment (WEB_*), read before the configuration: each built extension's
+/// own, and a variable of one that is not built stops the start, as a misspelt one would.
+pub fn configure_from_env() -> std::result::Result<(), String> {
+    #[cfg(feature = "rate-limit")]
+    crate::ratelimit::configure_from_env()?;
+    #[cfg(not(feature = "rate-limit"))]
+    unbuilt(
+        "rate limits",
+        "rate-limit",
+        &["WEB_RATE_LIMIT_KEYS", "WEB_RATE_LIMIT_DRY_RUN", "WEB_MAX_UPSTREAM_REQUESTS_PER_IP"],
+    )?;
+    #[cfg(feature = "proxy-cache")]
+    crate::cache::configure_from_env()?;
+    #[cfg(not(feature = "proxy-cache"))]
+    unbuilt("the proxy cache", "proxy-cache", &["WEB_PROXY_CACHE_MEMORY"])?;
+    #[cfg(feature = "compress-files")]
+    crate::variants::configure_from_env()?;
+    #[cfg(not(feature = "compress-files"))]
+    unbuilt("compressed variants", "compress-files", &["WEB_COMPRESSED_FILES_MEMORY"])?;
+    #[cfg(not(feature = "jwt"))]
+    unbuilt("JWT validation", "jwt", &["WEB_JWT_CONFIG"])?;
+    #[cfg(not(feature = "api-firewall"))]
+    unbuilt("the API firewall", "api-firewall", &["WEB_API_FIREWALL_CONFIG"])?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn unbuilt(what: &str, feature: &str, variables: &[&str]) -> std::result::Result<(), String> {
+    match variables.iter().find(|name| std::env::var_os(name).is_some()) {
+        Some(name) => Err(format!("{name}: this webfast was built without {what} (cargo feature {feature})")),
+        None => Ok(()),
+    }
+}
+
+/// The request checks the environment names (WEB_JWT_CONFIG, WEB_API_FIREWALL_CONFIG), loaded
+/// into `config`; what was loaded, one line each, for the startup log and `validate`.
+pub fn load_checks(config: &mut Config) -> std::result::Result<Vec<String>, String> {
+    let _ = &config;
+    #[allow(unused_mut)]
+    let mut loaded = Vec::new();
+    #[allow(unused_variables)]
+    let file = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    #[cfg(feature = "jwt")]
+    if let Some(path) = file("WEB_JWT_CONFIG") {
+        let jwt = crate::jwt::JwtAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        let (providers, rules) = jwt.counts();
+        let bound = bound_to(jwt.upstreams());
+        loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s){bound}"));
+        config.jwt = Some(Arc::new(jwt));
+    }
+    #[cfg(feature = "api-firewall")]
+    if let Some(path) = file("WEB_API_FIREWALL_CONFIG") {
+        let firewall = crate::apifw::ApiFirewall::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        let (apis, operations, later) = firewall.counts();
+        let later = if later > 0 {
+            format!(", {later} spec(s) read once the server runs")
+        } else {
+            String::new()
+        };
+        loaded.push(format!(
+            "API firewall: {path}, {apis} API(s), {operations} operation(s){later}{}",
+            bound_to(firewall.upstreams())
+        ));
+        config.api_firewall = Some(Arc::new(firewall));
+    }
+    check_bindings(config).map_err(|e| format!("{e:#}"))?;
+    Ok(loaded)
+}
+
+/// ", checked at the proxies to a:80, b:8787" for the upstreams a check is bound to; "": none.
+#[allow(dead_code)]
+fn bound_to<'a>(upstreams: impl Iterator<Item = &'a Authority>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for upstream in upstreams {
+        if !names.iter().any(|n| n == upstream.as_str()) {
+            names.push(upstream.to_string());
+        }
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(", checked at the proxies to {}", names.join(", "))
+    }
+}
+
+/// What the extensions do once the server runs: `begin` before the servers take the
+/// configuration (the JWT keys start being read), `finish` with the ports' states (API specs
+/// given as a path are read through the first port's routes; compressed variants redo the ready
+/// answers of the sites reading their files).
+pub struct Started {
+    #[cfg(feature = "jwt")]
+    jwt: Option<Arc<crate::jwt::JwtAuth>>,
+    #[cfg(feature = "api-firewall")]
+    firewall: Option<Arc<crate::apifw::ApiFirewall>>,
+}
+
+impl Started {
+    pub fn begin(config: &Config) -> Result<Started> {
+        let _ = config;
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &config.jwt {
+            jwt.start()?;
+        }
+        Ok(Started {
+            #[cfg(feature = "jwt")]
+            jwt: config.jwt.clone(),
+            #[cfg(feature = "api-firewall")]
+            firewall: config.api_firewall.clone(),
+        })
+    }
+
+    pub fn finish(self, states: &[Arc<crate::server::ServerState>]) -> Result<()> {
+        let _ = states;
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.firewall {
+            firewall.start(states.first().cloned().map(local_fetch))?;
+        }
+        #[cfg(feature = "compress-files")]
+        {
+            let states: Vec<std::sync::Weak<crate::server::ServerState>> = states.iter().map(Arc::downgrade).collect();
+            crate::variants::on_change(Arc::new(move |changed| crate::watch::prepare_answers(&states, changed)));
+        }
+        #[cfg(feature = "jwt")]
+        let _ = &self.jwt;
+        Ok(())
+    }
+}
+
+/// Requests to this server's own routes, as a client on the loopback would make them, marked so
+/// that the Host check and the request checks pass them by (src/server.rs `InternalRequest`).
+#[cfg(feature = "api-firewall")]
+fn local_fetch(state: Arc<crate::server::ServerState>) -> crate::apifw::LocalFetch {
+    Arc::new(move |mut request: http::Request<Body>| {
+        let state = state.clone();
+        Box::pin(async move {
+            request.extensions_mut().insert(crate::server::InternalRequest);
+            let conn = state.connection(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
+            crate::server::handle(conn, request).await
+        })
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

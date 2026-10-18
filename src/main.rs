@@ -129,43 +129,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    #[cfg(feature = "rate-limit")]
-    if let Err(e) = webfast::ratelimit::configure_from_env() {
+    if let Err(e) = webfast::extensions::configure_from_env() {
         eprintln!("{e}");
-        return ExitCode::from(2);
-    }
-    #[cfg(feature = "proxy-cache")]
-    if let Err(e) = webfast::cache::configure_from_env() {
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
-    #[cfg(feature = "compress-files")]
-    if let Err(e) = webfast::variants::configure_from_env() {
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
-    #[cfg(not(feature = "compress-files"))]
-    if std::env::var_os("WEB_COMPRESSED_FILES_MEMORY").is_some() {
-        eprintln!(
-            "WEB_COMPRESSED_FILES_MEMORY: this webfast was built without compressed variants (cargo feature compress-files)"
-        );
-        return ExitCode::from(2);
-    }
-    #[cfg(not(feature = "proxy-cache"))]
-    if std::env::var_os("WEB_PROXY_CACHE_MEMORY").is_some() {
-        eprintln!("WEB_PROXY_CACHE_MEMORY: this webfast was built without the proxy cache (cargo feature proxy-cache)");
-        return ExitCode::from(2);
-    }
-    #[cfg(not(feature = "rate-limit"))]
-    if let Some(name) = [
-        "WEB_RATE_LIMIT_KEYS",
-        "WEB_RATE_LIMIT_DRY_RUN",
-        "WEB_MAX_UPSTREAM_REQUESTS_PER_IP",
-    ]
-    .into_iter()
-    .find(|name| std::env::var_os(name).is_some())
-    {
-        eprintln!("{name}: this webfast was built without rate limits (cargo feature rate-limit)");
         return ExitCode::from(2);
     }
     let max_in_memory = match webfast::files::max_file_in_memory_from_env() {
@@ -249,70 +214,11 @@ fn main() -> ExitCode {
 /// The request checks the environment names: WEB_JWT_CONFIG (src/jwt) and
 /// WEB_API_FIREWALL_CONFIG (src/apifw), each a YAML file; what was loaded, one line each.
 fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
-    let _ = &config;
-    #[allow(unused_mut)]
-    let mut loaded = Vec::new();
-    let file = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    if let Some(path) = file("WEB_JWT_CONFIG") {
-        #[cfg(feature = "jwt")]
-        {
-            let jwt = webfast::jwt::JwtAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
-            let (providers, rules) = jwt.counts();
-            let bound = bound_upstreams(jwt.upstreams());
-            loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s){bound}"));
-            config.jwt = Some(std::sync::Arc::new(jwt));
-        }
-        #[cfg(not(feature = "jwt"))]
-        return Err(format!("WEB_JWT_CONFIG={path}: this build has no `jwt` feature"));
-    }
-    if let Some(path) = file("WEB_API_FIREWALL_CONFIG") {
-        #[cfg(feature = "api-firewall")]
-        {
-            let firewall =
-                webfast::apifw::ApiFirewall::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
-            let (apis, operations, later) = firewall.counts();
-            let later = if later > 0 {
-                format!(", {later} spec(s) read once the server runs")
-            } else {
-                String::new()
-            };
-            loaded.push(format!(
-                "API firewall: {path}, {apis} API(s), {operations} operation(s){later}{}",
-                bound_upstreams(firewall.upstreams())
-            ));
-            config.api_firewall = Some(std::sync::Arc::new(firewall));
-        }
-        #[cfg(not(feature = "api-firewall"))]
-        return Err(format!(
-            "WEB_API_FIREWALL_CONFIG={path}: this build has no `api-firewall` feature"
-        ));
-    }
-    webfast::extensions::check_bindings(config).map_err(|e| format!("{e:#}"))?;
+    let loaded = webfast::extensions::load_checks(config)?;
     for line in &loaded {
         tracing::info!("request checks: {line}");
     }
     Ok(loaded)
-}
-
-/// ", checked at the proxies to a:80, b:8787" for the upstreams checks are bound to; "": none.
-#[cfg(any(feature = "jwt", feature = "api-firewall"))]
-fn bound_upstreams<'a>(upstreams: impl Iterator<Item = &'a http::uri::Authority>) -> String {
-    let mut names: Vec<String> = Vec::new();
-    for upstream in upstreams {
-        if !names.iter().any(|n| n == upstream.as_str()) {
-            names.push(upstream.to_string());
-        }
-    }
-    if names.is_empty() {
-        String::new()
-    } else {
-        format!(", checked at the proxies to {}", names.join(", "))
-    }
 }
 
 /// WEB_WORKERS: how many threads serve connections (`auto` or unset: one per CPU).
