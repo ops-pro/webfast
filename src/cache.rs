@@ -121,6 +121,8 @@ pub struct Miss {
     store: bool,
     /// The client asked for the upstream's answer (no-cache, max-age): `Cache-Status: fwd=request`.
     forced: bool,
+    /// Its credentials were checked here (src/handler.rs `Credentialed`): kept only when shared.
+    pub(crate) credentialed: bool,
     /// The site's `encode` on the way to the proxy (src/handler.rs sets it): which encodings to
     /// keep, in its order.
     pub encode: Option<Arc<Encode>>,
@@ -296,11 +298,13 @@ impl Cache {
 
     /// The directive's step: `Some` answers from the cache; `None` lets the request go on, marked
     /// for the proxy when its response may be kept.
-    pub fn check(&self, ctx: &mut Ctx) -> Option<Response<Body>> {
+    pub async fn check(&self, ctx: &mut Ctx) -> Option<Response<Body>> {
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() || MAX_MEMORY.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        let uri = ctx.req.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        // A cheap copy (shared bytes): the checks on a hit borrow the request mutably.
+        let path_and_query = ctx.req.uri.path_and_query().cloned();
+        let uri = path_and_query.as_ref().map_or("/", |pq| pq.as_str());
         if self.settings.exclude.as_ref().is_some_and(|re| re.is_match(uri)) {
             return None;
         }
@@ -337,6 +341,12 @@ impl Cache {
                 forced = true;
             }
             let fresh = entry.freshness.fresh;
+            if !forced
+                && age < fresh + entry.freshness.while_revalidating
+                && let Some(refusal) = refused(ctx, &entry).await
+            {
+                return Some(refusal);
+            }
             if !forced && age < fresh {
                 return Some(entry.answer(ctx, now, None));
             }
@@ -362,10 +372,30 @@ impl Cache {
             settings: self.settings.clone(),
             store,
             forced,
+            credentialed: ctx.req.extensions.get::<crate::handler::Credentialed>().is_some(),
             encode: None,
             fallback,
         }));
         None
+    }
+}
+
+/// The request checks bound to the upstream a stored response came from (src/jwt, src/apifw:
+/// `upstreams`): a stored answer goes only to a request that would have passed them on its way
+/// there. `Some`: the refusal to answer with.
+async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
+    let checks = ctx.upstream_checks.clone()?;
+    let body = ctx.body.take().unwrap_or_else(crate::body::empty);
+    let client_ip = ctx.client_ip;
+    match checks
+        .check_upstream(&mut ctx.req, body, client_ip, &entry.fetch.proxy.upstreams)
+        .await
+    {
+        Ok(body) => {
+            ctx.body = Some(body);
+            None
+        }
+        Err(response) => Some(ctx.respond(response)),
     }
 }
 
@@ -386,7 +416,13 @@ impl Miss {
         {
             parts.headers.insert(CACHE_CONTROL, value.clone());
         }
-        let decided = if self.store {
+        // A request whose credentials were checked here, its token perhaps taken off before the
+        // upstream: kept only when the response says it may be shared (RFC 9111 §3.5).
+        let shared = || {
+            let cc = Directives::of(&parts.headers);
+            cc.public || cc.s_maxage.is_some() || cc.must_revalidate
+        };
+        let decided = if self.store && (!self.credentialed || shared()) {
             storable(parts.status, &parts.headers, sent, &self.settings)
         } else {
             None
@@ -1168,6 +1204,8 @@ async fn revalidate(entry: Arc<Entry>) {
                     settings: entry.settings.clone(),
                     store: true,
                     forced: false,
+                    // Stored before as shared, or the request had no credentials.
+                    credentialed: false,
                     encode: entry.encode.clone(),
                     fallback: None,
                 }),

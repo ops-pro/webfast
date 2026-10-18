@@ -32,6 +32,12 @@ use std::sync::Arc;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Marks a request whose credentials were checked here (src/jwt): a cache keeps the response to
+/// it only when the response says it may be shared, as for a request with Authorization (the
+/// token may have been taken off before the upstream).
+#[derive(Debug, Clone, Copy)]
+pub struct Credentialed;
+
 /// What the connection tells about a request.
 #[derive(Debug)]
 pub struct ConnInfo {
@@ -139,6 +145,9 @@ pub struct Ctx {
     /// A `cache` the request passed without an answer: for the proxy, which keeps its response.
     #[cfg(feature = "proxy-cache")]
     pub cache_miss: Option<Box<crate::cache::Miss>>,
+    /// Request checks bound to upstreams (src/jwt, src/apifw), for the proxy to run before it
+    /// sends the request on; `None`: there are none, or the server asks itself.
+    pub(crate) upstream_checks: Option<Arc<crate::server::Checks>>,
 }
 
 /// A change to the response recorded on the way down the chain.
@@ -200,6 +209,7 @@ impl Ctx {
             error: None,
             #[cfg(feature = "proxy-cache")]
             cache_miss: None,
+            upstream_checks: None,
         }
     }
 
@@ -823,7 +833,7 @@ impl Next {
                     }
                 },
                 #[cfg(feature = "proxy-cache")]
-                Handler::Cache(cache) => match cache.check(&mut ctx) {
+                Handler::Cache(cache) => match cache.check(&mut ctx).await {
                     None => continue,
                     Some(response) => {
                         let hooks = std::mem::take(&mut ctx.hooks);
@@ -1052,7 +1062,7 @@ impl Handler {
                 Some((zone, wait)) => ctx.fail_rate_limited(zone, wait),
             },
             #[cfg(feature = "proxy-cache")]
-            Handler::Cache(cache) => match cache.check(&mut ctx) {
+            Handler::Cache(cache) => match cache.check(&mut ctx).await {
                 None => next.run(ctx).await,
                 Some(response) => response,
             },

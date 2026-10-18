@@ -95,7 +95,15 @@ async fn run(
     } else {
         crate::body::full(body.to_string())
     };
-    match fw.check(&mut parts, body).await {
+    match fw
+        .check(
+            &mut parts,
+            body,
+            "203.0.113.7".parse().unwrap(),
+            &["access_token".to_string()],
+        )
+        .await
+    {
         Ok(body) => Ok(String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap()),
         Err(response) => Err((
             response.status().as_u16(),
@@ -486,7 +494,10 @@ async fn timings() {
         }
         let total = started.elapsed() / rounds;
         // The same request without the firewall: building it and collecting its body.
-        let none = ApiFirewall { apis: Vec::new() };
+        let none = ApiFirewall {
+            apis: Vec::new(),
+            log: EventLog::new("api-firewall", None, Path::new(".")),
+        };
         let started = std::time::Instant::now();
         for _ in 0..rounds {
             let _ = run(&none, method, uri, &headers, body).await;
@@ -497,4 +508,283 @@ async fn timings() {
             total.saturating_sub(baseline)
         );
     }
+}
+
+/// A spec with the operations `GET /<name>` for each name.
+fn small_spec(names: &[&str]) -> String {
+    let mut text = "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths:\n".to_string();
+    for name in names {
+        text.push_str(&format!(
+            "  /{name}:\n    get:\n      responses: {{'200': {{description: ok}}}}\n"
+        ));
+    }
+    text
+}
+
+/// The server's own routes as the spec source sees them: the spec in `text` with an ETag (a 304
+/// for a matching If-None-Match), or only the status when it is not 200. `answers` counts the 200s
+/// and the 304s.
+fn served(text: Arc<Mutex<(String, u16)>>, answers: Arc<Mutex<(u32, u32)>>) -> LocalFetch {
+    Arc::new(move |request: http::Request<Body>| {
+        let (text, status) = text.lock().unwrap().clone();
+        let answers = answers.clone();
+        Box::pin(async move {
+            let etag = format!("\"{}\"", &blake3::hash(text.as_bytes()).to_hex()[..16]);
+            let mut response = http::Response::new(crate::body::empty());
+            if status != 200 {
+                *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                return response;
+            }
+            if request
+                .headers()
+                .get(http::header::IF_NONE_MATCH)
+                .is_some_and(|v| v == etag.as_str())
+            {
+                answers.lock().unwrap().1 += 1;
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+            } else {
+                answers.lock().unwrap().0 += 1;
+                *response.body_mut() = crate::body::full(text);
+            }
+            response
+                .headers_mut()
+                .insert(http::header::ETAG, HeaderValue::from_str(&etag).unwrap());
+            response
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_spec_from_the_servers_own_routes_is_kept_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "apis:\n  - spec: {uri: /openapi.yaml, refresh: 1h}\n    base_path: /api\n    reason_header: true\n";
+    let fw = ApiFirewall::from_yaml(yaml, dir.path()).unwrap();
+    assert_eq!(fw.counts(), (1, 0, 1));
+    assert_eq!(
+        run(&fw, "GET", "/api/a", &[], "").await,
+        Err((503, "spec:unavailable".into())),
+        "no spec yet"
+    );
+    assert!(
+        run(&fw, "GET", "/elsewhere", &[], "").await.is_ok(),
+        "the rest of the site is not held up"
+    );
+
+    let text = Arc::new(Mutex::new((small_spec(&["a"]), 200)));
+    let answers = Arc::new(Mutex::new((0, 0)));
+    let local = served(text.clone(), answers.clone());
+    assert!(fw.look_now(Some(&local)).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/a", &[], "").await.is_ok());
+    assert_eq!(run(&fw, "GET", "/api/b", &[], "").await.unwrap_err().0, 403);
+
+    // Unchanged: a 304, nothing read or compiled again.
+    assert!(fw.look_now(Some(&local)).await[0].is_ok());
+    assert_eq!(*answers.lock().unwrap(), (1, 1));
+    // Changed: the new spec replaces the old one.
+    text.lock().unwrap().0 = small_spec(&["a", "b"]);
+    assert!(fw.look_now(Some(&local)).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/b", &[], "").await.is_ok());
+    // A failing source, or a spec that does not compile, leaves the last one in place.
+    *text.lock().unwrap() = (String::new(), 500);
+    assert!(fw.look_now(Some(&local)).await[0].is_err());
+    *text.lock().unwrap() = ("openapi: 9.9.9\n".into(), 200);
+    assert!(fw.look_now(Some(&local)).await[0].is_err());
+    assert!(
+        run(&fw, "GET", "/api/b", &[], "").await.is_ok(),
+        "the last good spec holds"
+    );
+
+    let log_only = ApiFirewall::from_yaml(&yaml.replace("reason_header: true", "mode: log_only"), dir.path()).unwrap();
+    assert!(
+        run(&log_only, "GET", "/api/a", &[], "").await.is_ok(),
+        "log_only: no spec, let through"
+    );
+}
+
+#[tokio::test]
+async fn a_spec_not_read_again_within_its_ttl_stops_holding() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "apis:\n  - spec: {uri: /openapi.yaml, refresh: 1h, ttl: 200ms}\n    base_path: /api\n";
+    let fw = ApiFirewall::from_yaml(yaml, dir.path()).unwrap();
+    let text = Arc::new(Mutex::new((small_spec(&["a"]), 200)));
+    let local = served(text.clone(), Arc::new(Mutex::new((0, 0))));
+    assert!(fw.look_now(Some(&local)).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/a", &[], "").await.is_ok());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        run(&fw, "GET", "/api/a", &[], "").await.unwrap_err().0,
+        503,
+        "past its ttl"
+    );
+    // A successful look, here a 304, makes it hold again.
+    assert!(fw.look_now(Some(&local)).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/a", &[], "").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_spec_file_is_read_again_when_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("openapi.yaml"), small_spec(&["a"])).unwrap();
+    let yaml = "apis:\n  - spec: {file: openapi.yaml, refresh: 1h}\n    base_path: /api\n";
+    let fw = ApiFirewall::from_yaml(yaml, dir.path()).unwrap();
+    assert_eq!(fw.counts(), (1, 1, 0), "read at startup");
+    assert!(run(&fw, "GET", "/api/a", &[], "").await.is_ok());
+    assert!(fw.look_now(None).await[0].is_ok(), "unchanged");
+    std::fs::write(dir.path().join("openapi.yaml"), small_spec(&["a", "bb"])).unwrap();
+    assert!(fw.look_now(None).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/bb", &[], "").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_spec_from_a_url_is_fetched_with_its_headers() {
+    let spec = small_spec(&["a"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let spec = spec.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                    let ok = req.headers().get("authorization").is_some_and(|v| v == "Bearer t0ken");
+                    let body = if ok { spec.clone() } else { String::new() };
+                    async move {
+                        let mut response = http::Response::new(http_body_util::Full::new(Bytes::from(body)));
+                        if !ok {
+                            *response.status_mut() = StatusCode::UNAUTHORIZED;
+                        }
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    // SAFETY: no other test reads or writes these variables.
+    unsafe {
+        std::env::set_var("WEB_SERVER_TEST_APIFW_TOKEN", "t0ken");
+        std::env::set_var("WEB_SERVER_TEST_APIFW_WRONG", "nope");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = |var: &str| {
+        format!(
+            "apis:\n  - spec:\n      uri: http://{address}/spec\n      headers: {{Authorization: 'Bearer ${{{var}}}'}}\n    base_path: /api\n"
+        )
+    };
+    let fw = ApiFirewall::from_yaml(&yaml("WEB_SERVER_TEST_APIFW_TOKEN"), dir.path()).unwrap();
+    assert!(fw.look_now(None).await[0].is_ok());
+    assert!(run(&fw, "GET", "/api/a", &[], "").await.is_ok());
+    let wrong = ApiFirewall::from_yaml(&yaml("WEB_SERVER_TEST_APIFW_WRONG"), dir.path()).unwrap();
+    let err = format!("{:#}", wrong.look_now(None).await.remove(0).unwrap_err());
+    assert!(err.contains("401"), "{err}");
+}
+
+#[tokio::test]
+async fn violations_are_written_to_the_firewalls_own_log() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("openapi.yaml"), small_spec(&["a"])).unwrap();
+    let yaml = "log: {output: firewall.log}\napis:\n  - spec: openapi.yaml\n    base_path: /api\n    endpoints: [{path: /a, mode: log_only}]\n";
+    let fw = ApiFirewall::from_yaml(yaml, dir.path()).unwrap();
+    assert!(run(&fw, "GET", "/api/a?x=1", &[], "").await.is_ok(), "log_only for /a");
+    assert_eq!(
+        run(&fw, "GET", "/api/zzz?access_token=s3cret", &[], "")
+            .await
+            .unwrap_err()
+            .0,
+        403
+    );
+    crate::accesslog::flush_all(Duration::from_secs(2));
+    let text = std::fs::read_to_string(dir.path().join("firewall.log")).unwrap();
+    let events: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let seen: Vec<(&str, &str, u64)> = events
+        .iter()
+        .map(|e| {
+            (
+                e["msg"].as_str().unwrap(),
+                e["reason"].as_str().unwrap(),
+                e["status"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("request let through (log_only)", "request-parameter:query:x", 403),
+            ("request refused", "request:unknown-operation", 403),
+        ]
+    );
+    assert_eq!(events[0]["logger"], "api-firewall");
+    assert_eq!(events[0]["request"]["client_ip"], "203.0.113.7");
+    assert_eq!(
+        events[1]["request"]["uri"], "/api/zzz?access_token=REDACTED",
+        "the JWT module's parameter"
+    );
+}
+
+#[test]
+fn schema_errors_name_the_place_and_keyword_not_the_value() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"password": {"type": "string", "minLength": 12}},
+        "additionalProperties": false
+    });
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let short = serde_json::json!({"password": "hunter2"});
+    assert_eq!(
+        schema_error(&validator.validate(&short).unwrap_err()),
+        "/password: minLength"
+    );
+    let extra = serde_json::json!({"password": "correct horse battery", "admin": true});
+    assert_eq!(
+        schema_error(&validator.validate(&extra).unwrap_err()),
+        "/: additionalProperties: admin"
+    );
+}
+
+/// `Ok` or `Err((status, reason))` for a GET checked at a proxy sending to `upstream`.
+async fn at_upstream(fw: &ApiFirewall, upstream: &str, uri: &str) -> std::result::Result<(), (u16, String)> {
+    let (mut parts, ()) = http::Request::get(uri)
+        .header("host", "shop.test")
+        .body(())
+        .unwrap()
+        .into_parts();
+    let upstreams = [crate::config::upstream_authority(upstream).unwrap()];
+    let client_ip = "203.0.113.7".parse().unwrap();
+    match fw.check_upstream(&mut parts, empty(), client_ip, &[], &upstreams).await {
+        Ok(_) => Ok(()),
+        Err(response) => Err((
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("apifw-validation-status")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default(),
+        )),
+    }
+}
+
+#[tokio::test]
+async fn apis_bound_to_an_upstream_are_checked_by_its_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("openapi.yaml"), small_spec(&["a"])).unwrap();
+    let yaml =
+        "apis:\n  - spec: openapi.yaml\n    upstreams: [app:8787]\n    base_path: /api\n    reason_header: true\n";
+    let fw = ApiFirewall::from_yaml(yaml, dir.path()).unwrap();
+    assert!(fw.bound_to_upstreams());
+    assert!(
+        run(&fw, "GET", "/api/zzz", &[], "").await.is_ok(),
+        "not looked at before the routes"
+    );
+    assert!(at_upstream(&fw, "app:8787", "/api/a").await.is_ok());
+    assert_eq!(
+        at_upstream(&fw, "http://APP:8787", "/api/zzz").await,
+        Err((403, "request:unknown-operation".into()))
+    );
+    assert!(
+        at_upstream(&fw, "ai:8800", "/api/zzz").await.is_ok(),
+        "another upstream"
+    );
+    assert!(at_upstream(&fw, "app:8787", "/page").await.is_ok(), "outside base_path");
+    assert!(ApiFirewall::from_yaml(&yaml.replace("app:8787", "unix/app.sock"), dir.path()).is_err());
 }

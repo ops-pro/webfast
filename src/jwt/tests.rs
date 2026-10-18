@@ -3,6 +3,10 @@ use super::*;
 use http_body_util::BodyExt;
 use serde_json::json;
 
+fn ip() -> std::net::IpAddr {
+    "203.0.113.7".parse().unwrap()
+}
+
 fn now() -> u64 {
     unix_now()
 }
@@ -45,7 +49,7 @@ fn claims(extra: Value) -> Value {
 }
 
 async fn refused(auth: &JwtAuth, parts: &mut http::request::Parts) -> (u16, String) {
-    let response = auth.check(parts).await.expect_err("refused");
+    let response = auth.check(parts, ip()).await.expect_err("refused");
     let status = response.status().as_u16();
     assert!(response.headers().contains_key("www-authenticate"));
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -58,7 +62,7 @@ async fn valid_tokens_pass_and_their_claims_go_upstream() {
         let auth = auth(&signer, "");
         let token = signer.token("k1", &claims(json!({})));
         let mut parts = request("/api/orders", &[("authorization", &bearer(&token))]);
-        auth.check(&mut parts)
+        auth.check(&mut parts, ip())
             .await
             .unwrap_or_else(|_| panic!("{}", signer.alg()));
         assert_eq!(parts.headers["x-user"], "u1");
@@ -69,7 +73,7 @@ async fn valid_tokens_pass_and_their_claims_go_upstream() {
         );
         // Again: from the cache, the same result.
         let mut again = request("/api/orders", &[("authorization", &bearer(&token))]);
-        auth.check(&mut again).await.unwrap();
+        auth.check(&mut again, ip()).await.unwrap();
         assert_eq!(again.headers["x-user"], "u1");
     }
 }
@@ -142,7 +146,7 @@ async fn tokens_that_do_not_hold_are_refused() {
     // Within the clock skew (60 s) an expired token still passes.
     let late = signer.token("k1", &claims(json!({"exp": now() - 30})));
     let mut parts = request("/api/orders", &[("authorization", &bearer(&late))]);
-    assert!(auth.check(&mut parts).await.is_ok());
+    assert!(auth.check(&mut parts, ip()).await.is_ok());
 }
 
 #[tokio::test]
@@ -159,11 +163,11 @@ async fn rules_decide_which_requests_need_a_token() {
         assert_eq!(refused(&auth, &mut parts).await.0, 401, "{path}");
     }
     let mut public = request("/api/public/x", &[]);
-    assert!(auth.check(&mut public).await.is_ok(), "a rule without providers");
+    assert!(auth.check(&mut public, ip()).await.is_ok(), "a rule without providers");
     let mut elsewhere = request("/index.html", &[]);
-    assert!(auth.check(&mut elsewhere).await.is_ok(), "no rule");
+    assert!(auth.check(&mut elsewhere, ip()).await.is_ok(), "no rule");
     let mut optional = request("/api/open/x", &[]);
-    assert!(auth.check(&mut optional).await.is_ok(), "allow_missing");
+    assert!(auth.check(&mut optional, ip()).await.is_ok(), "allow_missing");
     let bad = Signer::ec().token("k1", &claims(json!({})));
     let mut optional_bad = request("/api/open/x", &[("authorization", &bearer(&bad))]);
     assert_eq!(
@@ -179,7 +183,7 @@ async fn claim_headers_cannot_come_from_the_client() {
     let auth = auth(&signer, "");
     for path in ["/index.html", "/api/public/x", "/api/open/x"] {
         let mut parts = request(path, &[("x-user", "admin"), ("X-Roles", "root")]);
-        auth.check(&mut parts).await.unwrap();
+        auth.check(&mut parts, ip()).await.unwrap();
         assert!(
             parts.headers.get("x-user").is_none() && parts.headers.get("x-roles").is_none(),
             "{path}"
@@ -190,7 +194,7 @@ async fn claim_headers_cannot_come_from_the_client() {
         "/api/orders",
         &[("authorization", &bearer(&token)), ("x-user", "admin")],
     );
-    auth.check(&mut parts).await.unwrap();
+    auth.check(&mut parts, ip()).await.unwrap();
     assert_eq!(parts.headers.get_all("x-user").iter().collect::<Vec<_>>(), ["u2"]);
 }
 
@@ -201,13 +205,13 @@ async fn tokens_in_cookies_and_parameters_and_kept_or_passed_on() {
     let auth = auth(&signer, extra);
     let token = signer.token("k1", &claims(json!({"exp": null})));
     let mut cookie = request("/api/x", &[("cookie", &format!("a=b; session={token}"))]);
-    auth.check(&mut cookie).await.unwrap();
+    auth.check(&mut cookie, ip()).await.unwrap();
     let payload = token.split('.').nth(1).unwrap();
     assert_eq!(cookie.headers["x-jwt-payload"], payload);
     let mut param = request(&format!("/api/x?a=1&access_token={token}"), &[]);
-    auth.check(&mut param).await.unwrap();
+    auth.check(&mut param, ip()).await.unwrap();
     let mut header = request("/api/x", &[("x-token", &token)]);
-    auth.check(&mut header).await.unwrap();
+    auth.check(&mut header, ip()).await.unwrap();
     assert_eq!(header.headers["x-token"], token.as_str(), "forward_original_token");
     let mut authorization = request("/api/x", &[("authorization", &bearer(&token))]);
     assert_eq!(
@@ -275,10 +279,10 @@ async fn rotated_keys_are_picked_up_from_the_file() {
         let token = signer.token(kid, &claims(json!({"aud": null})));
         request("/x", &[("authorization", &bearer(&token))])
     };
-    auth.check(&mut check(&old, "old")).await.unwrap();
+    auth.check(&mut check(&old, "old"), ip()).await.unwrap();
     // The issuer rotates: the file gets the new key; a token with it makes the server read again.
     std::fs::write(&file, jwks(&[(&old, "old"), (&new, "new")])).unwrap();
-    auth.check(&mut check(&new, "new")).await.unwrap();
+    auth.check(&mut check(&new, "new"), ip()).await.unwrap();
     // Unknown key ids do not make it read again at once.
     let mut unknown = check(&Signer::ec(), "nobody");
     let started = std::time::Instant::now();
@@ -323,7 +327,7 @@ async fn keys_are_read_from_a_jwks_uri() {
     auth.start().unwrap();
     let token = signer.token("k1", &claims(json!({"aud": null})));
     // The first read may still be under way: the unknown key makes the request wait for it.
-    auth.check(&mut request("/x", &[("authorization", &bearer(&token))]))
+    auth.check(&mut request("/x", &[("authorization", &bearer(&token))]), ip())
         .await
         .unwrap();
 }
@@ -348,7 +352,7 @@ async fn timings() {
         let started = std::time::Instant::now();
         for _ in 0..rounds {
             let mut parts = request("/api/orders", &[("authorization", &header)]);
-            auth.check(&mut parts).await.unwrap();
+            auth.check(&mut parts, ip()).await.unwrap();
         }
         let cached = started.elapsed() / rounds;
         let started = std::time::Instant::now();
@@ -364,4 +368,105 @@ async fn timings() {
             baseline
         );
     }
+}
+
+#[tokio::test]
+async fn log_only_writes_failures_down_and_lets_requests_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let signer = Signer::ec();
+    let yaml = format!(
+        "mode: log_only\nlog: {{output: events.log}}\nproviders:\n  main:\n    issuer: https://id.test\n    jwks: '{}'\n    output_claim_to_headers: [{{header: X-User, claim: sub}}]\nrules:\n  - match: {{paths: [\"/api/strict/*\"]}}\n    providers: [main]\n    mode: block\n  - match: {{paths: [\"/api/*\"]}}\n    providers: [main]\n",
+        jwks(&[(&signer, "k1")])
+    );
+    let auth = JwtAuth::from_yaml(&yaml, dir.path()).unwrap();
+    let mut missing = request("/api/x", &[]);
+    assert!(
+        auth.check(&mut missing, ip()).await.is_ok(),
+        "log_only: no token passes"
+    );
+    let bad = Signer::ec().token("k1", &claims(json!({})));
+    let mut forged = request("/api/x?page=2", &[("authorization", &bearer(&bad))]);
+    assert!(
+        auth.check(&mut forged, ip()).await.is_ok(),
+        "log_only: a bad token passes"
+    );
+    assert!(
+        forged.headers.get("x-user").is_none(),
+        "but with no claims: nothing was verified"
+    );
+    assert!(forged.headers.contains_key("authorization"), "and as it came");
+    let mut strict = request("/api/strict/x", &[]);
+    assert_eq!(refused(&auth, &mut strict).await.0, 401, "the rule's own mode: block");
+    let good = signer.token("k1", &claims(json!({})));
+    let mut fine = request("/api/x", &[("authorization", &bearer(&good))]);
+    auth.check(&mut fine, ip()).await.unwrap();
+    assert_eq!(fine.headers["x-user"], "u1");
+
+    crate::accesslog::flush_all(Duration::from_secs(2));
+    let text = std::fs::read_to_string(dir.path().join("events.log")).unwrap();
+    let events: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let seen: Vec<(&str, &str, &str)> = events
+        .iter()
+        .map(|e| {
+            (
+                e["msg"].as_str().unwrap(),
+                e["reason"].as_str().unwrap(),
+                e["request"]["uri"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("request let through (log_only)", "missing", "/api/x"),
+            ("request let through (log_only)", "bad-signature", "/api/x?page=2"),
+            ("request refused", "missing", "/api/strict/x"),
+        ],
+        "valid tokens are not written down"
+    );
+    assert_eq!(events[0]["logger"], "jwt");
+    assert_eq!(events[0]["request"]["client_ip"], "203.0.113.7");
+    assert!(!text.contains(&bad), "tokens are never written");
+}
+
+#[tokio::test]
+async fn rules_bound_to_an_upstream_are_checked_by_its_proxy() {
+    let signer = Signer::ec();
+    let yaml = format!(
+        "providers:\n  main:\n    issuer: https://id.test\n    audiences: [api]\n    jwks: '{}'\n    output_claim_to_headers: [{{header: X-User, claim: sub}}]\nrules:\n  - match: {{upstreams: ['http://App:8787'], paths: ['/api/*']}}\n    providers: [main]\n",
+        jwks(&[(&signer, "k1")])
+    );
+    let auth = JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap();
+    assert!(auth.bound_to_upstreams());
+    let app = [crate::config::upstream_authority("app:8787").unwrap()];
+    let ai = [crate::config::upstream_authority("ai:8800").unwrap()];
+
+    // Before the routes the rule is not looked at; the claim headers still come off.
+    let mut parts = request("/api/orders", &[("x-user", "forged")]);
+    auth.check(&mut parts, ip()).await.unwrap();
+    assert!(parts.headers.get("x-user").is_none());
+    // At the proxy to the app a token is needed; at another proxy, or off the rule's paths, not.
+    let response = auth.check_upstream(&mut parts, ip(), &app).await.expect_err("no token");
+    assert_eq!(response.status(), 401);
+    assert!(
+        auth.check_upstream(&mut request("/api/orders", &[]), ip(), &ai)
+            .await
+            .is_ok()
+    );
+    assert!(
+        auth.check_upstream(&mut request("/page", &[]), ip(), &app)
+            .await
+            .is_ok()
+    );
+    let token = signer.token("k1", &claims(json!({})));
+    let mut parts = request("/api/orders", &[("authorization", &bearer(&token))]);
+    auth.check_upstream(&mut parts, ip(), &app).await.unwrap();
+    assert_eq!(parts.headers["x-user"], "u1");
+
+    // Upstreams are written as reverse_proxy takes them: plain HTTP, host and port.
+    let err = JwtAuth::from_yaml(&yaml.replace("http://App:8787", "https://app"), Path::new("."))
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+    assert!(err.contains("rule 1: upstream"), "{err}");
 }

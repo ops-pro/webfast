@@ -15,6 +15,9 @@
 //! connection of its own, and when it answers 101 the client's and the upstream's connections are
 //! joined into a tunnel that copies bytes both ways until either side closes. The tunnel keeps the
 //! client connection's place (src/guard.rs `Place`), so it counts against the connection limits.
+//!
+//! Request checks bound to an upstream (`upstreams` in src/jwt and src/apifw) run here, on the
+//! request as it goes to that upstream, before anything is sent.
 
 use crate::body::{Body, boxed};
 use crate::guard::{BodyStalled, BodyTooLarge, Place};
@@ -158,6 +161,18 @@ impl ReverseProxy {
         if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
             return ctx.status(StatusCode::PAYLOAD_TOO_LARGE);
         }
+        // Request checks bound to these upstreams (src/jwt, src/apifw: `upstreams`), on the request
+        // as it goes there.
+        if let Some(checks) = ctx.upstream_checks.take() {
+            let body = ctx.body.take().unwrap_or_else(crate::body::empty);
+            match checks
+                .check_upstream(&mut ctx.req, body, ctx.client_ip, &self.upstreams)
+                .await
+            {
+                Ok(body) => ctx.body = Some(body),
+                Err(response) => return ctx.respond(response),
+            }
+        }
         // The client's slot at the upstreams (WEB_MAX_UPSTREAM_REQUESTS_PER_IP), held until the
         // response ends.
         #[cfg(feature = "rate-limit")]
@@ -170,6 +185,12 @@ impl ReverseProxy {
         // A `cache` the request passed: the response may be kept (src/cache.rs).
         #[cfg(feature = "proxy-cache")]
         let mut miss = ctx.cache_miss.take();
+        #[cfg(feature = "proxy-cache")]
+        if let Some(miss) = miss.as_mut()
+            && ctx.req.extensions.get::<crate::handler::Credentialed>().is_some()
+        {
+            miss.credentialed = true;
+        }
         // A WebSocket handshake on a connection that can be handed over (HTTP/1.1); anything else
         // goes on as an ordinary request, its Upgrade dropped as hop-by-hop.
         if let Some(protocol) = upgrade_of(&ctx.req.headers)

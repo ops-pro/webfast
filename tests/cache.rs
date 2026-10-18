@@ -483,3 +483,89 @@ fn what_the_plugin_has_and_webfast_does_not_is_refused() {
         assert!(error.contains(message), "{options} in a site: {error}");
     }
 }
+
+#[cfg(feature = "jwt")]
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "jwt")]
+#[tokio::test]
+async fn checks_bound_to_the_upstream_hold_for_what_the_cache_keeps() {
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+    let point = key.public_key().as_ref().to_vec();
+    let jwks = serde_json::json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k",
+        "x": base64url(&point[1..33]), "y": base64url(&point[33..65])}]});
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let input = format!(
+        "{}.{}",
+        base64url(br#"{"alg":"ES256","kid":"k"}"#),
+        base64url(
+            serde_json::json!({"iss": "https://id.test", "sub": "u1", "exp": exp})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let signature = key
+        .sign(&aws_lc_rs::rand::SystemRandom::new(), input.as_bytes())
+        .unwrap();
+    let bearer = format!("Bearer {input}.{}", base64url(signature.as_ref()));
+
+    let seen = Arc::new(Seen::default());
+    let addr = upstream(seen.clone()).await;
+    let text = format!("{{\n\tcache {{\n\t\tstale 30s\n\t}}\n}}\n:0 {{\n\tcache\n\treverse_proxy /api/* {addr}\n}}\n");
+    let mut config = load(&text).unwrap();
+    // A token is not needed, but one that comes must hold (as Istio's allow_missing).
+    let yaml = format!(
+        "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\nrules:\n  - match: {{upstreams: ['{addr}']}}\n    providers: [id]\n    allow_missing: true\n"
+    );
+    config.jwt = Some(Arc::new(
+        webfast::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap(),
+    ));
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+
+    // Stored from a request without a token: a bad token still gets 401, not the stored answer.
+    assert_eq!(get(port, "/api/doc", &[]).await.status, StatusCode::OK);
+    until_stored(port, "/api/doc").await;
+    let bad = get(port, "/api/doc", &[("authorization", "Bearer a.b.c")]).await;
+    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(bad.header("cache-status"), "", "not from the cache");
+    assert_eq!(
+        get(port, "/api/doc", &[("authorization", &bearer)]).await.status,
+        StatusCode::OK
+    );
+
+    // A verified token, and an answer that does not say it may be shared (max-age only): not
+    // kept, so a request without the token does not get it.
+    assert_eq!(
+        get(port, "/api/mine", &[("authorization", &bearer)]).await.status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!webfast::cache::is_stored(&format!("127.0.0.1:{port}"), "/api/mine"));
+    let anonymous = get(port, "/api/mine", &[]).await;
+    assert!(
+        !anonymous.header("cache-status").contains("hit"),
+        "{:?}",
+        anonymous.headers
+    );
+    assert_eq!(seen.count("/api/mine"), 2);
+    running.shutdown(Duration::from_secs(1)).await;
+}

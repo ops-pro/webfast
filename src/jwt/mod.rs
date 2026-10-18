@@ -12,7 +12,18 @@
 //! that have one); without it a token is required. The headers claims are written to are taken
 //! off every request first, so a client cannot send them itself.
 //!
+//! A rule with `match: {upstreams: [app:8787]}` is not looked at before the routes but by each
+//! `reverse_proxy` sending to one of those upstreams, just before the request goes
+//! (`check_upstream`, src/proxy.rs); the other rules before the routes (`check`). Among each kind
+//! the first rule that matches decides.
+//!
+//! A failed check is written to the event log (src/eventlog.rs) — never the token — and answered
+//! 401 / 403; with `mode: log_only` (for all rules, or a rule's own) the request goes on instead,
+//! as it came and without claim headers.
+//!
 //! ```yaml
+//! mode: block                              # block | log_only; a rule may set its own
+//! log: {output: /var/log/web/jwt.log}      # or stdout / stderr / discard; none: the server's log
 //! providers:
 //!   keycloak:
 //!     issuer: https://id.example.com/realms/main
@@ -21,6 +32,8 @@
 //!     output_claim_to_headers: [{header: X-User, claim: sub}]
 //! rules:
 //!   - match: {paths: ["/api/public/*"]}      # no providers: not checked
+//!   - match: {upstreams: [stream:8800]}       # checked at the proxy to the streaming service
+//!     providers: [keycloak]
 //!   - match: {paths: ["/api/*"]}
 //!     providers: [keycloak]
 //! ```
@@ -36,6 +49,7 @@ use crate::handler::{decode_path, hostport_of, strip_port};
 use crate::matcher::{PathPattern, clean_path, host_matches, needs_clean};
 use anyhow::{Context, Result, anyhow, bail};
 use http::header::{CONTENT_TYPE, COOKIE, WWW_AUTHENTICATE};
+use http::uri::Authority;
 use http::{HeaderName, HeaderValue, Method, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -55,6 +69,21 @@ struct FileConfig {
     rules: Vec<RuleConfig>,
     #[serde(default)]
     cache: CacheConfig,
+    /// What a failed check does unless its rule says otherwise.
+    #[serde(default)]
+    mode: Mode,
+    /// Where failed checks are written (src/eventlog.rs); none: the server's log.
+    log: Option<crate::eventlog::LogConfig>,
+}
+
+/// What a failed check does: `block` answers 401 / 403; `log_only` writes the failure down and
+/// lets the request through (without claim headers: nothing was verified).
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Block,
+    LogOnly,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +142,7 @@ struct RuleConfig {
     providers: Vec<String>,
     #[serde(default)]
     allow_missing: bool,
+    mode: Option<Mode>,
 }
 
 #[derive(Deserialize, Default)]
@@ -124,6 +154,8 @@ struct MatchConfig {
     methods: Vec<String>,
     #[serde(default)]
     hosts: Vec<String>,
+    #[serde(default)]
+    upstreams: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -169,9 +201,13 @@ struct Rule {
     paths: Vec<PathPattern>,
     methods: Vec<Method>,
     hosts: Vec<String>,
+    /// Empty: checked before the routes. Else checked by a `reverse_proxy` sending to one of
+    /// these, just before the request goes (src/proxy.rs).
+    upstreams: Vec<Authority>,
     /// Indexes into `providers`; empty: requests matched are not checked.
     providers: Vec<usize>,
     allow_missing: bool,
+    mode: Mode,
 }
 
 /// A token found valid, and what it adds to the request.
@@ -201,6 +237,23 @@ pub enum Failure {
 }
 
 impl Failure {
+    /// For the event log.
+    fn code(self) -> &'static str {
+        match self {
+            Failure::Missing => "missing",
+            Failure::Malformed => "malformed",
+            Failure::UnknownIssuer => "unknown-issuer",
+            Failure::UnsupportedAlgorithm => "unsupported-algorithm",
+            Failure::UnknownKey => "unknown-key",
+            Failure::BadSignature => "bad-signature",
+            Failure::NoExpiration => "no-expiration",
+            Failure::Expired => "expired",
+            Failure::NotYetValid => "not-yet-valid",
+            Failure::LifetimeTooLong => "lifetime-too-long",
+            Failure::Audience => "audience",
+        }
+    }
+
     /// Status and message as Envoy's jwt_authn gives them.
     fn answer(self) -> (StatusCode, &'static str) {
         match self {
@@ -220,10 +273,18 @@ pub struct JwtAuth {
     rules: Vec<Rule>,
     /// Request headers that only a verified token may set.
     reserved: Vec<HeaderName>,
+    /// Query parameters a token may come in: the event log does not write their values.
+    hidden_params: Vec<String>,
     cache: cache::TokenCache<Verified>,
+    log: crate::eventlog::EventLog,
 }
 
 impl JwtAuth {
+    /// The query parameters a token may come in: event logs do not write their values.
+    pub fn hidden_params(&self) -> &[String] {
+        &self.hidden_params
+    }
+
     /// Reads the YAML file at `path` (`jwks_file`s are relative to it) and loads the inline and
     /// file keys; keys from a `jwks_uri` are read once `start` runs.
     pub fn load(path: &Path) -> Result<JwtAuth> {
@@ -256,12 +317,21 @@ impl JwtAuth {
                         .map_err(|_| anyhow!("rule {}: invalid method {method:?}", i + 1))?,
                 );
             }
+            let mut upstreams = Vec::new();
+            for upstream in &rule.matcher.upstreams {
+                upstreams.push(
+                    crate::config::upstream_authority(upstream)
+                        .map_err(|e| anyhow!("rule {}: upstream {upstream:?}: {e}", i + 1))?,
+                );
+            }
             rules.push(Rule {
                 paths: rule.matcher.paths.iter().map(|p| PathPattern::new(p)).collect(),
                 methods,
                 hosts: rule.matcher.hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+                upstreams,
                 providers: indexes,
                 allow_missing: rule.allow_missing,
+                mode: rule.mode.unwrap_or(file.mode),
             });
         }
         let mut reserved: Vec<HeaderName> = Vec::new();
@@ -272,11 +342,20 @@ impl JwtAuth {
                 }
             }
         }
+        let mut hidden_params: Vec<String> = file
+            .providers
+            .values()
+            .flat_map(|c| c.from_params.iter().cloned())
+            .collect();
+        hidden_params.sort();
+        hidden_params.dedup();
         Ok(JwtAuth {
             providers,
             rules,
             reserved,
+            hidden_params,
             cache: cache::TokenCache::new(file.cache.tokens),
+            log: crate::eventlog::EventLog::new("jwt", file.log.as_ref(), base),
         })
     }
 
@@ -297,57 +376,121 @@ impl JwtAuth {
         (self.providers.len(), self.rules.len())
     }
 
-    /// Checks the request: `Ok` to go on (with the claims' headers set, the token taken off unless
-    /// forwarded), or the 401 / 403 to answer with. (A refusal is the rare way out: the response
-    /// is returned as it is rather than boxed for every request.)
+    /// Whether a rule is bound to upstreams (checked by the proxy, `check_upstream`).
+    pub fn bound_to_upstreams(&self) -> bool {
+        self.rules.iter().any(|r| !r.upstreams.is_empty())
+    }
+
+    /// The upstreams rules are bound to (each must be one a `reverse_proxy` sends to).
+    pub fn upstreams(&self) -> impl Iterator<Item = &Authority> {
+        self.rules.iter().flat_map(|r| r.upstreams.iter())
+    }
+
+    /// Before the routes: takes the claims' headers off the request, then checks it by the first
+    /// rule without `upstreams` that matches. `Ok` to go on (with the claims' headers set, the
+    /// token taken off unless forwarded), or the 401 / 403 to answer with. A failure is written to
+    /// the event log; in `log_only` the request then goes on as it came. (A refusal is the rare
+    /// way out: the response is returned as it is rather than boxed for every request.)
     #[allow(clippy::result_large_err)]
-    pub async fn check(&self, parts: &mut http::request::Parts) -> std::result::Result<(), Response<Body>> {
+    pub async fn check(
+        &self,
+        parts: &mut http::request::Parts,
+        client_ip: std::net::IpAddr,
+    ) -> std::result::Result<(), Response<Body>> {
         for name in &self.reserved {
             parts.headers.remove(name);
         }
-        let Some(rule) = self.rule_for(parts) else {
-            return Ok(());
-        };
+        match self.rule_for(parts, None) {
+            Some(rule) => self.apply(rule, parts, client_ip).await,
+            None => Ok(()),
+        }
+    }
+
+    /// At a `reverse_proxy` about to send the request to one of `upstreams` (the request as it
+    /// goes there, after any rewrite): the first rule bound to one of them that matches decides,
+    /// as `check` does.
+    #[allow(clippy::result_large_err)]
+    pub async fn check_upstream(
+        &self,
+        parts: &mut http::request::Parts,
+        client_ip: std::net::IpAddr,
+        upstreams: &[Authority],
+    ) -> std::result::Result<(), Response<Body>> {
+        match self.rule_for(parts, Some(upstreams)) {
+            Some(rule) => self.apply(rule, parts, client_ip).await,
+            None => Ok(()),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn apply(
+        &self,
+        rule: &Rule,
+        parts: &mut http::request::Parts,
+        client_ip: std::net::IpAddr,
+    ) -> std::result::Result<(), Response<Body>> {
         if rule.providers.is_empty() {
             return Ok(());
         }
-        let Some((token, header)) = self.extract(rule, parts) else {
-            if rule.allow_missing {
-                return Ok(());
-            }
-            return Err(refusal(Failure::Missing));
-        };
-        let now = unix_now();
-        let key = cache::digest(token.as_bytes());
-        let verified = match self.cache.get(&key) {
-            Some(verified) if self.still_valid(&verified, rule, now) => verified,
-            _ => match self.verify(&token, rule, now).await {
+        let failure = match self.extract(rule, parts) {
+            None if rule.allow_missing => return Ok(()),
+            None => Failure::Missing,
+            Some((token, header)) => match self.verified(&token, rule).await {
                 Ok(verified) => {
-                    let verified = Arc::new(verified);
-                    self.cache.insert(key, verified.clone());
-                    verified
+                    parts.extensions.insert(crate::handler::Credentialed);
+                    if !self.providers[verified.provider].forward
+                        && let Some(header) = header
+                    {
+                        parts.headers.remove(header);
+                    }
+                    for (name, value) in &verified.headers {
+                        parts.headers.insert(name.clone(), value.clone());
+                    }
+                    return Ok(());
                 }
-                Err(failure) => {
-                    tracing::debug!(?failure, "JWT refused");
-                    return Err(refusal(failure));
-                }
+                Err(failure) => failure,
             },
         };
-        if !self.providers[verified.provider].forward
-            && let Some(header) = header
-        {
-            parts.headers.remove(header);
-        }
-        for (name, value) in &verified.headers {
-            parts.headers.insert(name.clone(), value.clone());
-        }
-        Ok(())
+        let refused = rule.mode == Mode::Block;
+        self.log.record(&crate::eventlog::Event {
+            refused,
+            status: failure.answer().0.as_u16(),
+            client_ip,
+            parts,
+            reason: failure.code(),
+            detail: "",
+            hidden_params: &self.hidden_params,
+        });
+        if refused { Err(refusal(failure)) } else { Ok(()) }
     }
 
-    fn rule_for(&self, parts: &http::request::Parts) -> Option<&Rule> {
+    /// The token verified: from the cache when it was seen and still holds, else checked now.
+    async fn verified(&self, token: &str, rule: &Rule) -> std::result::Result<Arc<Verified>, Failure> {
+        let now = unix_now();
+        let key = cache::digest(token.as_bytes());
+        if let Some(verified) = self.cache.get(&key)
+            && self.still_valid(&verified, rule, now)
+        {
+            return Ok(verified);
+        }
+        let verified = Arc::new(self.verify(token, rule, now).await?);
+        self.cache.insert(key, verified.clone());
+        Ok(verified)
+    }
+
+    /// The first rule that matches: before the routes (`at`: `None`) among those without
+    /// upstreams, at a proxy among those bound to one of its upstreams.
+    fn rule_for(&self, parts: &http::request::Parts, at: Option<&[Authority]>) -> Option<&Rule> {
         let mut path: Option<String> = None;
         let mut host: Option<String> = None;
         self.rules.iter().find(|rule| {
+            let bound = match at {
+                None => rule.upstreams.is_empty(),
+                Some(upstreams) => rule.upstreams.iter().any(|u| upstreams.contains(u)),
+            };
+            if !bound {
+                return false;
+            }
             if !rule.methods.is_empty() && !rule.methods.contains(&parts.method) {
                 return false;
             }

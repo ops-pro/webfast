@@ -18,7 +18,6 @@ use http::{HeaderName, Method};
 use jsonschema::{Draft, PatternOptions, Registry, Resource, Validator};
 use rustc_hash::FxHashSet;
 use serde_json::{Map, Value, json};
-use std::path::Path;
 
 /// The document's URI for references from compiled schemas.
 const DOCUMENT: &str = "urn:openapi";
@@ -123,17 +122,6 @@ impl RequestBody {
             .filter(|m| m.accepts(media_type))
             .min_by_key(specificity)
     }
-}
-
-/// Reads the document at `path` (YAML, or JSON for `.json`).
-pub(super) fn load(path: &Path, strict: bool) -> Result<Spec> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let document: Value = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
-        serde_json::from_str(&text)?
-    } else {
-        serde_yaml_ng::from_str(&text)?
-    };
-    compile(document, strict).with_context(|| format!("OpenAPI document {}", path.display()))
 }
 
 pub(super) fn compile(mut document: Value, strict: bool) -> Result<Spec> {

@@ -249,7 +249,8 @@ fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
         {
             let jwt = webfast::jwt::JwtAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
             let (providers, rules) = jwt.counts();
-            loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s)"));
+            let bound = bound_upstreams(jwt.upstreams());
+            loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s){bound}"));
             config.jwt = Some(std::sync::Arc::new(jwt));
         }
         #[cfg(not(feature = "jwt"))]
@@ -260,9 +261,15 @@ fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
         {
             let firewall =
                 webfast::apifw::ApiFirewall::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
-            let (apis, operations) = firewall.counts();
+            let (apis, operations, later) = firewall.counts();
+            let later = if later > 0 {
+                format!(", {later} spec(s) read once the server runs")
+            } else {
+                String::new()
+            };
             loaded.push(format!(
-                "API firewall: {path}, {apis} API(s), {operations} operation(s)"
+                "API firewall: {path}, {apis} API(s), {operations} operation(s){later}{}",
+                bound_upstreams(firewall.upstreams())
             ));
             config.api_firewall = Some(std::sync::Arc::new(firewall));
         }
@@ -271,10 +278,27 @@ fn checks_from_env(config: &mut config::Config) -> Result<Vec<String>, String> {
             "WEB_API_FIREWALL_CONFIG={path}: this build has no `api-firewall` feature"
         ));
     }
+    webfast::server::check_bindings(config).map_err(|e| format!("{e:#}"))?;
     for line in &loaded {
         tracing::info!("request checks: {line}");
     }
     Ok(loaded)
+}
+
+/// ", checked at the proxies to a:80, b:8787" for the upstreams checks are bound to; "": none.
+#[cfg(any(feature = "jwt", feature = "api-firewall"))]
+fn bound_upstreams<'a>(upstreams: impl Iterator<Item = &'a http::uri::Authority>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for upstream in upstreams {
+        if !names.iter().any(|n| n == upstream.as_str()) {
+            names.push(upstream.to_string());
+        }
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(", checked at the proxies to {}", names.join(", "))
+    }
 }
 
 /// WEB_WORKERS: how many threads serve connections (`auto` or unset: one per CPU).

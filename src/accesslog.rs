@@ -14,6 +14,7 @@ use http_body::{Frame, SizeHint};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
@@ -26,6 +27,21 @@ pub enum Output {
     Stdout,
     Stderr,
     Discard,
+    /// Appended to; opened again when the path no longer names the file that is open (logrotate
+    /// moved or removed it), so rotation needs no signal.
+    File(&'static Path),
+}
+
+impl Output {
+    /// `stdout`, `stderr`, `discard`, or a file path (relative ones under `base`).
+    pub fn parse(text: &str, base: &Path) -> Output {
+        match text {
+            "stdout" => Output::Stdout,
+            "stderr" => Output::Stderr,
+            "discard" => Output::Discard,
+            path => Output::File(Box::leak(base.join(path).into_boxed_path())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +94,8 @@ struct Writer {
 
 static STDOUT: OnceLock<Writer> = OnceLock::new();
 static STDERR: OnceLock<Writer> = OnceLock::new();
+/// One writer per log file.
+static FILES: Mutex<Vec<(&'static Path, &'static Writer)>> = Mutex::new(Vec::new());
 /// Writer threads started so far (flushed on shutdown).
 static STARTED: Mutex<Vec<Output>> = Mutex::new(Vec::new());
 
@@ -86,26 +104,78 @@ fn writer(output: Output) -> Option<&'static Writer> {
         Output::Stdout => &STDOUT,
         Output::Stderr => &STDERR,
         Output::Discard => return None,
+        Output::File(path) => {
+            let mut files = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, writer)) = files.iter().find(|(p, _)| *p == path) {
+                return Some(writer);
+            }
+            let writer: &'static Writer = Box::leak(Box::new(start_writer(output)));
+            files.push((path, writer));
+            return Some(writer);
+        }
     };
-    Some(cell.get_or_init(|| {
-        let (queue, receiver) = sync_channel(QUEUE_LINES);
-        std::thread::Builder::new()
-            .name(format!("access-log-{output:?}").to_lowercase())
-            .spawn(move || write_batches(output, receiver))
-            .expect("access log thread");
-        if let Ok(mut started) = STARTED.lock() {
-            started.push(output);
-        }
-        Writer {
-            queue,
-            dropped: AtomicU64::new(0),
-        }
-    }))
+    Some(cell.get_or_init(|| start_writer(output)))
+}
+
+fn start_writer(output: Output) -> Writer {
+    let (queue, receiver) = sync_channel(QUEUE_LINES);
+    std::thread::Builder::new()
+        .name("log-writer".into())
+        .spawn(move || write_batches(output, receiver))
+        .expect("a log writer thread");
+    if let Ok(mut started) = STARTED.lock() {
+        started.push(output);
+    }
+    Writer {
+        queue,
+        dropped: AtomicU64::new(0),
+    }
+}
+
+/// Queues `line` (newline included) for `output`; dropped and counted when its queue is full.
+pub fn write_line(output: Output, line: String) {
+    let Some(writer) = writer(output) else { return };
+    if let Err(TrySendError::Full(_)) = writer.queue.try_send(Message::Line(line)) {
+        writer.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A log file, open for appending, and which file it is (device and inode).
+type OpenFile = Option<(std::fs::File, Option<(u64, u64)>)>;
+
+#[cfg(unix)]
+fn file_id(metadata: Option<std::fs::Metadata>) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    metadata.map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_: Option<std::fs::Metadata>) -> Option<(u64, u64)> {
+    None
+}
+
+/// Appends `bytes` to the file at `path`, opening it again first when it is no longer the one
+/// open (rotated away or removed), or when there is nothing to compare with.
+fn append(path: &Path, open: &mut OpenFile, bytes: &[u8]) -> std::io::Result<()> {
+    let current = file_id(std::fs::metadata(path).ok());
+    let stale = match open {
+        Some((_, Some(id))) => current != Some(*id),
+        _ => true,
+    };
+    if stale {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let id = file_id(file.metadata().ok());
+        *open = Some((file, id));
+    }
+    let (file, _) = open.as_mut().expect("opened above");
+    file.write_all(bytes)
 }
 
 fn write_batches(output: Output, receiver: Receiver<Message>) {
     let mut batch: Vec<u8> = Vec::with_capacity(64 * 1024);
     let interval = batch_interval();
+    let mut file: OpenFile = None;
+    let mut failing = false;
     loop {
         // Sleeping rather than blocking in recv: senders then never have to wake this thread.
         std::thread::sleep(interval);
@@ -123,11 +193,25 @@ fn write_batches(output: Output, receiver: Receiver<Message>) {
             }
         }
         if !batch.is_empty() {
-            let _ = match output {
+            let written = match output {
                 Output::Stdout => std::io::stdout().lock().write_all(&batch),
                 Output::Stderr => std::io::stderr().lock().write_all(&batch),
                 Output::Discard => Ok(()),
+                Output::File(path) => append(path, &mut file, &batch),
             };
+            // Said once when writing starts failing, and once when it works again.
+            match (written, failing) {
+                (Err(e), false) => {
+                    tracing::warn!(?output, error = %e, "cannot write the log; its lines are lost until it can");
+                    failing = true;
+                    file = None;
+                }
+                (Ok(()), true) => {
+                    tracing::info!(?output, "the log is written again");
+                    failing = false;
+                }
+                _ => {}
+            }
             batch.clear();
             if batch.capacity() > 1 << 20 {
                 batch.shrink_to(64 * 1024);
@@ -164,11 +248,10 @@ pub fn flush_all(timeout: Duration) {
 
 impl AccessLog {
     fn write(&self, info: &RequestInfo, status: u16, size: u64) {
-        let Some(writer) = writer(self.output) else { return };
-        let line = self.line(info, status, size);
-        if let Err(TrySendError::Full(_)) = writer.queue.try_send(Message::Line(line)) {
-            writer.dropped.fetch_add(1, Ordering::Relaxed);
+        if self.output == Output::Discard {
+            return;
         }
+        write_line(self.output, self.line(info, status, size));
     }
 
     /// The log line, newline included.
@@ -214,7 +297,7 @@ impl AccessLog {
 }
 
 /// JSON string contents: quotes, backslashes and control characters escaped.
-fn json_escape(out: &mut String, text: &str) {
+pub(crate) fn json_escape(out: &mut String, text: &str) {
     for ch in text.chars() {
         match ch {
             '"' => out.push_str("\\\""),

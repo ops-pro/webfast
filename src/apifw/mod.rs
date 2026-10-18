@@ -9,6 +9,10 @@
 //! body; in `log_only` it is logged and the request goes on; `off` checks nothing. Modes can be
 //! set per operation (`endpoints`).
 //!
+//! An API bound to upstreams (`upstreams: [app:8787]`) is checked by each `reverse_proxy` sending
+//! to one of them, just before the request goes, on the request as it goes there
+//! (`check_upstream`, src/proxy.rs); the other APIs before the routes (`check`).
+//!
 //! What it does differently from Wallarm (see the report in the commit introducing it):
 //! - one reading of everything: the body is read once, validated, and exactly those bytes go
 //!   upstream; query strings and paths are decoded once, strictly — a broken percent-escape, an
@@ -21,9 +25,15 @@
 //! - nothing fails open: a body type that is declared but not looked into (multipart, binary) is
 //!   still checked for its type and size, one that is not declared is a violation.
 //!
+//! The spec is a file, or a source kept current: a URL, or a path asked of this server's own
+//! routes (src/apifw/source.rs). Violations go to the event log (src/eventlog.rs).
+//!
 //! ```yaml
+//! log: {output: /var/log/web/api-firewall.log}   # or stdout / stderr / discard; none: the server's log
 //! apis:
 //!   - spec: openapi.yaml           # relative to this file; YAML or JSON, OpenAPI 3.0 or 3.1
+//!     upstreams: [app:8787]        # checked at the proxy to the app; none: before the routes
+//!     # spec: {uri: /api/openapi.json, refresh: 1m, ttl: 24h}   a source (src/apifw/source.rs)
 //!     base_path: /api              # the spec's paths are under it
 //!     mode: block                  # block | log_only | off
 //!     unknown_query_params: block  # block | allow
@@ -35,21 +45,31 @@
 
 mod params;
 mod router;
+mod source;
 mod spec;
 
+pub use source::LocalFetch;
+
 use crate::body::{Body, empty};
+use crate::eventlog::{Event, EventLog, LogConfig};
 use crate::guard::{BodyTooLarge, LimitedBody, TooLargeError};
 use crate::handler::{decode_path, hostport_of, strip_port};
 use crate::matcher::{clean_path, host_matches, needs_clean};
 use anyhow::{Context, Result, anyhow, bail};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
+use http::uri::Authority;
 use http::{HeaderValue, Method, Response, StatusCode};
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use spec::{BodyFormat, Credential, Location, Operation, Spec};
+use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,16 +83,20 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     apis: Vec<ApiConfig>,
+    /// Where violations are written (src/eventlog.rs); none: the server's log.
+    log: Option<LogConfig>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApiConfig {
-    spec: String,
+    spec: source::SpecConfig,
     #[serde(default)]
     base_path: String,
     #[serde(default)]
     hosts: Vec<String>,
+    #[serde(default)]
+    upstreams: Vec<String>,
     #[serde(default = "block")]
     mode: Mode,
     #[serde(default = "block")]
@@ -102,20 +126,35 @@ struct EndpointConfig {
 }
 
 struct Api {
-    /// The spec's file, for the log.
+    /// Where the spec comes from, for the log.
     name: String,
     /// Lowercase, without a trailing slash; empty: the whole site.
     base: String,
     hosts: Vec<String>,
-    spec: Spec,
+    /// Empty: checked before the routes. Else checked by a `reverse_proxy` sending to one of
+    /// these, just before the request goes (src/proxy.rs).
+    upstreams: Vec<Authority>,
     mode: Mode,
-    /// Each operation's mode.
-    modes: Vec<Mode>,
+    /// Per-operation modes: method (`None`: any), spec path, mode.
+    endpoints: Vec<(Option<Method>, String, Mode)>,
+    strict: bool,
     unknown_query: bool,
     max_body: usize,
     block_status: StatusCode,
     reason_header: bool,
     pass_options: bool,
+    source: source::Source,
+    /// The spec as last compiled; `None` until one is.
+    compiled: ArcSwapOption<Compiled>,
+    /// Milliseconds since the Unix epoch of the last successful look at the source.
+    last_ok: AtomicU64,
+    seen: Mutex<source::Seen>,
+}
+
+/// A spec compiled, and each of its operations' mode.
+struct Compiled {
+    spec: Spec,
+    modes: Vec<Mode>,
 }
 
 /// A request that does not follow the spec.
@@ -145,11 +184,13 @@ impl Violation {
 
 /// The APIs to check requests against.
 pub struct ApiFirewall {
-    apis: Vec<Api>,
+    apis: Vec<Arc<Api>>,
+    log: EventLog,
 }
 
 impl ApiFirewall {
-    /// Reads the YAML file at `path` and compiles the specs it names (relative to it).
+    /// Reads the YAML file at `path` and the specs it names as files (relative to it); specs
+    /// from a uri are read once `start` runs.
     pub fn load(path: &Path) -> Result<ApiFirewall> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         ApiFirewall::from_yaml(&text, path.parent().unwrap_or(Path::new(".")))
@@ -160,81 +201,181 @@ impl ApiFirewall {
         let file: FileConfig = serde_yaml_ng::from_str(text)?;
         let mut apis = Vec::new();
         for config in file.apis {
-            let path = base.join(&config.spec);
-            let spec = spec::load(&path, config.strict_bodies)?;
-            apis.push(api(config, spec, path.display().to_string())?);
+            let source = source::Source::from_config(&config.spec, base)?;
+            let api = api(config, source)?;
+            if api.source.read_at_startup() {
+                let source::Origin::File(path) = &api.source.origin else {
+                    unreachable!("a file")
+                };
+                let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                let compiled = api.compile(&bytes, true)?;
+                api.install(compiled);
+                api.seen.lock().unwrap_or_else(PoisonError::into_inner).digest = Some(*blake3::hash(&bytes).as_bytes());
+            }
+            apis.push(Arc::new(api));
         }
-        Ok(ApiFirewall { apis })
+        Ok(ApiFirewall {
+            apis,
+            log: EventLog::new("api-firewall", file.log.as_ref(), base),
+        })
     }
 
     /// An API from a spec given as text (tests, tools).
     pub fn from_spec(spec_text: &str, config_yaml: &str) -> Result<ApiFirewall> {
         let config: ApiConfig = serde_yaml_ng::from_str(config_yaml)?;
-        let document: Value = serde_yaml_ng::from_str(spec_text)?;
-        let spec = spec::compile(document, config.strict_bodies)?;
+        let api = api(config, source::Source::inline())?;
+        let compiled = api.compile(spec_text.as_bytes(), true)?;
+        api.install(compiled);
         Ok(ApiFirewall {
-            apis: vec![api(config, spec, "inline".into())?],
+            apis: vec![Arc::new(api)],
+            log: EventLog::new("api-firewall", None, Path::new(".")),
         })
     }
 
-    /// APIs and their operations (for the startup log).
-    pub fn counts(&self) -> (usize, usize) {
-        (self.apis.len(), self.apis.iter().map(|a| a.spec.operations.len()).sum())
+    /// APIs, their operations, and APIs whose spec is read once the server runs (for the log).
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let operations = self
+            .apis
+            .iter()
+            .filter_map(|a| a.compiled.load_full())
+            .map(|c| c.spec.operations.len())
+            .sum();
+        let later = self
+            .apis
+            .iter()
+            .filter(|a| !a.source.read_at_startup() && a.compiled.load().is_none())
+            .count();
+        (self.apis.len(), operations, later)
     }
 
-    /// Checks a request: `Ok` with its body to go on (the same bytes if it was read), or the
-    /// response to answer with.
+    /// Starts keeping the specs current (on the current tokio runtime): those from a uri are read
+    /// now, and every source with a `refresh` looked at again that often. `local`: this server's
+    /// own routes, for specs given as a path.
+    pub fn start(&self, local: Option<LocalFetch>) -> Result<()> {
+        let needs_client = self
+            .apis
+            .iter()
+            .any(|a| matches!(a.source.origin, source::Origin::Url(_)));
+        let client = if needs_client {
+            Some(crate::fetch::client()?)
+        } else {
+            None
+        };
+        for api in &self.apis {
+            if api.source.refresh.is_some() {
+                tokio::spawn(refresh(api.clone(), client.clone(), local.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// One look at every API's source now (tests, tools).
+    pub async fn look_now(&self, local: Option<&LocalFetch>) -> Vec<Result<()>> {
+        let client = crate::fetch::client().ok();
+        let mut out = Vec::new();
+        for api in &self.apis {
+            out.push(api.reload(client.as_ref(), local).await);
+        }
+        out
+    }
+
+    /// Whether an API is bound to upstreams (checked by the proxy, `check_upstream`).
+    pub fn bound_to_upstreams(&self) -> bool {
+        self.apis.iter().any(|a| !a.upstreams.is_empty())
+    }
+
+    /// The upstreams APIs are bound to (each must be one a `reverse_proxy` sends to).
+    pub fn upstreams(&self) -> impl Iterator<Item = &Authority> {
+        self.apis.iter().flat_map(|a| a.upstreams.iter())
+    }
+
+    /// Before the routes: checks a request against the first API without `upstreams` it is
+    /// under. `Ok` with its body to go on (the same bytes if it was read), or the response to
+    /// answer with. A violation is written to the event log, without the values of
+    /// `hidden_params` (the query parameters the JWT module reads tokens from).
     #[allow(clippy::result_large_err)]
     pub async fn check(
         &self,
         parts: &mut http::request::Parts,
         body: Body,
+        client_ip: IpAddr,
+        hidden_params: &[String],
     ) -> std::result::Result<Body, Response<Body>> {
-        let Some(api) = self.api_for(parts) else {
-            return Ok(body);
-        };
-        if api.mode == Mode::Off && api.modes.iter().all(|m| *m == Mode::Off) {
-            return Ok(body);
-        }
-        let (mode, outcome, body) = api.check(parts, body).await;
-        match outcome {
-            Ok(()) => Ok(body),
-            Err(violation) => {
-                let status = violation.status.unwrap_or(api.block_status);
-                // A body over the limit or not readable cannot be passed on: refused in any mode.
-                if mode == Mode::Block || matches!(status, StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST) {
-                    tracing::info!(
-                        api = %api.name,
-                        method = %parts.method,
-                        path = %parts.uri.path(),
-                        reason = %violation.reason,
-                        detail = %violation.detail,
-                        status = status.as_u16(),
-                        "request refused by the API firewall"
-                    );
-                    let mut response = Response::new(empty());
-                    *response.status_mut() = status;
-                    if api.reason_header
-                        && let Ok(value) = HeaderValue::from_str(&violation.reason)
-                    {
-                        response.headers_mut().insert("apifw-validation-status", value);
-                    }
-                    return Err(response);
-                }
-                tracing::warn!(
-                    api = %api.name,
-                    method = %parts.method,
-                    path = %parts.uri.path(),
-                    reason = %violation.reason,
-                    detail = %violation.detail,
-                    "request does not follow the API spec (log_only)"
-                );
-                Ok(body)
-            }
+        match self.api_for(parts, None) {
+            Some(api) => self.check_api(api, parts, body, client_ip, hidden_params).await,
+            None => Ok(body),
         }
     }
 
-    fn api_for(&self, parts: &http::request::Parts) -> Option<&Api> {
+    /// At a `reverse_proxy` about to send the request to one of `upstreams`: checks it, as it
+    /// goes there (after any rewrite), against the first API bound to one of them it is under.
+    #[allow(clippy::result_large_err)]
+    pub async fn check_upstream(
+        &self,
+        parts: &mut http::request::Parts,
+        body: Body,
+        client_ip: IpAddr,
+        hidden_params: &[String],
+        upstreams: &[Authority],
+    ) -> std::result::Result<Body, Response<Body>> {
+        match self.api_for(parts, Some(upstreams)) {
+            Some(api) => self.check_api(api, parts, body, client_ip, hidden_params).await,
+            None => Ok(body),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn check_api(
+        &self,
+        api: &Api,
+        parts: &mut http::request::Parts,
+        body: Body,
+        client_ip: IpAddr,
+        hidden_params: &[String],
+    ) -> std::result::Result<Body, Response<Body>> {
+        if api.mode == Mode::Off && api.endpoints.iter().all(|(_, _, m)| *m == Mode::Off) {
+            return Ok(body);
+        }
+        let (mode, outcome, body) = api.check(parts, body).await;
+        let Err(violation) = outcome else {
+            return Ok(body);
+        };
+        let status = violation.status.unwrap_or(api.block_status);
+        // A body over the limit or not readable cannot be passed on: refused in any mode.
+        let refused = mode == Mode::Block || matches!(status, StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST);
+        self.log.record(&Event {
+            refused,
+            status: status.as_u16(),
+            client_ip,
+            parts,
+            reason: &violation.reason,
+            detail: &violation.detail,
+            hidden_params,
+        });
+        if !refused {
+            return Ok(body);
+        }
+        let mut response = Response::new(empty());
+        *response.status_mut() = status;
+        if api.reason_header
+            && let Ok(value) = HeaderValue::from_str(&violation.reason)
+        {
+            response.headers_mut().insert("apifw-validation-status", value);
+        }
+        Err(response)
+    }
+
+    /// The first API the request is under: before the routes (`at`: `None`) among those without
+    /// upstreams, at a proxy among those bound to one of its upstreams.
+    fn api_for(&self, parts: &http::request::Parts, at: Option<&[Authority]>) -> Option<&Api> {
+        let bound = |api: &Api| match at {
+            None => api.upstreams.is_empty(),
+            Some(upstreams) => api.upstreams.iter().any(|u| upstreams.contains(u)),
+        };
+        // Nothing to decode for a request no API of this phase can be for.
+        if !self.apis.iter().any(|api| bound(api)) {
+            return None;
+        }
         let decoded = decode_path(parts.uri.path()).to_lowercase();
         let path = if needs_clean(&decoded) {
             clean_path(&decoded, true)
@@ -242,21 +383,28 @@ impl ApiFirewall {
             decoded
         };
         let mut host: Option<String> = None;
-        self.apis.iter().find(|api| {
-            let under = path.starts_with(&api.base) && matches!(path.as_bytes().get(api.base.len()), None | Some(b'/'));
-            if !under {
-                return false;
-            }
-            if api.hosts.is_empty() {
-                return true;
-            }
-            let host = host.get_or_insert_with(|| strip_port(hostport_of(parts)).to_ascii_lowercase());
-            api.hosts.iter().any(|h| host_matches(h, host))
-        })
+        self.apis
+            .iter()
+            .find(|api| {
+                if !bound(api) {
+                    return false;
+                }
+                let under =
+                    path.starts_with(&api.base) && matches!(path.as_bytes().get(api.base.len()), None | Some(b'/'));
+                if !under {
+                    return false;
+                }
+                if api.hosts.is_empty() {
+                    return true;
+                }
+                let host = host.get_or_insert_with(|| strip_port(hostport_of(parts)).to_ascii_lowercase());
+                api.hosts.iter().any(|h| host_matches(h, host))
+            })
+            .map(|api| &**api)
     }
 }
 
-fn api(config: ApiConfig, spec: Spec, name: String) -> Result<Api> {
+fn api(config: ApiConfig, source: source::Source) -> Result<Api> {
     let base = config.base_path.trim_end_matches('/').to_ascii_lowercase();
     if !base.is_empty() && !base.starts_with('/') {
         bail!("base_path {:?}: starts with /", config.base_path);
@@ -267,7 +415,7 @@ fn api(config: ApiConfig, spec: Spec, name: String) -> Result<Api> {
     };
     let block_status = StatusCode::from_u16(config.block_status.unwrap_or(403))
         .map_err(|_| anyhow!("block_status {:?}", config.block_status))?;
-    let mut modes = vec![config.mode; spec.operations.len()];
+    let mut endpoints = Vec::new();
     for endpoint in &config.endpoints {
         let method = match &endpoint.method {
             Some(m) => Some(
@@ -275,44 +423,151 @@ fn api(config: ApiConfig, spec: Spec, name: String) -> Result<Api> {
             ),
             None => None,
         };
-        let mut matched = false;
-        for (i, op) in spec.operations.iter().enumerate() {
-            if op.path == endpoint.path && method.as_ref().is_none_or(|m| *m == op.method) {
-                modes[i] = endpoint.mode;
-                matched = true;
-            }
-        }
-        if !matched {
-            bail!(
-                "endpoint {} {}: no such operation in the spec",
-                endpoint.method.as_deref().unwrap_or("*"),
-                endpoint.path
-            );
-        }
+        endpoints.push((method, endpoint.path.clone(), endpoint.mode));
     }
-    tracing::info!(spec = %name, base = %base, operations = spec.operations.len(), mode = ?config.mode, "API firewall: spec compiled");
+    let mut upstreams = Vec::new();
+    for upstream in &config.upstreams {
+        upstreams.push(crate::config::upstream_authority(upstream).map_err(|e| anyhow!("upstream {upstream:?}: {e}"))?);
+    }
     Ok(Api {
-        name,
+        name: source.describe(),
         base,
         hosts: config.hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
-        spec,
+        upstreams,
         mode: config.mode,
-        modes,
+        endpoints,
+        strict: config.strict_bodies,
         unknown_query: config.unknown_query_params == Mode::Block,
         max_body,
         block_status,
         reason_header: config.reason_header,
         pass_options: config.pass_options,
+        source,
+        compiled: ArcSwapOption::empty(),
+        last_ok: AtomicU64::new(0),
+        seen: Mutex::new(source::Seen::default()),
     })
 }
 
+/// Keeps an API's spec current: a look every `refresh`, sooner after a failure (1 s, doubling
+/// up to a minute, never later than `refresh`).
+async fn refresh(api: Arc<Api>, client: Option<crate::fetch::Client>, local: Option<LocalFetch>) {
+    let every = api.source.refresh.unwrap_or(Duration::from_secs(60));
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let wait = match api.reload(client.as_ref(), local.as_ref()).await {
+            Ok(()) => {
+                backoff = Duration::from_secs(1);
+                every
+            }
+            Err(e) => {
+                tracing::warn!(spec = %api.name, error = %format!("{e:#}"), retry_secs = backoff.min(every).as_secs(), "cannot read the API spec; the last one stays");
+                let wait = backoff.min(every);
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                wait
+            }
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 impl Api {
+    /// The spec to check against: `None` before one was compiled, or once `ttl` has passed
+    /// without a successful look at its source.
+    fn current(&self) -> Option<Arc<Compiled>> {
+        let compiled = self.compiled.load_full()?;
+        if let Some(ttl) = self.source.ttl
+            && unix_millis().saturating_sub(self.last_ok.load(Ordering::Acquire)) > ttl.as_millis() as u64
+        {
+            return None;
+        }
+        Some(compiled)
+    }
+
+    /// Compiles a spec (YAML or JSON); with `strict`, endpoints that name no operation are an
+    /// error (at startup), otherwise a warning (a spec read again).
+    fn compile(&self, bytes: &[u8], strict: bool) -> Result<Compiled> {
+        let text = std::str::from_utf8(bytes).context("the spec is not UTF-8")?;
+        let document: Value = if text.trim_start().starts_with('{') {
+            serde_json::from_str(text)?
+        } else {
+            serde_yaml_ng::from_str(text)?
+        };
+        let spec = spec::compile(document, self.strict).with_context(|| format!("OpenAPI document {}", self.name))?;
+        let mut modes = vec![self.mode; spec.operations.len()];
+        for (method, path, mode) in &self.endpoints {
+            let mut matched = false;
+            for (i, op) in spec.operations.iter().enumerate() {
+                if op.path == *path && method.as_ref().is_none_or(|m| *m == op.method) {
+                    modes[i] = *mode;
+                    matched = true;
+                }
+            }
+            if !matched {
+                let method = method.as_ref().map_or("*", Method::as_str);
+                if strict {
+                    bail!("endpoint {method} {path}: no such operation in the spec");
+                }
+                tracing::warn!(spec = %self.name, endpoint = %format!("{method} {path}"), "endpoint: no such operation in the spec now");
+            }
+        }
+        Ok(Compiled { spec, modes })
+    }
+
+    /// Puts a compiled spec in place (requests in flight keep the one they found).
+    fn install(&self, compiled: Compiled) {
+        tracing::info!(spec = %self.name, base = %self.base, operations = compiled.spec.operations.len(), mode = ?self.mode, "API firewall: spec compiled");
+        self.compiled.store(Some(Arc::new(compiled)));
+        self.last_ok.store(unix_millis(), Ordering::Release);
+    }
+
+    /// One look at the source: a changed spec is compiled (on a blocking thread) and put in
+    /// place; an unchanged one only counts as seen.
+    async fn reload(self: &Arc<Self>, client: Option<&crate::fetch::Client>, local: Option<&LocalFetch>) -> Result<()> {
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner).now();
+        let (bytes, next) = self
+            .source
+            .look(&seen, client, local, self.hosts.first().map(String::as_str))
+            .await?;
+        if let Some(bytes) = bytes {
+            let digest = *blake3::hash(&bytes).as_bytes();
+            if seen.digest != Some(digest) {
+                let api = self.clone();
+                let compiled = tokio::task::spawn_blocking(move || api.compile(&bytes, false))
+                    .await
+                    .map_err(|e| anyhow!("{e}"))??;
+                self.install(compiled);
+            }
+            let mut stored = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            *stored = next;
+            stored.digest = Some(digest);
+        } else {
+            let mut stored = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            let digest = stored.digest;
+            *stored = next;
+            stored.digest = digest;
+        }
+        self.last_ok.store(unix_millis(), Ordering::Release);
+        Ok(())
+    }
+
     /// The mode that applies, whether the request follows the spec, and its body.
     async fn check(
         &self,
         parts: &mut http::request::Parts,
         body: Body,
     ) -> (Mode, std::result::Result<(), Violation>, Body) {
+        let Some(compiled) = self.current() else {
+            let violation = Violation::new("spec:unavailable", "no spec yet, or not read again within its ttl")
+                .with_status(StatusCode::SERVICE_UNAVAILABLE);
+            return (self.mode, Err(violation), body);
+        };
         let raw = parts.uri.path();
         if let Some(problem) = ambiguous(raw) {
             return (self.mode, Err(Violation::new("request-path:ambiguous", problem)), body);
@@ -329,12 +584,12 @@ impl Api {
             Some("") | None => "/",
             Some(rest) => rest,
         };
-        if parts.method == Method::OPTIONS && self.pass_options && self.spec.router.knows_path(rest) {
+        if parts.method == Method::OPTIONS && self.pass_options && compiled.spec.router.knows_path(rest) {
             return (Mode::Off, Ok(()), body);
         }
-        let found = self.spec.router.find(&parts.method, rest).or_else(|| {
+        let found = compiled.spec.router.find(&parts.method, rest).or_else(|| {
             (parts.method == Method::HEAD)
-                .then(|| self.spec.router.find(&Method::GET, rest))
+                .then(|| compiled.spec.router.find(&Method::GET, rest))
                 .flatten()
         });
         let Some(found) = found else {
@@ -347,11 +602,11 @@ impl Api {
                 body,
             );
         };
-        let mode = self.modes[found.operation];
+        let mode = compiled.modes[found.operation];
         if mode == Mode::Off {
             return (mode, Ok(()), body);
         }
-        let op = &self.spec.operations[found.operation];
+        let op = &compiled.spec.operations[found.operation];
         if let Err(violation) = self.check_parameters(op, &found.params, parts) {
             return (mode, Err(violation), body);
         }
@@ -453,7 +708,7 @@ impl Api {
                     .ok_or_else(|| Violation::new(reason(), "not of its type"))?
             };
             if let Err(error) = validator.validate(&value) {
-                return Err(Violation::new(reason(), error.to_string()));
+                return Err(Violation::new(reason(), schema_error(&error)));
             }
         }
         if self.unknown_query {
@@ -639,8 +894,31 @@ fn validate_body(media: &spec::Media, bytes: &Bytes) -> std::result::Result<(), 
     match &media.validator {
         Some(validator) => validator
             .validate(&value)
-            .map_err(|error| Violation::new(reason(), error.to_string())),
+            .map_err(|error| Violation::new(reason(), schema_error(&error))),
         None => Ok(()),
+    }
+}
+
+/// A schema error without the value it is about, which may be a password or personal data and
+/// goes to the event log: where in the request, and the keyword that failed (with the property
+/// names an object may not carry, a few and cut short).
+fn schema_error(error: &jsonschema::ValidationError<'_>) -> String {
+    let at = match error.instance_path().as_str() {
+        "" => "/",
+        path => path,
+    };
+    let keyword = error.kind().keyword();
+    match error.kind() {
+        jsonschema::error::ValidationErrorKind::AdditionalProperties { unexpected }
+        | jsonschema::error::ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+            let names: Vec<String> = unexpected
+                .iter()
+                .take(5)
+                .map(|n| n.chars().take(40).collect())
+                .collect();
+            format!("{at}: {keyword}: {}", names.join(", "))
+        }
+        _ => format!("{at}: {keyword}"),
     }
 }
 

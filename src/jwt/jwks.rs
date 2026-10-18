@@ -385,42 +385,16 @@ pub(super) async fn refresh(keys: Arc<Keys>, client: Client) {
     }
 }
 
-pub(super) type Client = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    http_body_util::Empty<Bytes>,
->;
-
-/// An HTTP(S) client for JWKS documents: rustls on aws-lc-rs with the Mozilla roots built in (the
-/// image has no CA store of its own).
-pub(super) fn client() -> Result<Client> {
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(crate::tls::provider())
-        .context("TLS for the JWKS client")?
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Ok(hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(https))
-}
+pub(super) use crate::fetch::{Client, client};
 
 async fn fetch(client: &Client, uri: &http::Uri, timeout: Duration) -> Result<Bytes> {
-    let request = http::Request::get(uri.clone())
-        .header(http::header::ACCEPT, "application/json")
-        .header(http::header::USER_AGENT, "web-server")
-        .body(http_body_util::Empty::new())?;
-    let work = async {
-        let response = client.request(request).await.context("JWKS request")?;
-        if !response.status().is_success() {
-            bail!("JWKS answered {}", response.status());
-        }
-        let limited = http_body_util::Limited::new(response.into_body(), MAX_JWKS);
-        let body = http_body_util::BodyExt::collect(limited)
-            .await
-            .map_err(|e| anyhow!("JWKS body: {e}"))?;
-        Ok(body.to_bytes())
-    };
-    tokio::time::timeout(timeout, work)
-        .await
-        .map_err(|_| anyhow!("JWKS not read within {} ms", timeout.as_millis()))?
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
+    let fetched = crate::fetch::get(client, uri, &headers, MAX_JWKS, timeout).await?;
+    if !fetched.status.is_success() {
+        bail!("JWKS answered {}", fetched.status);
+    }
+    Ok(fetched.body)
 }
 
 fn unix_millis() -> u64 {

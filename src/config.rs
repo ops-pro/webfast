@@ -1666,19 +1666,20 @@ fn parse_status_range(t: &Token) -> Result<(u16, u16)> {
 
 fn parse_upstream(t: &Token) -> Result<Authority> {
     let text = static_text(t)?;
+    upstream_authority(&text).map_err(|e| token_err(t, format!("reverse_proxy: {e}")))
+}
+
+/// An upstream as `reverse_proxy` takes it (`host:port`, `http://host:port`, `:port` for
+/// localhost, `host` for port 80), as the authority it is dialled at. The request checks name
+/// upstreams the same way (`upstreams` in src/jwt and src/apifw).
+pub fn upstream_authority(text: &str) -> std::result::Result<Authority, String> {
     let rest = match text.split_once("://") {
         Some(("http", rest)) => rest,
-        Some((scheme, _)) => bail!(token_err(
-            t,
-            format!("reverse_proxy: {scheme}:// upstreams are not supported (only plain HTTP)")
-        )),
-        None => text.as_str(),
+        Some((scheme, _)) => return Err(format!("{scheme}:// upstreams are not supported (only plain HTTP)")),
+        None => text,
     };
     if rest.starts_with("unix/") || rest.contains('/') {
-        bail!(token_err(
-            t,
-            "reverse_proxy: an upstream is host:port (no unix sockets or paths)"
-        ));
+        return Err("an upstream is host:port (no unix sockets or paths)".into());
     }
     let with_port = if rest.starts_with(':') {
         format!("localhost{rest}")
@@ -1693,7 +1694,35 @@ fn parse_upstream(t: &Token) -> Result<Authority> {
     };
     with_port
         .parse::<Authority>()
-        .map_err(|_| token_err(t, "reverse_proxy: invalid upstream address"))
+        .map_err(|_| "invalid upstream address".to_string())
+}
+
+impl Config {
+    /// Every upstream a `reverse_proxy` of the configuration sends to, once each.
+    pub fn upstreams(&self) -> Vec<Authority> {
+        fn walk(routes: &[Route], out: &mut Vec<Authority>) {
+            for route in routes {
+                match &route.handler {
+                    Handler::Proxy(proxy) => {
+                        for upstream in &proxy.upstreams {
+                            if !out.contains(upstream) {
+                                out.push(upstream.clone());
+                            }
+                        }
+                    }
+                    Handler::Subroute(list) => walk(list, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for server in &self.servers {
+            for site in &server.sites {
+                walk(&site.routes, &mut out);
+            }
+        }
+        out
+    }
 }
 
 fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<ReverseProxy> {

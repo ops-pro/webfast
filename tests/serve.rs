@@ -102,6 +102,28 @@ async fn upstream() -> SocketAddr {
                             .unwrap();
                         return Ok::<_, Infallible>(response);
                     }
+                    // An API's spec as the app behind the proxy serves it: with an ETag, 304 when
+                    // unchanged, 404 while there is none.
+                    if req.uri().path() == "/api/openapi.json" {
+                        let spec = OPENAPI.lock().unwrap().clone();
+                        let etag = format!("\"{}\"", spec.len() * 31 + spec.bytes().map(usize::from).sum::<usize>());
+                        let unchanged = req.headers().get("if-none-match").is_some_and(|v| v == etag.as_str());
+                        let (status, body) = if spec.is_empty() {
+                            (StatusCode::NOT_FOUND, Bytes::new())
+                        } else if unchanged {
+                            (StatusCode::NOT_MODIFIED, Bytes::new())
+                        } else {
+                            OPENAPI_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            (StatusCode::OK, Bytes::from(spec))
+                        };
+                        let response = http::Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .header("etag", etag)
+                            .body(Full::new(body).map_err(|never| match never {}).boxed_unsync())
+                            .unwrap();
+                        return Ok::<_, Infallible>(response);
+                    }
                     let header = |name: &str| {
                         req.headers()
                             .get(name)
@@ -245,13 +267,18 @@ async fn start() -> Harness {
 
 /// The harness with its configuration changed first (the request checks, say).
 async fn start_with(adjust: impl FnOnce(&mut webfast::config::Config)) -> Harness {
+    start_with_upstreams(|config, _, _| adjust(config)).await
+}
+
+/// The same, knowing the stub upstreams' addresses: the app's and the streaming service's.
+async fn start_with_upstreams(adjust: impl FnOnce(&mut webfast::config::Config, SocketAddr, SocketAddr)) -> Harness {
     let site = site();
     let app = upstream().await;
     let ai = upstream().await;
     let text = caddyfile(site.path(), app, ai);
     let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
     let mut config = webfast::load_parsed(&file, 1 << 24).unwrap();
-    adjust(&mut config);
+    adjust(&mut config, app, ai);
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -846,6 +873,72 @@ async fn api_requests_are_checked_against_the_spec() {
     assert_eq!(h.get("/api/unknown", &[]).await.status, 403);
     assert_eq!(h.get("/legacy-page", &[]).await.status, 200, "outside the API");
     assert_eq!(h.get("/en/", &[]).await.status, 200, "files too");
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+/// The spec the upstream serves at /api/openapi.json (none while empty), and how often it was
+/// sent whole.
+static OPENAPI: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static OPENAPI_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "api-firewall")]
+fn openapi_with(names: &[&str]) -> String {
+    let paths: Vec<String> = names
+        .iter()
+        .map(|name| format!(r#""/{name}": {{"get": {{"responses": {{"200": {{"description": "ok"}}}}}}}}"#))
+        .collect();
+    format!(
+        r#"{{"openapi": "3.0.3", "info": {{"title": "t", "version": "1"}}, "paths": {{{}}}}}"#,
+        paths.join(", ")
+    )
+}
+
+#[cfg(feature = "api-firewall")]
+#[tokio::test]
+async fn an_api_spec_from_behind_the_proxy_is_read_and_kept_current() {
+    use std::sync::atomic::Ordering;
+    let yaml =
+        "apis:\n  - spec: {uri: /api/openapi.json, refresh: 100ms}\n    base_path: /api\n    reason_header: true\n";
+    let firewall = webfast::apifw::ApiFirewall::from_yaml(yaml, Path::new(".")).unwrap();
+    let h = start_with(|config| config.api_firewall = Some(Arc::new(firewall))).await;
+    let reason = |got: &Got| header(got, "apifw-validation-status").to_string();
+
+    // No spec yet (the upstream answers 404): the API waits, the rest of the site does not.
+    let got = h.get("/api/echo", &[]).await;
+    assert_eq!(
+        (got.status, reason(&got)),
+        (StatusCode::SERVICE_UNAVAILABLE, "spec:unavailable".into())
+    );
+    assert_eq!(h.get("/healthz", &[]).await.status, StatusCode::OK);
+
+    *OPENAPI.lock().unwrap() = openapi_with(&["echo"]);
+    eventually(&h.client, &format!("{}/api/echo", h.base), None, |status, _, _| {
+        status == 200
+    })
+    .await;
+    let got = h.get("/api/other", &[]).await;
+    assert_eq!(
+        (got.status, reason(&got)),
+        (StatusCode::FORBIDDEN, "request:unknown-operation".into())
+    );
+    // The spec's own path is not in the spec: asked from outside, it is checked like any other.
+    assert_eq!(h.get("/api/openapi.json", &[]).await.status, StatusCode::FORBIDDEN);
+
+    // Unchanged, it is not sent again: the looks get 304s.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(OPENAPI_SENT.load(Ordering::Relaxed), 1);
+
+    *OPENAPI.lock().unwrap() = openapi_with(&["echo", "other"]);
+    eventually(&h.client, &format!("{}/api/other", h.base), None, |status, _, _| {
+        status == 200
+    })
+    .await;
+    assert_eq!(OPENAPI_SENT.load(Ordering::Relaxed), 2);
+
+    // Gone from the upstream: the last spec holds (no ttl set).
+    OPENAPI.lock().unwrap().clear();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.get("/api/other", &[]).await.status, StatusCode::OK);
     h.running.shutdown(Duration::from_secs(1)).await;
 }
 
@@ -1547,4 +1640,69 @@ fn decompress(encoding: &str, data: &[u8]) -> Vec<u8> {
         _ => unreachable!(),
     };
     out
+}
+
+#[cfg(all(feature = "jwt", feature = "api-firewall"))]
+#[tokio::test]
+async fn checks_bound_to_an_upstream_cover_what_goes_there() {
+    // The app's spec under /api, bound to the app: the streaming upstream, also under /api, and the
+    // app's pages outside /api are not its business. JWT bound to the streaming upstream only.
+    let spec = "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths:\n  /echo:\n    get:\n      parameters: [{name: q, in: query, schema: {type: integer}}]\n      responses: {'200': {description: ok}}\n";
+    let jwks = r#"{"keys":[{"kty":"EC","crv":"P-256","kid":"k","x":"aHVs20Hxxnm1yF0cI-pshIRk5pGnYY4yPQh0qLvTyho","y":"zPVbJZIvuwtf_IyJ5X0LBECsLRdRV_1EmuHbVBiF0Ng"}]}"#;
+    let h = start_with_upstreams(|config, app, ai| {
+        let firewall = webfast::apifw::ApiFirewall::from_spec(
+            spec,
+            &format!("spec: inline\nupstreams: ['{app}']\nbase_path: /api\nreason_header: true\n"),
+        )
+        .unwrap();
+        let yaml = format!(
+            "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\nrules:\n  - match: {{upstreams: ['{ai}']}}\n    providers: [id]\n"
+        );
+        config.api_firewall = Some(Arc::new(firewall));
+        config.jwt = Some(Arc::new(webfast::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap()));
+    })
+    .await;
+    let reason = |got: &Got| header(got, "apifw-validation-status").to_string();
+
+    assert_eq!(h.get("/api/echo?q=1", &[]).await.status, 200);
+    let got = h.get("/api/echo?q=x", &[]).await;
+    assert_eq!(
+        (got.status, reason(&got)),
+        (StatusCode::FORBIDDEN, "request-parameter:query:q".into())
+    );
+    assert_eq!(h.get("/api/unknown", &[]).await.status, 403);
+    assert_eq!(h.get("/legacy-page", &[]).await.status, 200, "to the app, outside /api");
+    let stream = h.get("/api/stream/chat", &[]).await;
+    assert_eq!(
+        (stream.status, reason(&stream)),
+        (StatusCode::UNAUTHORIZED, String::new()),
+        "JWT, not the spec"
+    );
+    assert_eq!(
+        h.get("/api/stream/other", &[]).await.status,
+        404,
+        "answered by the routes, no upstream"
+    );
+    assert_eq!(h.get("/en/", &[]).await.status, 200, "files");
+    h.running.shutdown(Duration::from_secs(1)).await;
+}
+
+#[cfg(feature = "api-firewall")]
+#[tokio::test]
+async fn checks_bound_to_an_upstream_no_route_sends_to_stop_the_start() {
+    let mut config = load(":0 {\n\treverse_proxy /api/* 127.0.0.1:9\n}\n");
+    let firewall = webfast::apifw::ApiFirewall::from_spec(
+        "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths: {}\n",
+        "spec: inline\nupstreams: ['127.0.0.1:19']\n",
+    )
+    .unwrap();
+    config.api_firewall = Some(Arc::new(firewall));
+    let err = match server::start(config).await {
+        Ok(_) => panic!("started"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("127.0.0.1:19 (API firewall)") && err.contains("127.0.0.1:9"),
+        "{err}"
+    );
 }

@@ -32,7 +32,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 jwt = ["dep:hyper-rustls", "dep:serde", "dep:serde_yaml_ng"]
 # OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
 # file; without the feature none of its code or dependencies is built.
-api-firewall = ["dep:jsonschema", "dep:serde", "dep:serde_yaml_ng"]
+api-firewall = ["dep:hyper-rustls", "dep:jsonschema", "dep:serde", "dep:serde_yaml_ng"]
 
 [dependencies]
 anyhow = "1"

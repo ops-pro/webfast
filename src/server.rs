@@ -49,6 +49,9 @@ pub struct ServerState {
     /// to tell whether a request's Host is served with the connection's one.
     host_check: Option<Arc<CertResolver>>,
     checks: Checks,
+    /// The same checks when some are bound to upstreams, for the proxies (src/proxy.rs); `None`:
+    /// requests carry nothing for them.
+    upstream_checks: Option<Arc<Checks>>,
 }
 
 /// What every request is checked by before its site's routes and ready answers, when configured:
@@ -90,17 +93,110 @@ impl Checks {
     /// `Ok` with the body to go on with (the same bytes, when a check read it), or the answer
     /// that refuses the request.
     #[allow(clippy::result_large_err)]
-    async fn check(&self, parts: &mut http::request::Parts, body: Body) -> std::result::Result<Body, Response<Body>> {
+    async fn check(
+        &self,
+        parts: &mut http::request::Parts,
+        body: Body,
+        client_ip: IpAddr,
+    ) -> std::result::Result<Body, Response<Body>> {
+        let _ = client_ip;
         let _ = &parts;
         #[cfg(feature = "jwt")]
         if let Some(jwt) = &self.jwt {
-            jwt.check(parts).await?;
+            jwt.check(parts, client_ip).await?;
         }
         #[cfg(feature = "api-firewall")]
         if let Some(firewall) = &self.api_firewall {
-            return firewall.check(parts, body).await;
+            #[cfg(feature = "jwt")]
+            let hidden = self.jwt.as_ref().map_or(&[][..], |jwt| jwt.hidden_params());
+            #[cfg(not(feature = "jwt"))]
+            let hidden: &[String] = &[];
+            return firewall.check(parts, body, client_ip, hidden).await;
         }
         Ok(body)
+    }
+
+    /// Whether a rule or an API is bound to upstreams: the proxies then check too (src/proxy.rs).
+    fn bound_to_upstreams(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut bound = false;
+        #[cfg(feature = "jwt")]
+        {
+            bound |= self.jwt.as_ref().is_some_and(|jwt| jwt.bound_to_upstreams());
+        }
+        #[cfg(feature = "api-firewall")]
+        {
+            bound |= self.api_firewall.as_ref().is_some_and(|fw| fw.bound_to_upstreams());
+        }
+        bound
+    }
+
+    /// At a `reverse_proxy` about to send the request to one of `upstreams`: the JWT rules and
+    /// the APIs bound to them, as `check` does before the routes.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn check_upstream(
+        &self,
+        parts: &mut http::request::Parts,
+        body: Body,
+        client_ip: IpAddr,
+        upstreams: &[http::uri::Authority],
+    ) -> std::result::Result<Body, Response<Body>> {
+        let _ = (client_ip, upstreams, &parts);
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.jwt {
+            jwt.check_upstream(parts, client_ip, upstreams).await?;
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.api_firewall {
+            #[cfg(feature = "jwt")]
+            let hidden = self.jwt.as_ref().map_or(&[][..], |jwt| jwt.hidden_params());
+            #[cfg(not(feature = "jwt"))]
+            let hidden: &[String] = &[];
+            return firewall.check_upstream(parts, body, client_ip, hidden, upstreams).await;
+        }
+        Ok(body)
+    }
+}
+
+/// Refuses request checks bound to an upstream no `reverse_proxy` of `config` sends to: a typo,
+/// or routes changed since, would otherwise leave the requests going there unchecked.
+pub fn check_bindings(config: &Config) -> Result<()> {
+    Checks::from_config(config).bound_within(&config.upstreams())
+}
+
+impl Checks {
+    /// `Ok` when every upstream these checks are bound to is one of `known` (the upstreams the
+    /// `reverse_proxy`s send to): at startup, and for a reloaded Caddyfile, which keeps the checks.
+    fn bound_within(&self, known: &[http::uri::Authority]) -> Result<()> {
+        let _ = known;
+        #[allow(unused_mut)]
+        let mut missing: Vec<String> = Vec::new();
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.jwt {
+            for upstream in jwt.upstreams().filter(|u| !known.contains(u)) {
+                missing.push(format!("{upstream} (JWT)"));
+            }
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.api_firewall {
+            for upstream in firewall.upstreams().filter(|u| !known.contains(u)) {
+                missing.push(format!("{upstream} (API firewall)"));
+            }
+        }
+        missing.dedup();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let known: Vec<String> = known.iter().map(|u| u.to_string()).collect();
+        anyhow::bail!(
+            "request checks bound to upstreams no reverse_proxy sends to: {}; the Caddyfile's are: {}",
+            missing.join(", "),
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
     }
 }
 
@@ -298,6 +394,24 @@ enum Way {
     Chain(Arc<[Route]>, Option<Arc<[Route]>>),
 }
 
+/// Marks a request the server makes of its own routes (an API spec given as a path, src/apifw):
+/// the request checks and the Host check pass it by. Only set in the process; a client cannot.
+#[derive(Debug, Clone, Copy)]
+pub struct InternalRequest;
+
+/// Requests to this server's own routes, as a client on the loopback would make them.
+#[cfg(feature = "api-firewall")]
+fn local_fetch(state: Arc<ServerState>) -> crate::apifw::LocalFetch {
+    Arc::new(move |mut request: Request<Body>| {
+        let state = state.clone();
+        Box::pin(async move {
+            request.extensions_mut().insert(InternalRequest);
+            let conn = state.connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+            handle(conn, request).await
+        })
+    })
+}
+
 /// Handles one request on any protocol.
 pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Response<Body> {
     let started = Instant::now();
@@ -305,7 +419,9 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let remote = connection.info.remote;
     let version = parts.version;
     // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
-    let misdirected = connection.state.misdirected(&connection.info, &parts);
+    // A request the server makes of itself (src/apifw: a spec given as a path) passes both by.
+    let internal = parts.extensions.get::<InternalRequest>().is_some();
+    let misdirected = !internal && connection.state.misdirected(&connection.info, &parts);
     // The site, in the connection's routing (WEB_RELOAD=lazy, drain) or in the port's as it is now; what
     // the request needs of it is taken out, so that nothing holds the routing across an await.
     let picked = {
@@ -361,8 +477,8 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         let mut response = Response::new(crate::body::empty());
         *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
         (Way::Ready(response), crate::body::empty())
-    } else if state.checks.any() {
-        match state.checks.check(&mut parts, body).await {
+    } else if !internal && state.checks.any() {
+        match state.checks.check(&mut parts, body, client_ip).await {
             Ok(body) => (way, body),
             Err(response) => (Way::Ready(response), crate::body::empty()),
         }
@@ -374,7 +490,10 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         Way::Chain(routes, errors) => {
             // With `handle_errors`, the request as sent is kept for them.
             let kept = errors.map(|errors| (errors, request_head(&parts), conn.clone()));
-            let ctx = Ctx::new(conn, parts, body, client_ip);
+            let mut ctx = Ctx::new(conn, parts, body, client_ip);
+            if !internal {
+                ctx.upstream_checks = state.upstream_checks.clone();
+            }
             let response = Next::start(routes).run(ctx).await;
             match (kept, response.extensions().get::<Failed>()) {
                 (Some((errors, original, conn)), Some(Failed(error))) => {
@@ -471,6 +590,8 @@ struct Port {
 struct Shape {
     port: u16,
     tls: bool,
+    /// `strict_sni_host`: the Host check is set up with the port's certificates.
+    strict_host: bool,
     protocols: Protocols,
     limits: Limits,
     per_core: bool,
@@ -483,6 +604,7 @@ impl Shape {
         Shape {
             port: server.port,
             tls: server.tls.is_some(),
+            strict_host: server.strict_host,
             protocols: server.protocols,
             limits: server.limits,
             per_core: server.per_core,
@@ -496,6 +618,9 @@ impl Shape {
         let mut what = Vec::new();
         if self.tls != new.tls {
             what.push("TLS on or off");
+        }
+        if self.strict_host != new.strict_host {
+            what.push("strict_sni_host");
         }
         if self.protocols != new.protocols {
             what.push("protocols");
@@ -537,6 +662,11 @@ impl Running {
     /// started with. The ports must stay as they are (`Shape`): what only a restart can change is
     /// refused, and the running configuration stays — as it does when anything else fails.
     pub async fn reload(&mut self, config: Config) -> Result<Ready> {
+        // The request checks stay as they started: the new routes must still send to the upstreams
+        // they are bound to.
+        if let Some(port) = self.ports.first() {
+            port.state.checks.bound_within(&config.upstreams())?;
+        }
         let Config {
             servers,
             stores,
@@ -658,6 +788,7 @@ pub async fn start(config: Config) -> Result<Running> {
         stores: Vec::new(),
         watcher: None,
     };
+    check_bindings(&config)?;
     let checks = Checks::from_config(&config);
     #[cfg(feature = "jwt")]
     if let Some(jwt) = &checks.jwt {
@@ -667,6 +798,11 @@ pub async fn start(config: Config) -> Result<Running> {
         start_server(server, &mut running, checks.clone()).await?;
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
+    // Specs given as a uri are read once the server runs (a path: through the first port's routes).
+    #[cfg(feature = "api-firewall")]
+    if let Some(firewall) = &checks.api_firewall {
+        firewall.start(states.first().cloned().map(local_fetch))?;
+    }
     running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
     running.stores = config.stores;
     Ok(running)
@@ -814,6 +950,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, checks: Check
         tls: state_tls,
         alt_svc: None,
         host_check,
+        upstream_checks: checks.bound_to_upstreams().then(|| Arc::new(checks.clone())),
         checks,
     };
     let mut quic_endpoint = None;
@@ -998,7 +1135,16 @@ async fn accept_loop(
                         _ => return,
                     };
                     let conn = conn.with_sni(stream.get_ref().1.server_name());
-                    serve_connection(builder, TokioIo::new(stream), service(conn), mode, &activity, &limits, ends).await;
+                    serve_connection(
+                        builder,
+                        TokioIo::new(stream),
+                        service(conn),
+                        mode,
+                        &activity,
+                        &limits,
+                        ends,
+                    )
+                    .await;
                 }
                 None => {
                     let mode = match (protocols.h1, protocols.h2c) {
@@ -1006,7 +1152,16 @@ async fn accept_loop(
                         (false, true) => Mode::Http2,
                         _ => Mode::Http1,
                     };
-                    serve_connection(builder, TokioIo::new(stream), service(conn), mode, &activity, &limits, ends).await;
+                    serve_connection(
+                        builder,
+                        TokioIo::new(stream),
+                        service(conn),
+                        mode,
+                        &activity,
+                        &limits,
+                        ends,
+                    )
+                    .await;
                 }
             }
         });
