@@ -230,7 +230,8 @@ pub fn stored() -> (usize, usize) {
 
 /// The snapshot requests read, made from the worker's picture.
 fn publish(variants: &Variants) {
-    let mut snapshot = Snapshot::with_capacity_and_hasher(variants.slots.len() + variants.useless.len(), Default::default());
+    let mut snapshot =
+        Snapshot::with_capacity_and_hasher(variants.slots.len() + variants.useless.len(), Default::default());
     for (key, slot) in &variants.slots {
         snapshot.insert(
             *key,
@@ -417,7 +418,9 @@ mod tests {
         let mut variants = variants_of(&[100, 100, 100, 100]);
         // 1 and 3 were asked for since the last pass.
         for i in [1u128, 3] {
-            variants.slots[&(i, Encoding::Br)].touched.store(true, Ordering::Relaxed);
+            variants.slots[&(i, Encoding::Br)]
+                .touched
+                .store(true, Ordering::Relaxed);
         }
         evict(&mut variants, 250);
         let mut kept: Vec<u128> = variants.slots.keys().map(|k| k.0).collect();
@@ -453,7 +456,11 @@ mod tests {
         variants.slots.insert(
             key,
             Slot {
-                variant: Arc::new(FileEntry::variant(bytes::Bytes::from_static(b"made"), None, touched.clone())),
+                variant: Arc::new(FileEntry::variant(
+                    bytes::Bytes::from_static(b"made"),
+                    None,
+                    touched.clone(),
+                )),
                 touched: touched.clone(),
                 source: Arc::downgrade(&file),
                 store: Weak::new(),
@@ -463,7 +470,10 @@ mod tests {
         variants.useless.insert(key_of(&useless, Encoding::Br).unwrap());
         publish(&variants);
         assert!(matches!(lookup(&file, Encoding::Br), Lookup::Have(v) if v.len() == 4));
-        assert!(touched.load(Ordering::Relaxed), "a hit marks the variant for the eviction");
+        assert!(
+            touched.load(Ordering::Relaxed),
+            "a hit marks the variant for the eviction"
+        );
         assert!(matches!(lookup(&file, Encoding::Gzip), Lookup::Missing));
         assert!(matches!(lookup(&useless, Encoding::Br), Lookup::No));
         // A snapshot without them: gone for requests at once.
