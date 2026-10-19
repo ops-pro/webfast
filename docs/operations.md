@@ -74,7 +74,10 @@ with, and no connection is cut by a reload. What the connections already open ge
 ## The Docker image
 
 [`Dockerfile`](../Dockerfile) builds webfast with profile-guided optimisation (`--build-arg
-WEBFAST_PGO=0` builds without it, in about half the time) on Debian slim:
+WEBFAST_PGO=0` builds without it, in about half the time) as one static binary (musl) on an empty
+image (`scratch`): no shell, no libc, no packages, about 25 MB. There is nothing to `docker exec`
+into; to look inside a running container use `docker debug` or an ephemeral container
+(`docker run --pid container:web …`). The roots for HTTPS fetches are built in.
 
 | What          | Where                                                                                 |
 | ------------- | ------------------------------------------------------------------------------------- |

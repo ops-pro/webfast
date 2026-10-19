@@ -98,7 +98,7 @@ HTTPS and HTTP/3 served directly, a hardened systemd service — each checked by
   where each cargo feature takes part.
 - [Configuration](docs/configuration.md): the Caddyfile subset, how it differs from Caddy, the
   environment variables.
-- [Operations](docs/operations.md): the Docker image, running behind a proxy or with TLS and
+- [Operations](docs/operations.md): the Docker image (static, on `scratch`), running behind a proxy or with TLS and
   HTTP/3, the host's settings, logs, limits, changed files, workers.
 - [Performance](docs/performance.md): how it is built for speed, and every measurement.
 - [Development](docs/development.md): layout, checks, tests, the PGO build, the compatibility check
