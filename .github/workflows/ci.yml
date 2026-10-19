@@ -1,0 +1,79 @@
+# The checks of scripts/check.sh on every push and pull request: formatting, clippy with every
+# feature and with each alone, the tests on x86-64 and arm64, the tests on the minimum Rust
+# (Cargo.toml's rust-version), and cargo-deny (advisories, licenses, bans, sources).
+name: CI
+
+on:
+  push:
+    branches: [main, dev-ci]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: every feature
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: no extension
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: each extension alone
+        run: |
+          for feature in mimalloc rate-limit proxy-cache jwt api-firewall compress-files; do
+            echo "::group::$feature"
+            cargo clippy --locked --all-targets --no-default-features --features "$feature" -- -D warnings
+            echo "::endgroup::"
+          done
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: the minimum Rust, from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

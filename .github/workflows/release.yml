@@ -1,0 +1,170 @@
+# The image and the binaries, for x86-64 and arm64, each built on a runner of its architecture
+# (profile-guided optimisation trains the build under a load, which emulation would make slow and
+# unrepresentative). The image goes to ghcr.io/<owner>/webfast as one multi-arch manifest: tagged
+# sha-<commit> on every push to main, and on a tag vX.Y.Z also X.Y.Z and latest. The binaries are
+# static (musl) and, on a tag, published as release assets with checksums. Every artifact gets a
+# provenance attestation (SLSA, Sigstore); a release also an SBOM attestation.
+name: Release
+
+on:
+  push:
+    branches: [main, dev-ci]
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The binary: static, with PGO (pgo/build.sh trains the instrumented build on this runner).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: build the binary
+        env:
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Ctarget-feature=+crt-static
+        run: sh pgo/build.sh out
+      - name: name and check it
+        id: binary
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/*) ;; *) version="${GITHUB_SHA::7}" ;; esac
+          name="webfast-$version-${{ matrix.target }}"
+          ./out/webfast --version
+          file out/webfast
+          tar -C out -czf "$name.tar.gz" webfast
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.binary.outputs.name }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: |
+            ${{ steps.binary.outputs.name }}.tar.gz
+            ${{ steps.binary.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+      # The image for this architecture, pushed by digest; the manifest job names it.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push the image by digest
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - name: keep the digest for the manifest
+        run: |
+          mkdir -p digests
+          touch "digests/${{ steps.image.outputs.digest }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: one manifest for both architectures
+        working-directory: digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+      - name: what was published
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, manifest]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: assets
+          merge-multiple: true
+      - name: software bill of materials
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: webfast-${{ github.ref_name }}.spdx.json
+          artifact-name: sbom
+      - uses: actions/attest-sbom@v2
+        with:
+          subject-path: assets/*.tar.gz
+          sbom-path: webfast-${{ github.ref_name }}.spdx.json
+      - name: the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp webfast-${{ github.ref_name }}.spdx.json assets/
+          gh release create "${{ github.ref_name }}" assets/* \
+            --title "webfast ${{ github.ref_name }}" \
+            --notes "Image: \`${{ env.IMAGE }}:${GITHUB_REF_NAME#v}\` (linux/amd64, linux/arm64). Binaries: static (musl), with provenance and SBOM attestations (\`gh attestation verify\`). Changes: CHANGELOG.md." \
+            --verify-tag

@@ -1,5 +1,7 @@
 # webfast
 
+[![CI](https://github.com/ops-pro/webfast/actions/workflows/ci.yml/badge.svg)](https://github.com/ops-pro/webfast/actions/workflows/ci.yml)
+
 A static-first web server for sites that are built ahead of time. It holds the whole site in
 memory, sends browsers the precompressed `.br` / `.zst` / `.gz` siblings the build made, proxies
 the dynamic paths to the application behind it, and speaks HTTP/1.1, HTTP/2 and HTTP/3. It is
@@ -110,7 +112,9 @@ HTTPS and HTTP/3 served directly, a hardened systemd service — each checked by
 scripts/check.sh          # formatting, lints, tests, the minimum Rust version, cargo-deny (in Docker)
 ```
 
-The same jobs run in CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)), which also builds the image.
+The same jobs run in CI ([`ci.yml`](.github/workflows/ci.yml)); [`release.yml`](.github/workflows/release.yml)
+builds the image for x86-64 and arm64 (`ghcr.io/ops-pro/webfast`) and the static binaries, with
+provenance attestations.
 
 ## License
 

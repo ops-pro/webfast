@@ -6,9 +6,8 @@ webfast faces the internet, so we treat reports about it as a priority.
 
 Please report it privately — not in a public issue, merge request or discussion:
 
-- where the project is hosted on GitHub: the repository's **Security** tab → **Report a
+- the repository's **Security** tab → **Report a
   vulnerability** (private vulnerability reporting);
-- where it is hosted on GitLab: a **new issue marked confidential**.
 
 Tell us what you can of:
 

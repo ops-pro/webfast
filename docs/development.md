@@ -65,13 +65,17 @@ scripts/check.sh fmt clippy # some
 
 `check.sh` runs each in a `rust:*-slim-bookworm` container, with the crate cache, the build
 directory and the tools in Docker volumes (`webfast-cargo`, `webfast-target`, `webfast-tools`).
-CI ([`.gitlab-ci.yml`](../.gitlab-ci.yml)) runs the same jobs on every push and merge request, and
-builds the image on the default branch and tags.
+CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the same jobs on every push and pull
+request, the tests on x86-64 and arm64; [`release.yml`](../.github/workflows/release.yml)
+builds the image (both architectures, one manifest on ghcr.io) and the static binaries on `main`
+and on tags, each on a runner of its architecture.
 
-Cargo features, all on by default: `mimalloc` (the allocator of the binary and of
-`examples/bench.rs`), `proxy-cache` (`cache` and `WEB_PROXY_CACHE_MEMORY`, src/cache.rs) and
-`rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`,
-src/ratelimit.rs; without it the directive and its variables stop the startup with an error that
+Cargo features, all on by default (docs/extensions.md): `mimalloc` (the allocator of the binary and of
+`examples/bench.rs`), `proxy-cache` (`cache` and `WEB_PROXY_CACHE_MEMORY`, src/cache.rs),
+`rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, src/ratelimit.rs), `jwt`
+(`WEB_JWT_CONFIG`, src/jwt), `api-firewall` (`WEB_API_FIREWALL_CONFIG`, src/apifw) and
+`compress-files` (`WEB_COMPRESSED_FILES_MEMORY`, src/variants.rs;
+without a feature its directive and variables stop the startup with an error that
 says so). `--no-default-features` builds the server without
 them; clippy checks that build too.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The checks CI runs (.gitlab-ci.yml), here in Docker — the host needs nothing else:
+# The checks CI runs (.github/workflows/ci.yml), here in Docker — the host needs nothing else:
 #
 #   scripts/check.sh [fmt] [clippy] [test] [msrv] [deny]     (none named: all)
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=${RUST_IMAGE:-rust:1-slim-bookworm}
 msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$root/Cargo.toml")
-deny_version=${CARGO_DENY_VERSION:-$(sed -n 's/.*cargo install --locked cargo-deny --version \([0-9.]*\).*/\1/p' "$root/.gitlab-ci.yml")}
+deny_version=${CARGO_DENY_VERSION:-0.20.2}
 checks=("$@")
 [ ${#checks[@]} -gt 0 ] || checks=(fmt clippy test msrv deny)
 
