@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Requests read the compressed variants from a snapshot (`ArcSwap`) instead of under a `RwLock`;
+  the proxy cache hashes its keys with ahash (keyed per process) instead of SipHash.
 - ETags are 8 characters of base64url (48 bits of the BLAKE3 hash) instead of 20 of hex; a
   representation `encode` makes on the fly gets a ninth character (`b`, `g`, `z`) instead of
   `-br` / `-gzip` / `-zstd`, a `dcz` delta `d` and 8 characters of its dictionary's hash, an

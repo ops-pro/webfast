@@ -245,16 +245,17 @@ impl Directives {
     }
 }
 
-/// The entries, by a hash of their key (keyed by the process), in shards.
+/// The entries, by a hash of their key (ahash, keyed by the process: a client cannot aim keys at one
+/// shard), in shards.
 struct Store {
-    hasher: std::hash::RandomState,
+    hasher: ahash::RandomState,
     shards: Vec<Mutex<FxHashMap<u64, Arc<Entry>>>>,
     /// The order entries came in and what they take (src/background.rs: CLOCK eviction).
     budget: Mutex<Budget<Weak<Entry>>>,
 }
 
 static STORE: LazyLock<Store> = LazyLock::new(|| Store {
-    hasher: std::hash::RandomState::new(),
+    hasher: ahash::RandomState::new(),
     shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
     budget: Mutex::new(Budget::new()),
 });

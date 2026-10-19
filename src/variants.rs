@@ -14,16 +14,19 @@
 //! reload dropped). Its memory is free once the ready answers holding it are worked out again and
 //! the responses sending it have ended.
 //!
-//! Nothing is made while ready answers are prepared: a startup or a rescan compresses nothing by
-//! itself, only what is asked for is.
+//! Requests read a snapshot of the variants (`ArcSwap`, no lock: a load and a lookup); the worker,
+//! the only writer, keeps the full picture under a mutex of its own and publishes a new snapshot
+//! after each change. Nothing is made while ready answers are prepared: a startup or a rescan
+//! compresses nothing by itself, only what is asked for is.
 
 use crate::background::{Budget, Seen, Worker};
 use crate::encode::{Encoding, compress_best};
 use crate::extensions::Lookup;
 use crate::files::{FileEntry, FileStore};
+use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 /// The default of WEB_COMPRESSED_FILES_MEMORY.
@@ -39,6 +42,8 @@ const QUEUE: usize = 256;
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// Variants of files gone are dropped, and a summary logged, this often.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// Files found not worth a variant are remembered up to this many; then the memory starts over.
+const USELESS_REMEMBERED: usize = 100_000;
 
 /// WEB_COMPRESSED_FILES_MEMORY: a size (`64MiB`), or `off`.
 pub fn configure_from_env() -> Result<(), String> {
@@ -67,6 +72,7 @@ fn key_of(entry: &FileEntry, encoding: Encoding) -> Option<Key> {
     Some((u128::from_le_bytes(hash[..16].try_into().ok()?), encoding))
 }
 
+/// A variant as the worker keeps it.
 struct Slot {
     variant: Arc<FileEntry>,
     touched: Arc<AtomicBool>,
@@ -77,18 +83,33 @@ struct Slot {
     size: usize,
 }
 
-/// The variants kept, and their budget (the CLOCK order and what they take).
+/// What a request finds in the snapshot.
+enum Kept {
+    Have {
+        variant: Arc<FileEntry>,
+        touched: Arc<AtomicBool>,
+    },
+    /// Made and found not worth keeping (it saved less than a tenth): not asked for again.
+    Useless,
+}
+
+type Snapshot = FxHashMap<Key, Kept>;
+
+/// The variants kept, their budget (the CLOCK order and what they take) and the files found not
+/// worth one: the worker's, under its mutex; `publish` makes the snapshot requests read.
 #[derive(Default)]
 struct Variants {
     slots: FxHashMap<Key, Slot>,
     budget: Budget<Key>,
+    useless: FxHashSet<Key>,
 }
 
-static VARIANTS: LazyLock<RwLock<Variants>> = LazyLock::new(Default::default);
+/// What requests read: a load, no lock (src/memo.rs and src/files.rs share the pattern).
+static SNAPSHOT: LazyLock<ArcSwap<Snapshot>> = LazyLock::new(|| ArcSwap::from_pointee(Snapshot::default()));
+/// The worker's full picture; taken by the worker, and by `stored` for a summary.
+static WRITER: LazyLock<Mutex<Variants>> = LazyLock::new(Default::default);
 /// Asked for and not made yet.
 static PENDING: LazyLock<Mutex<FxHashSet<Key>>> = LazyLock::new(Default::default);
-/// Made and found not worth keeping (they save less than a tenth): not asked for again.
-static USELESS: LazyLock<Mutex<FxHashSet<Key>>> = LazyLock::new(Default::default);
 /// The stores whose variants came or went since the ready answers were last worked out again.
 static CHANGED: Mutex<Vec<Weak<FileStore>>> = Mutex::new(Vec::new());
 
@@ -117,14 +138,14 @@ pub fn lookup(entry: &FileEntry, encoding: Encoding) -> Lookup {
     let Some(key) = key_of(entry, encoding) else {
         return Lookup::No;
     };
-    if let Some(slot) = VARIANTS.read().unwrap_or_else(PoisonError::into_inner).slots.get(&key) {
-        slot.touched.store(true, Ordering::Relaxed);
-        return Lookup::Have(slot.variant.clone());
+    match SNAPSHOT.load().get(&key) {
+        Some(Kept::Have { variant, touched }) => {
+            touched.store(true, Ordering::Relaxed);
+            Lookup::Have(variant.clone())
+        }
+        Some(Kept::Useless) => Lookup::No,
+        None => Lookup::Missing,
     }
-    if USELESS.lock().unwrap_or_else(PoisonError::into_inner).contains(&key) {
-        return Lookup::No;
-    }
-    Lookup::Missing
 }
 
 /// One file to compress.
@@ -203,12 +224,31 @@ pub fn wanted(entry: &Arc<FileEntry>, store: &Arc<FileStore>, encodings: &[Encod
 
 /// The variants kept and what they take (for the log, tests and diagnostics).
 pub fn stored() -> (usize, usize) {
-    let variants = VARIANTS.read().unwrap_or_else(PoisonError::into_inner);
+    let variants = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
     (variants.slots.len(), variants.budget.used())
+}
+
+/// The snapshot requests read, made from the worker's picture.
+fn publish(variants: &Variants) {
+    let mut snapshot = Snapshot::with_capacity_and_hasher(variants.slots.len() + variants.useless.len(), Default::default());
+    for (key, slot) in &variants.slots {
+        snapshot.insert(
+            *key,
+            Kept::Have {
+                variant: slot.variant.clone(),
+                touched: slot.touched.clone(),
+            },
+        );
+    }
+    for key in &variants.useless {
+        snapshot.insert(*key, Kept::Useless);
+    }
+    SNAPSHOT.store(Arc::new(snapshot));
 }
 
 fn make(job: Job) {
     let body = job.source.body();
+    let mut changed = false;
     for &encoding in &job.encodings {
         let Some(key) = key_of(&job.source, encoding) else {
             continue;
@@ -229,7 +269,7 @@ fn make(job: Job) {
                     job.source.content_type.clone(),
                     touched.clone(),
                 ));
-                let mut variants = VARIANTS.write().unwrap_or_else(PoisonError::into_inner);
+                let mut variants = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
                 let slot = Slot {
                     variant,
                     touched,
@@ -242,27 +282,31 @@ fn make(job: Job) {
                 }
                 variants.budget.add(key, size);
                 evict(&mut variants, max);
-                drop(variants);
+                changed = true;
                 MADE.fetch_add(1, Ordering::Relaxed);
                 note(&job.store);
             }
             Some(_) => {
-                let mut useless = USELESS.lock().unwrap_or_else(PoisonError::into_inner);
-                if useless.len() >= 100_000 {
-                    useless.clear();
+                let mut variants = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+                if variants.useless.len() >= USELESS_REMEMBERED {
+                    variants.useless.clear();
                 }
-                useless.insert(key);
+                variants.useless.insert(key);
+                changed = true;
             }
             None => {}
         }
         PENDING.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
+    }
+    if changed {
+        publish(&WRITER.lock().unwrap_or_else(PoisonError::into_inner));
     }
 }
 
 /// The budget's CLOCK pass over the variants: past `max`, a variant asked for since the last pass
 /// gets another round, the first that was not goes.
 fn evict(variants: &mut Variants, max: usize) {
-    let Variants { slots, budget } = variants;
+    let Variants { slots, budget, .. } = variants;
     budget.evict(max, |key| match slots.get(key) {
         None => Seen::Gone,
         Some(slot) if slot.touched.swap(false, Ordering::Relaxed) => Seen::Marked,
@@ -278,7 +322,7 @@ fn evict(variants: &mut Variants, max: usize) {
 /// Drops the variants of files that are gone; past a lowered WEB_COMPRESSED_FILES_MEMORY, some
 /// more.
 fn sweep() {
-    let mut variants = VARIANTS.write().unwrap_or_else(PoisonError::into_inner);
+    let mut variants = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
     let mut released = 0;
     let mut gone = Vec::new();
     variants.slots.retain(|_, slot| {
@@ -292,11 +336,12 @@ fn sweep() {
     for store in &gone {
         note(store);
     }
-    let Variants { slots, budget } = &mut *variants;
+    let Variants { slots, budget, .. } = &mut *variants;
     budget.release(released);
     budget.retain(|key| slots.contains_key(key));
     let max = MAX_MEMORY.load(Ordering::Relaxed);
     evict(&mut variants, max);
+    publish(&variants);
 }
 
 /// A store whose variants changed: its sites' ready answers are worked out again (`refresh`).
@@ -372,9 +417,7 @@ mod tests {
         let mut variants = variants_of(&[100, 100, 100, 100]);
         // 1 and 3 were asked for since the last pass.
         for i in [1u128, 3] {
-            variants.slots[&(i, Encoding::Br)]
-                .touched
-                .store(true, Ordering::Relaxed);
+            variants.slots[&(i, Encoding::Br)].touched.store(true, Ordering::Relaxed);
         }
         evict(&mut variants, 250);
         let mut kept: Vec<u128> = variants.slots.keys().map(|k| k.0).collect();
@@ -398,5 +441,33 @@ mod tests {
         let image = FileEntry::new("/photo.jpg", vec![7u8; 4096], None);
         assert!(!eligible(&image), "not a compressible type");
         assert!(!eligible(&FileEntry::new("/tiny.js", b"1".to_vec(), None)), "too small");
+    }
+
+    #[test]
+    fn requests_read_what_the_worker_published() {
+        let file = Arc::new(FileEntry::new("/published.js", b"var p = 1;".repeat(200), None));
+        let useless = FileEntry::new("/useless.js", b"var u = 2;".repeat(200), None);
+        let mut variants = Variants::default();
+        let touched = Arc::new(AtomicBool::new(false));
+        let key = key_of(&file, Encoding::Br).unwrap();
+        variants.slots.insert(
+            key,
+            Slot {
+                variant: Arc::new(FileEntry::variant(bytes::Bytes::from_static(b"made"), None, touched.clone())),
+                touched: touched.clone(),
+                source: Arc::downgrade(&file),
+                store: Weak::new(),
+                size: 4,
+            },
+        );
+        variants.useless.insert(key_of(&useless, Encoding::Br).unwrap());
+        publish(&variants);
+        assert!(matches!(lookup(&file, Encoding::Br), Lookup::Have(v) if v.len() == 4));
+        assert!(touched.load(Ordering::Relaxed), "a hit marks the variant for the eviction");
+        assert!(matches!(lookup(&file, Encoding::Gzip), Lookup::Missing));
+        assert!(matches!(lookup(&useless, Encoding::Br), Lookup::No));
+        // A snapshot without them: gone for requests at once.
+        publish(&Variants::default());
+        assert!(matches!(lookup(&file, Encoding::Br), Lookup::Missing));
     }
 }

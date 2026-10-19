@@ -48,6 +48,9 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_yaml_ng = { version = "0.10", optional = true }
 # The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
 # requests load them without counting references.
+# Keys of the proxy cache hashed with a per-process random key: safe against made-up collisions
+# like SipHash, at a fraction of its cost (src/cache.rs).
+ahash = "0.8"
 arc-swap = "1"
 # SHA-256 of the files that may be compression dictionaries (src/files.rs) and JWT signatures
 # with keys parsed once (src/jwt); already the TLS
