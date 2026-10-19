@@ -97,7 +97,9 @@ jobs:
       - name: keep the digest for the manifest
         run: |
           mkdir -p digests
-          touch "digests/${{ steps.image.outputs.digest }}"
+          # Named by the hex alone: upload-artifact refuses a colon in a file name.
+          digest="${{ steps.image.outputs.digest }}"
+          touch "digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
