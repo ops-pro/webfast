@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- ETags are 8 characters of base64url (48 bits of the BLAKE3 hash) instead of 20 of hex; a
+  representation `encode` makes on the fly gets a ninth character (`b`, `g`, `z`) instead of
+  `-br` / `-gzip` / `-zstd`, a `dcz` delta `d` and 8 characters of its dictionary's hash, an
+  upstream's ETag `.` and the letter. Files served from disk use the same form. After the
+  upgrade every conditional request misses once (the ETags clients hold are of the old form).
+  Compressed variants are keyed by the file's SHA-256, not its ETag.
 - Extensions (docs/extensions.md): the optional pieces plug into the core through hook traits
   composed at compile time (`src/extensions.rs`), with nothing on the request path for a feature
   that is off and a direct call for one that is on; one `Worker` and one `Budget`

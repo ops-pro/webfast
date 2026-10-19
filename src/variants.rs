@@ -59,13 +59,12 @@ pub fn set_max_memory(bytes: usize) {
     MAX_MEMORY.store(bytes, Ordering::Relaxed);
 }
 
-/// A file (by its ETag, the hash of its content: 80 bits) in an encoding.
+/// A file (by the SHA-256 of its content, 128 bits of it) in an encoding.
 type Key = (u128, Encoding);
 
 fn key_of(entry: &FileEntry, encoding: Encoding) -> Option<Key> {
-    let etag = entry.etag.to_str().ok()?;
-    let hex = etag.strip_prefix('"')?.strip_suffix('"')?;
-    Some((u128::from_str_radix(hex, 16).ok()?, encoding))
+    let hash = entry.sha256?;
+    Some((u128::from_le_bytes(hash[..16].try_into().ok()?), encoding))
 }
 
 struct Slot {

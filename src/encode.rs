@@ -49,6 +49,15 @@ impl Encoding {
         }
     }
 
+    /// The ninth character of an ETag for a representation made on the fly (`etag_with`).
+    pub fn letter(self) -> char {
+        match self {
+            Encoding::Zstd => 'z',
+            Encoding::Br => 'b',
+            Encoding::Gzip => 'g',
+        }
+    }
+
     /// Suffix of a precompressed sibling file.
     pub fn suffix(self) -> &'static str {
         match self {
@@ -227,14 +236,11 @@ impl Encode {
     /// The encoding for this request, and its If-None-Match with our ETag suffix taken off.
     pub fn choose(&self, accept: AcceptEncoding, headers: &mut HeaderMap) -> Option<Encoding> {
         let encoding = accept.ranked(&self.formats).next()?;
-        // `"<etag>-<encoding>"` → `"<etag>"`; nothing is built unless the suffix is there.
+        // The If-None-Match our ETag for this encoding was made from (`etag_with`); nothing is
+        // built unless it is one.
         if let Some(inm) = headers.get(http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
-            && !inm.starts_with("W/")
-            && let Some(stripped) = inm
-                .strip_suffix('"')
-                .and_then(|t| t.strip_suffix(encoding.name()))
-                .and_then(|t| t.strip_suffix('-'))
-            && let Ok(value) = HeaderValue::from_str(&[stripped, "\""].concat())
+            && let Some(base) = etag_without(inm, encoding.letter())
+            && let Ok(value) = HeaderValue::from_str(&base)
         {
             headers.insert(http::header::IF_NONE_MATCH, value);
         }
@@ -263,7 +269,7 @@ impl Encode {
         headers.remove(ACCEPT_RANGES);
         if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok())
             && !etag.starts_with("W/")
-            && let Ok(value) = HeaderValue::from_str(&[etag.trim_end_matches('"'), "-", encoding.name(), "\""].concat())
+            && let Some(value) = etag_with(etag, encoding.letter())
         {
             headers.insert(ETAG, value);
         }
@@ -351,6 +357,31 @@ impl Encode {
     }
 }
 
+/// `etag` (strong, with its quotes) for a representation in the encoding `letter` names: a ninth
+/// character on an ETag of ours (src/files.rs), `.` and the letter on any other (an upstream's).
+pub fn etag_with(etag: &str, letter: char) -> Option<HeaderValue> {
+    let inner = etag.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len() + 4);
+    out.push('"');
+    out.push_str(inner);
+    if !crate::files::is_own_etag(inner) {
+        out.push('.');
+    }
+    out.push(letter);
+    out.push('"');
+    HeaderValue::from_str(&out).ok()
+}
+
+/// The ETag `etag_with` made `tagged` from, when it is one in the encoding `letter` names;
+/// `None` for any other (a client holding another representation, or none of ours).
+pub fn etag_without(tagged: &str, letter: char) -> Option<String> {
+    let inner = tagged.strip_prefix('"')?.strip_suffix('"')?;
+    let base = inner.strip_suffix(letter)?;
+    if let Some(base) = base.strip_suffix('.') {
+        return Some(format!("\"{base}\""));
+    }
+    crate::files::is_own_etag(base).then(|| format!("\"{base}\""))
+}
 pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => content_type.starts_with(prefix),
@@ -573,7 +604,7 @@ mod tests {
         assert_eq!(response.headers()[CONTENT_ENCODING], encoding.name());
         assert_eq!(
             response.headers()[ETAG],
-            format!("\"abc-{}\"", encoding.name()).as_str()
+            format!("\"abc.{}\"", encoding.letter()).as_str()
         );
         let compressed = response.into_body().collect().await.unwrap().to_bytes();
         let mut plain = Vec::new();
@@ -662,8 +693,28 @@ mod tests {
             ..Encode::default()
         };
         let mut h = headers("br");
-        h.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc-br\""));
+        h.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc.b\""));
         assert_eq!(config.choose(AcceptEncoding::parse(&h), &mut h), Some(Encoding::Br));
         assert_eq!(h[http::header::IF_NONE_MATCH], "\"abc\"");
+    }
+
+    #[test]
+    fn etags_of_encoded_representations_get_a_letter_and_give_it_back() {
+        // Ours: a ninth character; an upstream's: a dot and the letter.
+        assert_eq!(etag_with("\"AAAAAAAA\"", 'b').unwrap(), "\"AAAAAAAAb\"");
+        assert_eq!(etag_with("\"p1\"", 'z').unwrap(), "\"p1.z\"");
+        assert_eq!(
+            etag_with("\"0123456789abcdef0123\"", 'g').unwrap(),
+            "\"0123456789abcdef0123.g\""
+        );
+        assert!(etag_with("W/\"weak\"", 'b').is_none(), "not a strong ETag");
+        // Back: only for the encoding asked, and only what etag_with made.
+        assert_eq!(etag_without("\"AAAAAAAAb\"", 'b').as_deref(), Some("\"AAAAAAAA\""));
+        assert_eq!(etag_without("\"AAAAAAAAb\"", 'g'), None, "another representation");
+        assert_eq!(etag_without("\"AAAAAAAA\"", 'b'), None, "the identity, not encoded");
+        assert_eq!(etag_without("\"p1.z\"", 'z').as_deref(), Some("\"p1\""));
+        assert_eq!(etag_without("\"p1.z\"", 'b'), None);
+        assert_eq!(etag_without("\"AAAAAAAAdBBBBBBBB\"", 'b'), None, "a delta's, not ours");
+        assert_eq!(etag_without("W/\"AAAAAAAAb\"", 'b'), None);
     }
 }

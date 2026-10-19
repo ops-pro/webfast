@@ -427,7 +427,10 @@ its directory.
 
 Those an answer shows are checked by `compat/`:
 
-- ETags are hashes of the content (BLAKE3, 80 bits), not modification time and size; there is no
+- ETags are hashes of the content (48 bits of BLAKE3 as 8 characters of base64url; a ninth
+  character, `b`, `g` or `z`, for a representation `encode` made on the fly, `d` and 8 characters
+  of the dictionary's hash for a `dcz` delta; an upstream's ETag gets `.` and the letter instead),
+  not modification time and size; there is no
   `Last-Modified`.
 - Proxied responses get no `Via`; the upstream gets the client's `Accept-Encoding` as it is (Caddy's
   transport asks for gzip when the client sent none).

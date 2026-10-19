@@ -103,7 +103,7 @@ async fn large_files_are_served_from_disk() {
     assert_eq!(got.header("content-length"), big.len().to_string());
     assert_eq!(got.header("accept-ranges"), "bytes");
     let etag = got.header("etag").to_string();
-    assert!(etag.starts_with('"') && etag.contains('-'), "{etag}");
+    assert_eq!(etag.len(), 10, "8 characters of base64url in quotes: {etag}");
     let head = send(port, Method::HEAD, "/big.bin", &[]).await;
     assert_eq!(head.header("content-length"), big.len().to_string());
     assert!(head.body.is_empty());

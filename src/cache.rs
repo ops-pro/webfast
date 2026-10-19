@@ -817,15 +817,15 @@ impl Entry {
     }
 
     /// The ETag of the representation in `encoding`: the upstream's for its own, otherwise with
-    /// the encoding appended to a strong one (as `encode` does).
+    /// the encoding's letter appended to a strong one (src/encode.rs `etag_with`; `i`: identity).
     fn etag_for(&self, encoding: Option<Encoding>) -> Option<HeaderValue> {
         let etag = self.etag.as_ref()?;
         if encoding == self.origin || etag.as_bytes().starts_with(b"W/") {
             return Some(etag.clone());
         }
         let text = etag.to_str().ok()?;
-        let name = encoding.map_or("identity", Encoding::name);
-        HeaderValue::from_str(&[text.trim_end_matches('"'), "-", name, "\""].concat()).ok()
+        let letter = encoding.map_or('i', Encoding::letter);
+        crate::encode::etag_with(text, letter)
     }
 
     /// The answer from the entry. `stale`: `None` when fresh; `Some(None)` while it is

@@ -129,8 +129,9 @@ pub fn max_file_in_memory_from_env() -> Result<Option<u64>, String> {
     }
 }
 
-/// A strong ETag for a file served from disk, from its size and modification time (as Caddy's and
-/// nginx's): hashing its content would mean reading it all at startup.
+/// A strong ETag for a file served from disk, from its size and modification time (what Caddy's and
+/// nginx's are made of; hashing its content would mean reading it all at startup), in the same
+/// form as the others (`etag_of`).
 pub fn disk_etag(metadata: &std::fs::Metadata) -> String {
     etag_from_version(metadata.len(), metadata.modified().ok())
 }
@@ -139,7 +140,10 @@ fn etag_from_version(len: u64, modified: Option<SystemTime>) -> String {
     let nanos = modified
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    format!("\"{len:x}-{nanos:x}\"")
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&len.to_le_bytes());
+    hasher.update(&nanos.to_le_bytes());
+    format!("\"{}\"", base64url(&hasher.finalize().as_bytes()[..6]))
 }
 
 /// Files read together are copied into shared buffers of about this size: few allocations — a
@@ -964,10 +968,38 @@ fn sha256_of(body: &[u8]) -> [u8; 32] {
     digest.as_ref().try_into().expect("32 bytes")
 }
 
-/// Strong ETag from the content: 80 bits of BLAKE3 in hex.
+/// An ETag of ours is `ETAG_CHARS` characters of base64url (48 bits of a BLAKE3 hash) in quotes.
+/// A representation made of the file on the fly gets a ninth character for its encoding
+/// (src/encode.rs `etag_with`: `b`, `g`, `z`); a `dcz` delta a ninth `d` and eight characters of
+/// its dictionary's hash (src/static_files.rs). Fixed lengths: nothing is parsed by separators.
+pub const ETAG_CHARS: usize = 8;
+
+const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// `bytes` as base64url without padding (six bytes: eight characters).
+pub fn base64url(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(BASE64URL[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// Whether `inner` (an ETag without its quotes) is one of ours: exactly `ETAG_CHARS` of base64url.
+pub fn is_own_etag(inner: &str) -> bool {
+    inner.len() == ETAG_CHARS && inner.bytes().all(|b| BASE64URL.contains(&b))
+}
+
+/// Strong ETag for a body in memory: 48 bits of its BLAKE3 hash, in quotes.
 pub fn etag_of(body: &[u8]) -> String {
     let hash = blake3::hash(body);
-    format!("\"{}\"", &hash.to_hex()[..20])
+    format!("\"{}\"", base64url(&hash.as_bytes()[..6]))
 }
 
 /// Content type by file extension; `None` (no header, as in Caddy) when unknown.
@@ -1332,5 +1364,27 @@ mod tests {
         assert_eq!(content_type("/a.JS"), Some("text/javascript; charset=utf-8"));
         assert_eq!(content_type("/noext"), None);
         assert_eq!(content_type("/x.unknownext"), None);
+    }
+
+    #[test]
+    fn etags_are_eight_characters_of_base64url() {
+        assert_eq!(base64url(b"\x00\x00\x00\x00\x00\x00"), "AAAAAAAA");
+        assert_eq!(base64url(b"\xff\xff\xff\xff\xff\xff"), "________");
+        assert_eq!(base64url(b"Man"), "TWFu");
+        assert_eq!(base64url(b"Ma"), "TWE");
+        let etag = etag_of(b"hello");
+        assert_eq!(etag.len(), ETAG_CHARS + 2, "{etag}");
+        assert!(is_own_etag(&etag[1..etag.len() - 1]));
+        assert_ne!(etag, etag_of(b"hello!"));
+        // Disk files: the same form, from their version.
+        let disk = etag_from_version(1234, Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)));
+        assert!(is_own_etag(&disk[1..disk.len() - 1]), "{disk}");
+        assert_ne!(
+            disk,
+            etag_from_version(1235, Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)))
+        );
+        // Not ours: an upstream's, or one of ours with its ninth character.
+        assert!(!is_own_etag("p1") && !is_own_etag("0123456789abcdef0123") && !is_own_etag("AAAAAAAAb"));
+        assert!(!is_own_etag("AAAA\"AAA"));
     }
 }

@@ -148,7 +148,8 @@ async fn a_new_version_goes_as_a_delta_to_the_old_one() {
     let again = get(port, "/assets/app-v2.js", &with_dictionary).await;
     assert_eq!(again.body, delta.body);
     let etag = delta.header("etag").to_string();
-    assert!(etag.contains("-dcz-"), "{etag}");
+    // Ours (8), `d`, and 8 of the dictionary's hash.
+    assert!(etag.len() == 19 && etag.as_bytes()[9] == b'd', "{etag}");
     let mut revalidate = with_dictionary.to_vec();
     revalidate.push(("if-none-match", &etag));
     assert_eq!(

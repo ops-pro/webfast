@@ -683,8 +683,8 @@ static KEPT_DELTAS: std::sync::LazyLock<std::sync::Mutex<Deltas>> = std::sync::L
 /// or worked out on the blocking pool (once per file and dictionary, whoever asks first waits).
 async fn delta(entry: &FileEntry, dictionary: bytes::Bytes, hash: [u8; 32]) -> Option<(bytes::Bytes, HeaderValue)> {
     let file_etag = entry.etag.to_str().ok()?;
-    let short: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
-    let etag = HeaderValue::from_str(&format!("{}-dcz-{short}\"", file_etag.trim_end_matches('"'))).ok()?;
+    let short = crate::files::base64url(&hash[..6]);
+    let etag = HeaderValue::from_str(&format!("{}d{short}\"", file_etag.trim_end_matches('"'))).ok()?;
     let key = (file_etag.to_string(), hash);
     let kept = |deltas: &Deltas| deltas.by.get(&key).cloned();
     if let Some(found) = kept(&KEPT_DELTAS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {

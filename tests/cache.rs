@@ -296,7 +296,7 @@ async fn a_stored_response_answers_from_memory_in_every_encoding() {
         let etag = if encoding.is_empty() {
             "\"p1\"".to_string()
         } else {
-            format!("\"p1-{encoding}\"")
+            format!("\"p1.{}\"", &encoding[..1])
         };
         assert_eq!(hit.header("etag"), etag);
         // Its validator gives a 304.

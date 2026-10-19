@@ -27,7 +27,7 @@ compared request by request ([`compat/`](compat)).
   come (NFS, SMB, FUSE, 9p); only changed files are read again, and the site's snapshot is replaced
   whole, so a page and its assets switch together. A changed Caddyfile is put in place on SIGHUP,
   without dropping a connection.
-- **ETag = hash of the content** (BLAKE3): unchanged files keep their ETag across deploys and
+- **ETag = hash of the content** (BLAKE3, 8 characters): unchanged files keep their ETag across deploys and
   replicas.
 - **A runtime per core**, as nginx's workers: one thread with its own epoll per listening socket
   (SO_REUSEPORT), connections stay where they were accepted; `WEB_WORKERS` sets how many.

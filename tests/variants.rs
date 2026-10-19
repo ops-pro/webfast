@@ -103,14 +103,18 @@ async fn files_without_a_sibling_get_a_variant_once_asked_for() {
     assert_eq!(webfast::variants::stored(), (0, 0), "nothing made at startup");
     let br = [("accept-encoding", "br")];
 
-    // The first answer: `encode` on the fly (its ETag is the file's with -br).
+    // The first answer: `encode` on the fly (its ETag is the file's with the letter b).
     let first = get(port, "/app.js", &br).await;
     assert_eq!(first.header("content-encoding"), "br");
-    assert!(first.header("etag").ends_with("-br\""), "{}", first.header("etag"));
+    let first_etag = first.header("etag");
+    assert!(
+        first_etag.len() == 11 && first_etag.ends_with("b\""),
+        "ours plus the letter: {first_etag}"
+    );
     assert_eq!(unbrotli(&first.body), app);
 
     // Then the variant: its own ETag, made at the highest level.
-    let variant = until(port, "/app.js", &br, |got| !got.header("etag").ends_with("-br\"")).await;
+    let variant = until(port, "/app.js", &br, |got| got.header("etag").len() == 10).await;
     assert_eq!(variant.status, StatusCode::OK);
     assert_eq!(variant.header("content-encoding"), "br");
     assert_eq!(variant.header("vary"), "Accept-Encoding");
