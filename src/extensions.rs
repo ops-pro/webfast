@@ -514,6 +514,7 @@ pub fn check_bindings(config: &Config) -> Result<()> {
 /// The extensions' environment (WEB_*), read before the configuration: each built extension's
 /// own, and a variable of one that is not built stops the start, as a misspelt one would.
 pub fn configure_from_env() -> std::result::Result<(), String> {
+    crate::dns::configure_from_env()?;
     #[cfg(feature = "rate-limit")]
     crate::ratelimit::configure_from_env()?;
     #[cfg(not(feature = "rate-limit"))]
@@ -625,6 +626,8 @@ pub struct Started {
 impl Started {
     pub fn begin(config: &Config) -> Result<Started> {
         let _ = config;
+        // The upstream names resolved before the servers take the configuration (src/dns.rs).
+        crate::dns::begin(config)?;
         #[cfg(feature = "jwt")]
         if let Some(jwt) = &config.jwt {
             jwt.start()?;

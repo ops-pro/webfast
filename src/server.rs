@@ -513,6 +513,8 @@ impl Running {
         if let Some(port) = self.ports.first() {
             port.state.hooks.bound_within(&config.upstreams())?;
         }
+        // The new configuration's upstream names, resolved before it is taken (src/dns.rs).
+        crate::dns::begin(&config)?;
         let Config {
             servers,
             stores,

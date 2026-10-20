@@ -1,58 +1,57 @@
-# Upstream names: design
+# Upstream names
 
-How `reverse_proxy` turns an upstream's host name into addresses. Not built yet; this is the
-decision, written before the code so that the code can be checked against it.
-
-## Today
-
-`HttpConnector` with its default resolver: `getaddrinfo` on a blocking thread pool, the system's
-`/etc/resolv.conf`, no cache in the process. Every new connection resolves the name again; the
-connection pool is all that stands between a request and a DNS round trip. Caddy does the same
-(Go's resolver has no cache either); nginx resolves static upstreams once at start and re-resolves
-on a `resolver … valid=` schedule.
+How `reverse_proxy` turns an upstream's host name into addresses (`src/dns.rs`,
+`src/upstreams.rs`). Written as the decision before the code; kept as the description of it.
 
 ## The decision
 
-**Requests never wait for DNS.** A name's addresses are a snapshot (`ArcSwap`, as the compressed
-variants and the proxy cache are read), and the resolver given to `HttpConnector`
-(`new_with_resolver`) answers from that snapshot with a ready future: no I/O, no await, no
-blocking pool on the hot path.
+**Requests never wait for DNS.** A proxy's servers are a snapshot (`ArcSwap`, read as the
+compressed variants and the proxy cache are) of the addresses its names resolved to; a request
+loads it once, chooses a server, and dials an address. No name is looked up on a request: not by
+`getaddrinfo` on a blocking pool (what `HttpConnector` does by default, and Caddy, whose Go
+resolver has no cache either), not by anything else.
 
-**One background thread refreshes the snapshots.** A `Worker` (`src/background.rs`): one thread for
-every name of every `reverse_proxy`, niced, a tick a second, a queue ordered by due time. The
-queries are blocking UDP (TCP on a truncated answer) on that thread; no Tokio there, as none is
-needed.
+**One background thread keeps the snapshots current.** A `Worker` (`src/background.rs`,
+`webfast-dns`): one thread for every name of every `reverse_proxy`, niced, a tick a second, each
+name refreshed when its term is up. The queries are blocking UDP (TCP when the answer is
+truncated) on that thread, with the module's own codec for A and AAAA (RFC 1035): no resolver
+library, as its runtime and cache are what this replaces.
 
-**When a name is refreshed:** at `refresh` when the directive gives one; otherwise at the smallest
-TTL of the answer, clamped to `[WEB_DNS_TTL_MIN, WEB_DNS_TTL_MAX]` (5s and 1h unless set). The
-refresh is scheduled at about 90% of the term, so a snapshot is never past its term while the DNS
-answers.
+**When a name is refreshed:** at the smallest TTL of the answer, clamped to
+`[WEB_DNS_TTL_MIN, WEB_DNS_TTL_MAX]` (5s and 1h unless set), scheduled at 90% of it, so that a
+snapshot is never past its term while the nameserver answers. (`dynamic a { refresh }` is not
+read yet; the code takes a `refresh` in place of the TTL when it is.)
 
-**The first resolution is at start and at reload, synchronous, with a timeout** (`WEB_DNS_TIMEOUT`,
-5s unless set), as nginx does: a static upstream that does not resolve is a configuration error
-at start, not a 502 on the first request. At a reload a name that stopped resolving keeps its
-addresses, with a warning.
+**The first resolution is at start and at reload, synchronous, with a timeout**
+(`WEB_DNS_TIMEOUT`, 5s unless set), as nginx does: a static upstream that does not resolve is an
+error at start (`reverse_proxy app.internal:8080: the name does not resolve: …`), not a 502 on
+the first request. A reload whose Caddyfile names an upstream that does not resolve is refused,
+the running configuration kept.
 
 **A failed refresh changes nothing:** the addresses stay (stale while revalidating), the next try
-backs off (1s doubling to the term), the failure is logged once at warn and then at debug, and
-counted for the metrics.
+backs off (1s doubling, up to the term), the failure is logged once at warn and then at debug,
+and the name's recovery at info.
 
-**Changed addresses take effect on the next dial.** Connections to addresses no longer answered
-live on until the pool's idle timeout; nothing is torn down, so a change costs no burst of
-reconnections.
+**Changed addresses take effect on the next dial.** A server whose address stays keeps its count
+of requests under way and its health; a new address is a new server; one no longer answered is
+dropped from the snapshot, and the pool's connections to it live on until its idle timeout. Nothing
+is torn down, so a change costs no burst of reconnections.
+
+**A name with several addresses is several servers** (docs/configuration.md, Upstreams): the
+policies and the health settings work per address, as HAProxy and nginx have it, not per name as
+Caddy does. `to app:8080` with three replicas behind the name is `least_conn` over the three. At
+most 64 servers per `reverse_proxy`; further addresses are not used, with a warning.
 
 **Resolvers:** `/etc/resolv.conf` (Docker mounts it, and `/etc/hosts`, into every container, the
-scratch image included); `transport http { resolvers <ip>… }` overrides it for that proxy, the
-Caddyfile's own syntax. `/etc/hosts` is read for the names in it. An IP literal, or `localhost`,
-goes through none of this.
+scratch image included), asked in its order, the next on a failure; `transport http { resolvers
+<ip>… }` overrides it for that proxy, in the Caddyfile's own syntax (a port after a colon; 53
+without). `/etc/hosts` is read for the names in it, `localhost` is the loopback, and a literal
+address goes through none of this.
 
-**The library:** `hickory-proto` for the messages (A, AAAA, the wire format), not
-`hickory-resolver`, whose runtime and cache this design replaces. About three hundred lines of our
-own, in the core (as `reverse_proxy` is), no feature.
+**IPv6:** A and AAAA are both asked for, the IPv4 addresses first in the snapshot; `WEB_DNS_IPV6=off`
+leaves AAAA out (a network where IPv6 is not routed).
 
 ## In the Caddyfile
-
-The subset of Caddy's that this covers, meaning the same:
 
 ```
 reverse_proxy app.internal:8080 {
@@ -62,9 +61,9 @@ reverse_proxy app.internal:8080 {
 }
 ```
 
-Later, when upstreams that come and go are needed, `dynamic a { name … port … refresh … resolvers …
-versions ipv4 }` and `dynamic srv`: the same worker and snapshot, with the set of upstreams itself
-in the snapshot rather than the addresses of each.
+Outside the Caddyfile, as every setting Caddy has no word for: `WEB_DNS_TTL_MIN`,
+`WEB_DNS_TTL_MAX`, `WEB_DNS_TIMEOUT`, `WEB_DNS_IPV6`.
 
-Outside the Caddyfile, as every setting Caddy has no word for: `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX`,
-`WEB_DNS_TIMEOUT`, `WEB_DNS_IPV6=off`.
+Not read: `dynamic a` and `dynamic srv` (upstreams that come and go by a name's answer). The
+snapshot is where they would go: the set of upstreams itself in it rather than the addresses of
+each.

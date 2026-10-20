@@ -41,7 +41,9 @@ compared request by request ([`compat/`](compat)).
 - **Deltas after a deploy** (RFC 9842 compression dictionaries, `dcz`): a browser that has the
   previous version of a bundle gets the new one as a delta to it — 170 bytes instead of 229 KB in
   Chrome for a script with a few changed lines — also when the deploy replaced the old file.
-- **Proxying** with streaming (server-sent events reach the client as they come) and WebSocket;
+- **Proxying** with streaming (server-sent events reach the client as they come), WebSocket, and
+  balancing over several upstreams by address (every `lb_policy` of Caddy, passive health,
+  retries; names resolved in the background, never on a request);
   **error pages** with `handle_errors`; **rate limits** with `rate_limit` and a **proxy cache**
   with `cache`, in the syntax of Caddy's caddy-ratelimit and cache-handler plugins (the cache
   answers the first client as the upstream sends, then keeps every encoding, made once at the

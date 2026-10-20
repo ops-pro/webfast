@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `reverse_proxy` balances over several upstreams with Caddy's words: every `lb_policy`
+  (`random_choose`, `weighted_round_robin`, `least_conn`, the hashes, `cookie`), `lb_retries`,
+  passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`,
+  `unhealthy_request_count`), 503 with every server down. The unit is an address: a name with
+  several is as many servers. Upstream names are resolved at start (one that does not resolve
+  stops it) and refreshed in the background at their TTL (`WEB_DNS_*`, `transport http {
+  resolvers }`); a request never waits for DNS (docs/dns.md). A `reverse_proxy` with one literal
+  address pays nothing for any of this.
+
 - Requests read the compressed variants from a snapshot (`ArcSwap`) instead of under a `RwLock`;
   the proxy cache hashes its keys with ahash (keyed per process) instead of SipHash.
 - ETags are 8 characters of base64url (48 bits of the BLAKE3 hash) instead of 20 of hex; a

@@ -18,7 +18,7 @@ Docker image starts with it.
 | Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify); `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
 | Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `request_body { max_size }`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
-| reverse_proxy  | plain-HTTP upstreams (`host:port`), `to`, `lb_policy random\|first\|round_robin`, `lb_try_duration`, `lb_try_interval`, `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, versions 1.1 }`                                                                                      |
+| reverse_proxy  | upstreams by address or name (resolved at start, refreshed at their TTL), `to`, every `lb_policy` (`random`, `random_choose`, `first`, `round_robin`, `weighted_round_robin`, `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`, `cookie`), `lb_retries`, `lb_try_duration`, `lb_try_interval`, passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`), `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }` (Upstreams) |
 | file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
 | Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms; `{http.rate_limit.exceeded.name}` |
 
@@ -241,6 +241,72 @@ example.com {
   `badger`, `nuts`, `otter`, `olric`, `etcd`: the cache is in memory), `cdn`, `api`, `key`,
   `cache_keys` and the other modes.
 
+### Upstreams
+
+`reverse_proxy` sends to one upstream or balances over several, with Caddy's words. The unit of
+balancing and of health is an address: a name that resolves to several (docs/dns.md) is as many
+servers, each with its own health and count of requests under way, as HAProxy and nginx have it
+(Caddy balances over the names). Names are resolved at start, and from then on in the background
+at their TTL; a request never waits for DNS.
+
+```caddyfile
+reverse_proxy app-1:8080 app-2:8080 app-3:8080 {
+	lb_policy least_conn
+	lb_retries 2
+	lb_try_interval 100ms
+	fail_duration 30s
+	max_fails 2
+	unhealthy_status 5xx
+	unhealthy_latency 5s
+}
+```
+
+| Setting                                                | What it does                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lb_policy random`                                     | one at random (the default)                                                                                                                                                                                                                                                                                   |
+| `lb_policy random_choose <n>`                          | `n` at random, the one with the fewest requests under way                                                                                                                                                                                                                                                     |
+| `lb_policy first`                                      | the first that is up, in the order written: a primary with backups                                                                                                                                                                                                                                            |
+| `lb_policy round_robin`                                | in turn                                                                                                                                                                                                                                                                                                       |
+| `lb_policy weighted_round_robin <w…>`                  | in turn, each as many times as its weight (one weight per upstream; a name's addresses share its weight)                                                                                                                                                                                                      |
+| `lb_policy least_conn`                                 | the fewest requests under way (until the response ends; a WebSocket tunnel until it closes); among equals, at random                                                                                                                                                                                          |
+| `lb_policy ip_hash` / `client_ip_hash`                 | by the peer's address / by the client's (the one a trusted proxy names)                                                                                                                                                                                                                                       |
+| `lb_policy uri_hash`                                   | by the request's path and query                                                                                                                                                                                                                                                                               |
+| `lb_policy query <key>` / `header <name>`              | by that query parameter / header; at random when the request has none                                                                                                                                                                                                                                         |
+| `lb_policy cookie [<name> [<secret>]]`                 | sticky: the response that chose a server sets a cookie (`lb` unless named; `Path=/; HttpOnly`, `Secure` over TLS) naming it, an HMAC of its address with `secret` (one per process unless given)                                                                                                              |
+| `lb_retries <n>`, `lb_try_duration`, `lb_try_interval` | a request the upstream was not reached by (the connection refused or timed out) that has no body to send again is tried at another, `lb_try_interval` (250ms) apart, while `lb_retries` and `lb_try_duration` allow (one that is 0 does not bound; both 0: no retry); every server tried, from the start again |
+| `fail_duration <d>`                                    | passive health on: a failure is remembered for this long (0, the default: off)                                                                                                                                                                                                                                |
+| `max_fails <n>`                                        | failures within `fail_duration` that mark a server down for `fail_duration` (1)                                                                                                                                                                                                                               |
+| `unhealthy_status <codes…>`                            | responses that count as failures, codes (`502`) or classes (`5xx`), besides a connection that failed                                                                                                                                                                                                          |
+| `unhealthy_latency <d>`                                | a response whose headers took longer counts as a failure                                                                                                                                                                                                                                                      |
+| `unhealthy_request_count <n>`                          | a server with this many requests under way is not chosen (0: no limit)                                                                                                                                                                                                                                        |
+| `transport http { resolvers <ip…> }`                   | the nameservers for this proxy's names (unset: `/etc/resolv.conf`)                                                                                                                                                                                                                                            |
+
+The hashes are rendezvous hashes: a key stays on its server while that server is up, and only the
+keys of a server that went down change hands. A down server is passed by; with every server down
+the request is refused with 503 (`handle_errors` applies). A `reverse_proxy` with one literal
+address and no health settings pays nothing for any of this (docs/performance.md, Upstreams).
+
+#### What `reverse_proxy` reads
+
+Caddy's directive has more. What is read, what is meant to come, and what is not:
+
+| Read                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to` and inline upstreams (`host:port`, `http://host:port`, `:port`, `host`); every `lb_policy`; `lb_retries`, `lb_try_duration`, `lb_try_interval`; `fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`; `header_up`, `header_down`; `flush_interval` (always streaming); `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }`; WebSocket; `request_body` |
+
+| Meant to come                                                                                                                                                                                                                                                                       |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TLS to the upstream: `https://` upstreams, `transport http { tls, tls_server_name, tls_trusted_ca_certs, tls_client_auth, tls_insecure_skip_verify, tls_except_ports }`                                                                                                             |
+| `handle_response [<matcher>] { … }` with `status` and `header` response matchers, `replace_status`, `copy_response`, `copy_response_headers`                                                                                                                                       |
+| `unix//path` upstreams; `h2c://` upstreams and `versions 2 h2c`; `transport fastcgi` and `php_fastcgi`                                                                                                                                                                              |
+| `dynamic a` / `dynamic srv` (upstreams that come and go by a name's answer); `transport http { proxy_protocol, max_conns_per_host }`; `method`, `rewrite`; active health checks (`health_uri` and the other `health_*`); `lb_retry_match`; a `trusted_proxies` of the proxy's own |
+
+| Not meant to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `request_buffers`, `response_buffers`, `stream_timeout`, `stream_close_delay` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_timeout, tls_renegotiation, tls_trust_pool }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
+
+A setting that is not read is an error at start, never ignored.
+
 ### Request checks: JWT and OpenAPI
 
 
@@ -432,6 +498,10 @@ Those an answer shows are checked by `compat/`:
   of the dictionary's hash for a `dcz` delta; an upstream's ETag gets `.` and the letter instead),
   not modification time and size; there is no
   `Last-Modified`.
+- `reverse_proxy` balances over addresses, not names: an upstream name with several addresses is
+  as many servers for `lb_policy` and the health settings (Caddy: one upstream, the dialler
+  trying its addresses in turn). With every server down the request gets 503, as in Caddy; a name
+  that does not resolve stops the start and a reload (Caddy: 502 per request).
 - Proxied responses get no `Via`; the upstream gets the client's `Accept-Encoding` as it is (Caddy's
   transport asks for gzip when the client sent none).
 - A failed request keeps the site's deferred headers, on the bare status and on the page
@@ -509,6 +579,9 @@ Those an answer shows are checked by `compat/`:
 | `WEB_TLS_STRICT_SNI`               | `off`       | `on`: a TLS handshake without SNI, or for a name no site names exactly or by a wildcard, gets no certificate and ends with an alert (docs/operations.md, TLS and HTTP/3) |
 | `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
+| `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX` | `5s`, `1h`  | the TTL of an upstream name's answer is kept within these; the name is resolved again at 90% of it (docs/dns.md) |
+| `WEB_DNS_TIMEOUT`                  | `5s`        | one DNS query at most; at start a name that does not resolve in time is an error |
+| `WEB_DNS_IPV6`                     | `on`        | `off`: upstream names are resolved to IPv4 addresses only |
 | `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
 | `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |
 | `WEB_STALL_TIMEOUT`                | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                                                                                                      |

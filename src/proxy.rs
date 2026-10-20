@@ -23,7 +23,8 @@ use crate::body::{Body, boxed};
 use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, UpstreamHeld};
 use crate::guard::{BodyStalled, BodyTooLarge, Place};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
-use http::header::{CONNECTION, HOST, UPGRADE};
+use crate::upstreams::{NoServer, Upstreams};
+use http::header::{CONNECTION, HOST, SET_COOKIE, UPGRADE};
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use hyper::upgrade::OnUpgrade;
@@ -31,7 +32,6 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -49,16 +49,15 @@ pub fn client(dial_timeout: Duration, keepalive: Option<Duration>) -> HttpClient
     builder.build(connector)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LbPolicy {
-    Random,
-    First,
-    RoundRobin,
-}
-
 pub struct ReverseProxy {
+    /// The upstreams as named (the request checks are bound to them); `servers` is what is sent
+    /// to (src/upstreams.rs).
     pub upstreams: Vec<Authority>,
-    pub policy: LbPolicy,
+    pub servers: Upstreams,
+    /// `lb_retries`, `lb_try_duration`, `lb_try_interval`: a request that reached no upstream
+    /// (the connection failed) and has no body to send again is tried again while both allow
+    /// (one that is 0 does not bound; both 0: no retry), `lb_try_interval` apart.
+    pub retries: u32,
     pub try_duration: Duration,
     pub try_interval: Duration,
     pub header_up: Vec<HeaderOp>,
@@ -67,7 +66,6 @@ pub struct ReverseProxy {
     /// For the connections of WebSocket handshakes (the pooled client has its own).
     pub dial_timeout: Duration,
     pub client: HttpClient,
-    pub counter: AtomicUsize,
 }
 
 /// Hop-by-hop fields (Caddy's list) never forwarded in either direction.
@@ -132,26 +130,6 @@ fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 }
 
 impl ReverseProxy {
-    fn pick(&self, attempt: usize) -> &Authority {
-        let n = self.upstreams.len();
-        let index = match self.policy {
-            LbPolicy::First => attempt.min(n - 1),
-            LbPolicy::RoundRobin => self.counter.fetch_add(1, Ordering::Relaxed) % n,
-            LbPolicy::Random => {
-                if n == 1 {
-                    0
-                } else {
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos() as usize)
-                        .unwrap_or(0);
-                    (nanos ^ self.counter.fetch_add(1, Ordering::Relaxed)) % n
-                }
-            }
-        };
-        &self.upstreams[index]
-    }
-
     pub async fn serve(self: &Arc<Self>, mut ctx: Ctx) -> Response<Body> {
         // Preparing ready answers (src/memo.rs): never kept from a proxy, so no upstream is called.
         if ctx.req.extensions.get::<crate::memo::Preparing>().is_some() {
@@ -200,10 +178,30 @@ impl ReverseProxy {
         // Without a body the request can be retried on another upstream (lb_try_duration).
         let replayable = body.as_ref().is_none_or(http_body::Body::is_end_stream);
         let started = Instant::now();
-        let mut attempt = 0;
+        // The servers as they are now, kept for the request; `tried`: those it tried, by bit.
+        let loaded = self.servers.load();
+        let passive = self.servers.passive();
+        let mut tried: u64 = 0;
+        let mut attempt: u32 = 0;
         let outcome = loop {
-            let upstream = self.pick(attempt).clone();
-            let mut parts = Uri::builder().scheme(Scheme::HTTP).authority(upstream.clone());
+            let picked = match loaded.pick(&ctx, tried) {
+                Ok(picked) => picked,
+                // Every server up was tried: from the start again, as Caddy retries.
+                Err(NoServer::AllTried) => {
+                    tried = 0;
+                    match loaded.pick(&ctx, 0) {
+                        Ok(picked) => picked,
+                        Err(_) => break Err(StatusCode::SERVICE_UNAVAILABLE),
+                    }
+                }
+                Err(NoServer::AllDown) => {
+                    tracing::warn!("no upstream is available");
+                    break Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            };
+            tried |= 1 << picked.index;
+            let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);
+            let mut parts = Uri::builder().scheme(Scheme::HTTP).authority(server.authority.clone());
             if let Some(pq) = &path_and_query {
                 parts = parts.path_and_query(pq.clone());
             }
@@ -221,6 +219,7 @@ impl ReverseProxy {
             *request.uri_mut() = uri;
             *request.version_mut() = http::Version::HTTP_11;
             *request.headers_mut() = headers.clone();
+            let sent_at = Instant::now();
             let sent = self.client.request(request);
             let result = match self.response_header_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
@@ -230,37 +229,57 @@ impl ReverseProxy {
                 None => sent.await.map_err(|e| (e.is_connect(), false)),
             };
             match result {
-                Ok(response) => break Ok(response),
+                Ok(response) => {
+                    if let Some(passive) = passive {
+                        if passive.faults(response.status().as_u16(), sent_at.elapsed()) {
+                            server.failed(passive);
+                        } else {
+                            server.succeeded();
+                        }
+                    }
+                    break Ok((response, lease, set_cookie.then_some(server)));
+                }
                 Err((connect, timed_out)) => {
                     // The body went over its `request_body` limit while it was being sent.
                     if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
-                        tracing::debug!(upstream = %upstream, "the request body went over its limit");
+                        tracing::debug!(upstream = %server.name, "the request body went over its limit");
                         break Err(StatusCode::PAYLOAD_TOO_LARGE);
                     }
                     // The client stopped sending its body: its fault, not the upstream's.
                     if body_stalled.as_ref().is_some_and(BodyStalled::happened) {
-                        tracing::debug!(upstream = %upstream, "the client stopped sending the request body");
+                        tracing::debug!(upstream = %server.name, "the client stopped sending the request body");
                         break Err(StatusCode::REQUEST_TIMEOUT);
                     }
-                    tracing::warn!(upstream = %upstream, connect, timed_out, "upstream request failed");
+                    tracing::warn!(upstream = %server.name, address = %server.addr, connect, timed_out, "upstream request failed");
+                    if let Some(passive) = passive {
+                        server.failed(passive);
+                    }
                     if timed_out {
                         break Err(StatusCode::GATEWAY_TIMEOUT);
                     }
-                    let can_retry = connect && replayable && started.elapsed() + self.try_interval < self.try_duration;
-                    if !can_retry {
+                    attempt += 1;
+                    let allowed = (self.retries > 0 || !self.try_duration.is_zero())
+                        && (self.retries == 0 || attempt <= self.retries)
+                        && (self.try_duration.is_zero() || started.elapsed() + self.try_interval < self.try_duration);
+                    if !(connect && replayable && allowed) {
                         break Err(StatusCode::BAD_GATEWAY);
                     }
-                    attempt += 1;
                     tokio::time::sleep(self.try_interval).await;
                 }
             }
         };
         match outcome {
-            Ok(response) => {
+            Ok((response, lease, chosen)) => {
                 let (mut parts, incoming) = response.into_parts();
                 remove_hop_headers(&mut parts.headers);
                 for op in &rendered_down {
                     op.apply(&mut parts.headers);
+                }
+                // `lb_policy cookie`: the response that chose a server names it to the client.
+                if let Some(server) = chosen
+                    && let Some(cookie) = self.servers.cookie_for(server, ctx.conn.tls)
+                {
+                    parts.headers.append(SET_COOKIE, cookie);
                 }
                 if parts.status.is_server_error()
                     && let Some(stale) = PROXY.fallback(&mut pending, &mut ctx, parts.status)
@@ -274,7 +293,7 @@ impl ReverseProxy {
                     header_down: &rendered_down,
                 };
                 let body = PROXY.observe(pending, sent, &mut parts, boxed(incoming));
-                ctx.respond_appending(Response::from_parts(parts, holding(body, held)))
+                ctx.respond_appending(Response::from_parts(parts, holding(body, (held, lease))))
             }
             Err(status) => {
                 if let Some(stale) = PROXY.fallback(&mut pending, &mut ctx, status) {
@@ -293,9 +312,12 @@ impl ReverseProxy {
         path_and_query: &str,
         headers: HeaderMap,
     ) -> Result<Response<hyper::body::Incoming>, String> {
+        let Some(server) = self.servers.any() else {
+            return Err("no upstream is available".to_string());
+        };
         let uri = Uri::builder()
             .scheme(Scheme::HTTP)
-            .authority(self.pick(0).clone())
+            .authority(server.authority.clone())
             .path_and_query(path_and_query)
             .build()
             .map_err(|e| e.to_string())?;
@@ -342,15 +364,24 @@ impl ReverseProxy {
         headers.insert(UPGRADE, protocol);
         let rendered_down: Vec<RenderedOp> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
         let place = ctx.req.extensions.get::<Place>().cloned();
-        let upstream = self.pick(0).clone();
+        let loaded = self.servers.load();
+        let picked = match loaded.pick(&ctx, 0) {
+            Ok(picked) => picked,
+            Err(_) => {
+                tracing::warn!("no upstream is available");
+                return ctx.fail(StatusCode::SERVICE_UNAVAILABLE, None);
+            }
+        };
+        let (server, lease) = (picked.server, picked.lease);
+        let upstream = server.name.clone();
         let target = ctx.req.uri.path_and_query().map_or("/", |pq| pq.as_str());
         let mut request = Request::new(crate::body::empty());
         *request.method_mut() = ctx.req.method.clone();
         *request.uri_mut() = target.parse().unwrap_or_else(|_| Uri::from_static("/"));
         *request.headers_mut() = headers;
-        let (dial_timeout, address) = (self.dial_timeout, upstream.clone());
+        let (dial_timeout, address) = (self.dial_timeout, server.addr);
         let exchange = async move {
-            let tcp = tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address.as_str()))
+            let tcp = tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address))
                 .await
                 .map_err(|_| "connection timed out".to_string())?
                 .map_err(|e| e.to_string())?;
@@ -372,7 +403,10 @@ impl ReverseProxy {
         let mut response = match answered {
             Ok(response) => response,
             Err((status, error)) => {
-                tracing::warn!(upstream = %upstream, %error, "upstream WebSocket handshake failed");
+                tracing::warn!(upstream = %upstream, address = %server.addr, %error, "upstream WebSocket handshake failed");
+                if let Some(passive) = self.servers.passive() {
+                    server.failed(passive);
+                }
                 return ctx.fail(status, None);
             }
         };
@@ -382,7 +416,7 @@ impl ReverseProxy {
             for op in &rendered_down {
                 op.apply(&mut parts.headers);
             }
-            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), held)));
+            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), (held, lease))));
         }
         // A tunnel counts as the connection it came from (src/guard.rs), not as a request: its
         // slot is given back with this answer.
@@ -398,6 +432,8 @@ impl ReverseProxy {
             op.apply(&mut parts.headers);
         }
         tokio::spawn(async move {
+            // The tunnel counts at its server until it closes.
+            let _lease = lease;
             let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream_io) else {
                 return;
             };

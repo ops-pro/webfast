@@ -202,6 +202,29 @@ compression: some 80 times less. What is not kept pays for the marks on its way 
 allocations, `Cache-Status`), within the upstream's own spread here. The compression at the
 highest levels is the worker's, once per stored answer, off the connections' threads.
 
+## Upstreams
+
+What choosing a server costs a proxied request (`src/upstreams.rs`, `cargo test --release --lib
+-- --ignored cost:: --nocapture`, 2026-10-20, in Docker on the development machine; two runs
+within 2 ns of each other):
+
+| `reverse_proxy`                                   | per pick |
+| ------------------------------------------------- | -------- |
+| one literal address, no health settings (`Fixed`) | 2.7 ns   |
+| one address with `fail_duration`                  | 55 ns    |
+| four servers, `round_robin`                       | 37 ns    |
+| four servers, `random`                            | 30 ns    |
+| four servers, `uri_hash`                          | 34 ns    |
+| four servers, `least_conn`                        | 47 ns    |
+| four servers, `client_ip_hash` with `fail_duration` | 86 ns  |
+
+The common case is a field read. A set is one snapshot load (`ArcSwap`, no reference count
+touched) and the policy over a bit mask of the servers that are up; the health settings add one
+clock read per pick (not per server) — the clock is what the first version spent 180 ns on, read
+once per server. `least_conn` adds an increment and a decrement on the chosen server's counter,
+shared between the threads. Against the 150–200 µs a proxied request takes to the upstream and
+back, none of this shows.
+
 ## The way here
 
 Handler chain in process, a page as br (precompressed):

@@ -23,8 +23,9 @@ use crate::files::Loader;
 use crate::handler::{Handler, HeaderOp, Route, Value};
 use crate::matcher::{FileMatcher, Matcher, MatcherSet, PathPattern, TryFile};
 use crate::placeholder::Template;
-use crate::proxy::{HttpClient, LbPolicy, ReverseProxy};
+use crate::proxy::{HttpClient, ReverseProxy};
 use crate::static_files::FileServer;
+use crate::upstreams::{Name, Passive, Policy, Upstreams};
 use anyhow::{Result, anyhow, bail};
 use http::uri::Authority;
 use http::{HeaderName, Method, StatusCode};
@@ -32,7 +33,6 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 pub struct Config {
@@ -1698,6 +1698,31 @@ pub fn upstream_authority(text: &str) -> std::result::Result<Authority, String> 
 }
 
 impl Config {
+    /// The sets of servers of every `reverse_proxy` that has one (a name, several upstreams, or
+    /// health settings), for the DNS thread (src/dns.rs).
+    pub fn upstream_sets(&self) -> Vec<Arc<crate::upstreams::Set>> {
+        fn walk(routes: &[Route], out: &mut Vec<Arc<crate::upstreams::Set>>) {
+            for route in routes {
+                match &route.handler {
+                    Handler::Proxy(proxy) => {
+                        if let Some(set) = proxy.servers.set() {
+                            out.push(set.clone());
+                        }
+                    }
+                    Handler::Subroute(list) => walk(list, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for server in &self.servers {
+            for site in &server.sites {
+                walk(&site.routes, &mut out);
+            }
+        }
+        out
+    }
+
     /// Every upstream a `reverse_proxy` of the configuration sends to, once each.
     pub fn upstreams(&self) -> Vec<Authority> {
         fn walk(routes: &[Route], out: &mut Vec<Authority>) {
@@ -1730,15 +1755,29 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     for t in &line.tokens[start..] {
         upstreams.push(parse_upstream(t)?);
     }
-    let mut policy = LbPolicy::Random;
+    let mut policy = Policy::Random;
+    let mut weights: Option<Vec<u32>> = None;
+    let mut retries = 0u32;
     let mut try_duration = Duration::ZERO;
     let mut try_interval = Duration::from_millis(250);
+    let mut fail_duration: Option<Duration> = None;
+    let mut max_fails = 1u32;
+    let mut unhealthy_status = Vec::new();
+    let mut unhealthy_latency = None;
+    let mut unhealthy_request_count = 0usize;
+    let mut resolvers: Option<Vec<std::net::SocketAddr>> = None;
     let mut header_up = Vec::new();
     let mut header_down = Vec::new();
     let mut dial_timeout = Duration::from_secs(3);
     let mut keepalive = Some(Duration::from_secs(120));
     let mut response_header_timeout = Some(DEFAULT_RESPONSE_HEADER_TIMEOUT);
     let mut own_client = false;
+    let duration = |sub: &Line| parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e));
+    let number = |sub: &Line| -> Result<u32> {
+        one_arg(sub)?
+            .parse::<u32>()
+            .map_err(|_| at_err(&sub.at, format!("{} takes a number", sub.name())))
+    };
     for sub in line.block.as_deref().unwrap_or(&[]) {
         let args = &sub.tokens[1..];
         match sub.name() {
@@ -1748,18 +1787,89 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                 }
             }
             "lb_policy" => {
-                policy = match one_arg(sub)?.as_str() {
-                    "random" => LbPolicy::Random,
-                    "first" => LbPolicy::First,
-                    "round_robin" => LbPolicy::RoundRobin,
-                    other => bail!(at_err(
+                let texts: Vec<&str> = args.iter().map(|t| t.text.as_str()).collect();
+                policy = match texts.as_slice() {
+                    ["random"] => Policy::Random,
+                    ["random_choose", n] => match n.parse::<u32>() {
+                        Ok(n) if n >= 2 => Policy::RandomChoose(n),
+                        _ => bail!(at_err(&sub.at, "lb_policy random_choose takes a number of 2 or more")),
+                    },
+                    ["first"] => Policy::First,
+                    ["round_robin"] => Policy::RoundRobin,
+                    ["weighted_round_robin", list @ ..] if !list.is_empty() => {
+                        let parsed: std::result::Result<Vec<u32>, _> = list.iter().map(|w| w.parse::<u32>()).collect();
+                        match parsed {
+                            Ok(list) if list.iter().all(|&w| w > 0) => weights = Some(list),
+                            _ => bail!(at_err(
+                                &sub.at,
+                                "lb_policy weighted_round_robin takes a weight (1 or more) per upstream"
+                            )),
+                        }
+                        Policy::WeightedRoundRobin
+                    }
+                    ["least_conn"] => Policy::LeastConn,
+                    ["ip_hash"] => Policy::IpHash,
+                    ["client_ip_hash"] => Policy::ClientIpHash,
+                    ["uri_hash"] => Policy::UriHash,
+                    ["query", key] => Policy::Query((*key).to_string()),
+                    ["header", name] => Policy::Header(
+                        HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|_| at_err(&sub.at, format!("lb_policy header: {name:?} is not a header name")))?,
+                    ),
+                    ["cookie", rest @ ..] if rest.len() <= 2 => {
+                        let name = rest.first().map_or("lb", |n| *n).to_string();
+                        let secret: Arc<[u8]> = match rest.get(1) {
+                            Some(secret) => secret.as_bytes().into(),
+                            None => {
+                                // No secret given: one for this process (the cookies stop
+                                // matching at a restart, and a new server is chosen).
+                                let mut secret = [0u8; 32];
+                                aws_lc_rs::rand::fill(&mut secret)
+                                    .map_err(|_| at_err(&sub.at, "no random bytes for the cookie secret"))?;
+                                secret.as_slice().into()
+                            }
+                        };
+                        Policy::Cookie { name, secret }
+                    }
+                    _ => bail!(at_err(
                         &sub.at,
-                        format!("lb_policy {other:?} is not supported (random, first, round_robin)")
+                        "lb_policy: random, random_choose <n>, first, round_robin, weighted_round_robin <w…>, least_conn, ip_hash, client_ip_hash, uri_hash, query <key>, header <name>, cookie [<name> [<secret>]]"
                     )),
                 }
             }
-            "lb_try_duration" => try_duration = parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e))?,
-            "lb_try_interval" => try_interval = parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e))?,
+            "lb_retries" => retries = number(sub)?,
+            "lb_try_duration" => try_duration = duration(sub)?,
+            "lb_try_interval" => try_interval = duration(sub)?,
+            "lb_retry_match" => bail!(at_err(
+                &sub.at,
+                "reverse_proxy: lb_retry_match is not supported (requests without a body are retried)"
+            )),
+            "fail_duration" => fail_duration = Some(duration(sub)?).filter(|d| !d.is_zero()),
+            "max_fails" => {
+                max_fails = number(sub)?;
+                if max_fails == 0 {
+                    bail!(at_err(&sub.at, "max_fails takes a number of 1 or more"));
+                }
+            }
+            "unhealthy_status" => {
+                if args.is_empty() {
+                    bail!(at_err(
+                        &sub.at,
+                        "unhealthy_status takes status codes (`502`) or classes (`5xx`)"
+                    ));
+                }
+                for t in args {
+                    unhealthy_status.push(parse_status_range(t)?);
+                }
+            }
+            "unhealthy_latency" => unhealthy_latency = Some(duration(sub)?).filter(|d| !d.is_zero()),
+            "unhealthy_request_count" => unhealthy_request_count = number(sub)? as usize,
+            name if name.starts_with("health_") => bail!(at_err(
+                &sub.at,
+                format!(
+                    "reverse_proxy: {name} is not supported (active health checks; the passive ones are: fail_duration, max_fails, unhealthy_status, unhealthy_latency, unhealthy_request_count)"
+                )
+            )),
             // Responses are always streamed as they arrive (the same as `flush_interval -1`).
             "flush_interval" => {
                 parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e))?;
@@ -1798,6 +1908,22 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                                 ));
                             }
                         }
+                        "resolvers" => {
+                            let mut list = Vec::new();
+                            for v in &t.tokens[1..] {
+                                let address = match v.text.parse::<std::net::IpAddr>() {
+                                    Ok(ip) => std::net::SocketAddr::new(ip, 53),
+                                    Err(_) => v.text.parse::<std::net::SocketAddr>().map_err(|_| {
+                                        token_err(v, "resolvers takes IP addresses (a port after a colon: 53 without)")
+                                    })?,
+                                };
+                                list.push(address);
+                            }
+                            if list.is_empty() {
+                                bail!(at_err(&t.at, "resolvers takes at least one address"));
+                            }
+                            resolvers = Some(list);
+                        }
                         other => bail!(at_err(&t.at, format!("transport http: unsupported option {other:?}"))),
                     }
                 }
@@ -1808,6 +1934,31 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     if upstreams.is_empty() {
         bail!(at_err(&line.at, "reverse_proxy needs an upstream"));
     }
+    if let Some(weights) = &weights
+        && weights.len() != upstreams.len()
+    {
+        bail!(at_err(
+            &line.at,
+            format!(
+                "lb_policy weighted_round_robin: {} weights for {} upstreams",
+                weights.len(),
+                upstreams.len()
+            )
+        ));
+    }
+    let names: Vec<Name> = upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, a)| Name::new(a.clone(), weights.as_ref().map_or(1, |w| w[i])))
+        .collect();
+    let passive = fail_duration.map(|fail_duration| Passive {
+        fail_duration,
+        max_fails,
+        unhealthy_status,
+        unhealthy_latency,
+        unhealthy_request_count,
+    });
+    let servers = Upstreams::new(names, policy, passive, resolvers, None);
     let client = if own_client {
         crate::proxy::client(dial_timeout, keepalive)
     } else {
@@ -1815,7 +1966,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     };
     Ok(ReverseProxy {
         upstreams,
-        policy,
+        servers,
+        retries,
         try_duration,
         try_interval,
         header_up,
@@ -1823,7 +1975,6 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         response_header_timeout,
         dial_timeout,
         client,
-        counter: AtomicUsize::new(0),
     })
 }
 

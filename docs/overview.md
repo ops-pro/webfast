@@ -143,7 +143,7 @@ flowchart TD
     slot -- within --> ws{"WebSocket upgrade (HTTP/1.1)?"}
     ws -- yes --> tunnel["handshake to the upstream;<br/>on 101 a tunnel both ways"]
     ws -- no --> send["headers: hop-by-hop dropped,<br/>X-Forwarded-*, client identity headers<br/>only from trusted proxies, header_up"]
-    send --> up["upstream: lb_policy, retries within<br/>lb_try_duration, response_header_timeout"]
+    send --> up["a server by lb_policy, per address, the down<br/>ones passed by; retries; response_header_timeout"]
     up --> resp{"response"}
     resp -- "502 / 504 / 408 / 413" --> fail["the failure, or a stored answer<br/>within stale-if-error"]
     resp -- ok --> tee["header_down; a cache miss's body<br/>kept on the side while it streams"]
@@ -173,6 +173,7 @@ flowchart LR
         jwks["JWKS read again every<br/>jwks_cache_duration, sooner for a new key id"]
         spec["API specs looked at again every refresh<br/>(conditional requests), compiled off the request threads"]
     end
+    dns["webfast-dns: upstream names resolved again<br/>at their TTL; requests read a snapshot"]
     certs["certificates: files looked at every minute"]
     reload["SIGHUP: the Caddyfile read again,<br/>put in place without dropping connections"]
     logs["log-writer: access and event logs,<br/>written in batches"]

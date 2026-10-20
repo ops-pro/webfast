@@ -12,6 +12,7 @@ pub mod cache;
 pub mod caddyfile;
 pub mod config;
 pub mod date;
+pub mod dns;
 pub mod encode;
 #[cfg(any(feature = "jwt", feature = "api-firewall"))]
 pub mod eventlog;
@@ -35,6 +36,7 @@ pub mod server;
 pub mod sockets;
 pub mod static_files;
 pub mod tls;
+pub mod upstreams;
 #[cfg(feature = "compress-files")]
 pub mod variants;
 pub mod watch;
