@@ -23,10 +23,12 @@ snapshot is never past its term while the nameserver answers. (`dynamic a { refr
 read yet; the code takes a `refresh` in place of the TTL when it is.)
 
 **The first resolution is at start and at reload, synchronous, with a timeout**
-(`WEB_DNS_TIMEOUT`, 5s unless set), as nginx does: a static upstream that does not resolve is an
-error at start (`reverse_proxy app.internal:8080: the name does not resolve: …`), not a 502 on
-the first request. A reload whose Caddyfile names an upstream that does not resolve is refused,
-the running configuration kept.
+(`WEB_DNS_TIMEOUT`, 5s unless set). A name that does not resolve then is not an error: the
+start goes on with a warning, a request to that upstream gets 502 (what a failed connection
+answers; the rest of the site serves), and the DNS thread keeps trying — a second, then two,
+four, up to a minute apart — so a container that Compose brings up later, or one being recreated,
+is found within a minute of appearing. This is how Caddy and nginx with `resolve` behave; a
+server that refuses to start because a neighbour is not up yet takes the site down with it.
 
 **A failed refresh changes nothing:** the addresses stay (stale while revalidating), the next try
 backs off (1s doubling, up to the term), the failure is logged once at warn and then at debug,

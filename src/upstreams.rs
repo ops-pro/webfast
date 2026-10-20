@@ -416,7 +416,9 @@ impl std::fmt::Debug for Picked<'_> {
 /// Why no server was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoServer {
-    /// None is up (or there is none yet): 503.
+    /// There is none: no name resolved yet (src/dns.rs). 502, as a connection that fails.
+    NoAddress,
+    /// None is up: 503.
     AllDown,
     /// Every one that is up was tried by this request already.
     AllTried,
@@ -436,6 +438,9 @@ impl Loaded<'_> {
             }),
             Loaded::Set(set, servers) => {
                 let n = servers.len().min(MAX_SERVERS);
+                if n == 0 {
+                    return Err(NoServer::NoAddress);
+                }
                 // Without health settings no server is ever down: the clock is not read.
                 let mut up: u64 = if n == MAX_SERVERS { u64::MAX } else { (1u64 << n) - 1 };
                 if let Some(passive) = &set.passive {

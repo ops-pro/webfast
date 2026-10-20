@@ -532,7 +532,8 @@ Those an answer shows are checked by `compat/`:
 - `reverse_proxy` balances over addresses, not names: an upstream name with several addresses is
   as many servers for `lb_policy` and the health settings (Caddy: one upstream, the dialler
   trying its addresses in turn). With every server down the request gets 503, as in Caddy; a name
-  that does not resolve stops the start and a reload (Caddy: 502 per request).
+  that does not resolve yet gets 502 for its requests until it does, as in Caddy (the start goes
+  on; the name is tried again with a back-off up to a minute).
 - Proxied responses get no `Via`; the upstream gets the client's `Accept-Encoding` as it is (Caddy's
   transport asks for gzip when the client sent none).
 - A failed request keeps the site's deferred headers, on the bare status and on the page
@@ -612,7 +613,7 @@ Those an answer shows are checked by `compat/`:
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
 | `WEB_ACME_DIR`                     | `/data/acme` | where the obtained certificates, their keys and the ACME account are kept (Automatic certificates) |
 | `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX` | `5s`, `1h`  | the TTL of an upstream name's answer is kept within these; the name is resolved again at 90% of it (docs/dns.md) |
-| `WEB_DNS_TIMEOUT`                  | `5s`        | one DNS query at most; at start a name that does not resolve in time is an error |
+| `WEB_DNS_TIMEOUT`                  | `5s`        | one DNS query at most; a name that does not resolve answers 502 until it does |
 | `WEB_DNS_IPV6`                     | `on`        | `off`: upstream names are resolved to IPv4 addresses only |
 | `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
 | `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |

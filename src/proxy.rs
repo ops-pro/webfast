@@ -198,6 +198,11 @@ impl ReverseProxy {
                     tracing::warn!("no upstream is available");
                     break Err(StatusCode::SERVICE_UNAVAILABLE);
                 }
+                // The name has not resolved (yet): what a failed connection answers.
+                Err(NoServer::NoAddress) => {
+                    tracing::warn!(upstreams = ?self.upstreams, "no upstream address: the name does not resolve");
+                    break Err(StatusCode::BAD_GATEWAY);
+                }
             };
             tried |= 1 << picked.index;
             let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);

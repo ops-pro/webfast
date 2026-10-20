@@ -3,7 +3,9 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -266,8 +268,9 @@ async fn a_cookie_keeps_a_client_on_its_server() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
-/// A nameserver of the test's own, answering every A query with `ip`.
-fn nameserver(ip: [u8; 4]) -> SocketAddr {
+/// A nameserver of the test's own, answering every A query with `ip` while `known` is set, and
+/// SERVFAIL otherwise (a container that is not up yet).
+fn nameserver(ip: [u8; 4], known: Arc<AtomicBool>) -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -275,14 +278,16 @@ fn nameserver(ip: [u8; 4]) -> SocketAddr {
         while let Ok((n, from)) = socket.recv_from(&mut buf) {
             let question = &buf[12..n];
             let qtype = u16::from_be_bytes([buf[n - 4], buf[n - 3]]);
+            let answers = qtype == 1 && known.load(Ordering::SeqCst);
+            let flags: u16 = if known.load(Ordering::SeqCst) { 0x8180 } else { 0x8182 };
             let mut msg = Vec::new();
             msg.extend_from_slice(&buf[..2]);
-            msg.extend_from_slice(&0x8180u16.to_be_bytes());
+            msg.extend_from_slice(&flags.to_be_bytes());
             msg.extend_from_slice(&1u16.to_be_bytes());
-            msg.extend_from_slice(&u16::from(qtype == 1).to_be_bytes());
+            msg.extend_from_slice(&u16::from(answers).to_be_bytes());
             msg.extend_from_slice(&[0; 4]);
             msg.extend_from_slice(question);
-            if qtype == 1 {
+            if answers {
                 msg.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4]);
                 msg.extend_from_slice(&ip);
             }
@@ -295,7 +300,7 @@ fn nameserver(ip: [u8; 4]) -> SocketAddr {
 #[tokio::test]
 async fn a_name_is_resolved_through_the_resolvers_before_the_start() {
     let live = upstream().await;
-    let ns = nameserver([127, 0, 0, 1]);
+    let ns = nameserver([127, 0, 0, 1], Arc::new(AtomicBool::new(true)));
     let (running, port) = start(&format!(
         ":0 {{\n\treverse_proxy app.test:{} {{\n\t\ttransport http {{\n\t\t\tresolvers {ns}\n\t\t}}\n\t}}\n}}\n",
         live.addr.port()
@@ -303,18 +308,40 @@ async fn a_name_is_resolved_through_the_resolvers_before_the_start() {
     .await;
     assert_eq!(get(port, "/", &[]).await.port(), live.addr.port());
     running.shutdown(Duration::from_secs(1)).await;
+}
 
-    // A nameserver that does not answer: the start fails, naming the upstream.
-    let config = load(&format!(
-        ":0 {{\n\treverse_proxy app.test:{} {{\n\t\ttransport http {{\n\t\t\tresolvers 127.0.0.1:1\n\t\t}}\n\t}}\n}}\n",
+#[tokio::test]
+async fn a_name_that_does_not_resolve_yet_gets_502_until_it_does() {
+    let live = upstream().await;
+    let known = Arc::new(AtomicBool::new(false));
+    let ns = nameserver([127, 0, 0, 1], known.clone());
+    // The start goes on without the name (a Compose stack where the container is not up yet).
+    let (running, port) = start(&format!(
+        ":0 {{\n\treverse_proxy /api/* app.test:{} {{\n\t\ttransport http {{\n\t\t\tresolvers {ns}\n\t\t}}\n\t}}\n\trespond /site \"site\"\n}}\n",
         live.addr.port()
-    ));
-    let error = match server::start(config).await {
-        Ok(_) => panic!("started with a name that does not resolve"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        error.contains("reverse_proxy app.test") && error.contains("does not resolve"),
-        "{error}"
+    ))
+    .await;
+    let first = get(port, "/api/x", &[]).await;
+    assert_eq!(first.status, 502, "body: {}", first.body);
+    assert_eq!(
+        get(port, "/site", &[]).await.body,
+        "site",
+        "the rest of the site serves"
     );
+    // The name appears: the DNS thread finds it on one of its tries (1 s, then 2, then 4…).
+    known.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    loop {
+        let answer = get(port, "/api/x", &[]).await;
+        if answer.status == 200 {
+            assert_eq!(answer.port(), live.addr.port());
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "still 502 after the name resolves"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    running.shutdown(Duration::from_secs(1)).await;
 }

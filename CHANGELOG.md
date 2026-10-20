@@ -21,8 +21,8 @@
   (`random_choose`, `weighted_round_robin`, `least_conn`, the hashes, `cookie`), `lb_retries`,
   passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`,
   `unhealthy_request_count`), 503 with every server down. The unit is an address: a name with
-  several is as many servers. Upstream names are resolved at start (one that does not resolve
-  stops it) and refreshed in the background at their TTL (`WEB_DNS_*`, `transport http {
+  several is as many servers. Upstream names are resolved at start (one that does not resolve yet
+  answers 502 until it does) and refreshed in the background at their TTL (`WEB_DNS_*`, `transport http {
   resolvers }`); a request never waits for DNS (docs/dns.md). A `reverse_proxy` with one literal
   address pays nothing for any of this.
 

@@ -451,8 +451,14 @@ fn tick(watches: &Watches) {
     }
 }
 
+/// The term a name that has not resolved yet is tried on: the back-off doubles from a second up
+/// to this (a container that is not up yet, in Compose, comes within it).
+const UNRESOLVED_TERM: Duration = Duration::from_secs(60);
+
 /// Resolves every name of every `reverse_proxy` of `config`, now, and has them refreshed from
-/// then on. A name that does not resolve is an error (the start, or the reload, stops).
+/// then on. A name that does not resolve is not an error: the start (or the reload) goes on, a
+/// request to that upstream gets 502 until the name resolves, and the DNS thread keeps trying
+/// (as Caddy serves, and as Compose brings containers up in its own order).
 pub fn begin(config: &crate::config::Config) -> anyhow::Result<()> {
     let options = options();
     for set in config.upstream_sets() {
@@ -461,21 +467,28 @@ pub fn begin(config: &crate::config::Config) -> anyhow::Result<()> {
                 continue;
             };
             let nameservers = set.nameservers();
-            let answer = lookup(host, &nameservers, options)
-                .map_err(|e| anyhow::anyhow!("reverse_proxy {}: the name does not resolve: {e}", name.text))?;
-            let term = set.refresh().unwrap_or(answer.ttl);
-            set.addresses(index, answer.addrs);
+            let (due, failures, term) = match lookup(host, &nameservers, options) {
+                Ok(answer) => {
+                    let term = set.refresh().unwrap_or(answer.ttl);
+                    set.addresses(index, answer.addrs);
+                    (Instant::now() + term.mul_f32(0.9), 0, term)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        upstream = %name.text,
+                        %error,
+                        "the upstream name does not resolve yet: requests to it get 502 until it does"
+                    );
+                    (Instant::now() + Duration::from_secs(1), 1, UNRESOLVED_TERM)
+                }
+            };
             let watch = Arc::new(Watch {
                 name: host.into(),
                 index,
                 nameservers,
                 refresh: set.refresh(),
                 set: Arc::downgrade(&set),
-                state: Mutex::new(State {
-                    due: Instant::now() + term.mul_f32(0.9),
-                    failures: 0,
-                    term,
-                }),
+                state: Mutex::new(State { due, failures, term }),
             });
             if REFRESHER.submit(watch).is_err() {
                 tracing::error!(name = %host, "the DNS thread takes no more names: this one is resolved once only");
