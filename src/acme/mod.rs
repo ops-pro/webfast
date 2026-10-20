@@ -9,8 +9,9 @@
 //! that offers `acme-tls/1` (src/acme/challenge.rs). Validation is not watched: the order is
 //! polled at the CA.
 //!
-//! A failure keeps what is on disk and is tried again with a back-off (a minute doubling to a
-//! day): a valid certificate is never ordered again, and never within a minute, which is what
+//! A failure keeps what is on disk and is tried again with a back-off (two minutes doubling to a
+//! day; five tries in the first hour, the most Let's Encrypt allows for one name): a valid
+//! certificate is never ordered again, which is what
 //! the CA's rate limits ask for.
 
 pub mod challenge;
@@ -221,7 +222,7 @@ async fn check(state: &State) {
             }
             Err(error) => {
                 entry.failures = entry.failures.saturating_add(1);
-                let wait = Duration::from_secs(60u64 << entry.failures.min(11).saturating_sub(1))
+                let wait = Duration::from_secs(120u64 << entry.failures.min(10).saturating_sub(1))
                     .min(Duration::from_secs(86_400));
                 if entry.failures == 1 {
                     tracing::warn!(host = %host.host, %error, retry_in = ?wait, "no certificate obtained; the one on disk, if any, stays in use");

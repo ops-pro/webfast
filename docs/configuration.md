@@ -265,7 +265,7 @@ both are answered before any route, so nothing in the site stands in the way. Th
 and the account live under `WEB_ACME_DIR` (`/data/acme`; in the image, a volume on `/data`),
 0600 for the keys. Until a host's certificate is there a handshake for it ends with no
 certificate, as for a name no site serves; a failure keeps what is on disk and is tried again with
-a back-off, never within a minute. Not done: wildcards (DNS-01), `tls internal`, `tls { … }`
+a back-off, never within two minutes. Not done: wildcards (DNS-01), `tls internal`, `tls { … }`
 blocks, on-demand TLS, several replicas sharing one directory.
 
 ### Upstreams

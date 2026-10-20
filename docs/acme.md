@@ -43,9 +43,9 @@ handshake for it ends, as for a name no site serves). A file that is broken keep
 certificate, as for any `tls` file.
 
 **A failure changes nothing:** the certificate on disk stays in use, the order is tried again
-with a back-off (1 minute doubling to 1 day) and logged at warn, then at debug. The CA's rate
+with a back-off (2 minutes doubling to 1 day: five tries in the first hour, the most Let's Encrypt allows a name) and logged at warn, then at debug. The CA's rate
 limits (Let's Encrypt: 5 certificates per set of names per week, 300 orders per account per 3
-hours) are the one thing the back-off protects: an order is never repeated within a minute, and a
+hours) are the one thing the back-off protects: an order is never repeated within two minutes, and a
 certificate that is valid is never ordered again.
 
 **Several replicas:** each obtains its own certificate for its own directory. A shared volume
