@@ -72,9 +72,10 @@ http-body-util = "0.1"
 httpdate = "1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful", "client-legacy", "http1", "http2"] }
-# The ACME client (src/acme): accounts, orders, challenges; the CSR and the TLS-ALPN-01 certificate
+# The ACME client (src/acme): accounts, orders, challenges, through the server's own HTTPS client
+# (its own would bring the platform verifier and a second root store); the CSR and the TLS-ALPN-01 certificate
 # with rcgen.
-instant-acme = { version = "0.8", optional = true, default-features = false, features = ["aws-lc-rs", "hyper-rustls", "rcgen"] }
+instant-acme = { version = "0.8", optional = true, default-features = false, features = ["aws-lc-rs", "rcgen"] }
 ipnet = "2"
 # Files kept in memory as LZ4 blocks (src/files.rs): the fast codec, with bounds-checked decoding.
 # mi_collect: threads that worked at startup give their free memory back (src/lib.rs).

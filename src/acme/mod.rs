@@ -331,9 +331,31 @@ fn http_client(root: Option<&Path>) -> Result<Box<dyn instant_acme::HttpClient>,
             .map_err(|e| e.to_string())?,
     };
     let connector = builder.https_only().enable_http1().build();
-    let client: hyper_util::client::legacy::Client<_, instant_acme::BodyWrapper<bytes::Bytes>> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-    Ok(Box::new(client))
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+    Ok(Box::new(AcmeHttp(client)))
+}
+
+/// The server's HTTPS client as the ACME client asks for one.
+struct AcmeHttp(
+    hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        instant_acme::BodyWrapper<bytes::Bytes>,
+    >,
+);
+
+impl instant_acme::HttpClient for AcmeHttp {
+    fn request(
+        &self,
+        request: http::Request<instant_acme::BodyWrapper<bytes::Bytes>>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>> {
+        let sent = self.0.request(request);
+        Box::pin(async move {
+            match sent.await {
+                Ok(response) => Ok(instant_acme::BytesResponse::from(response)),
+                Err(e) => Err(instant_acme::Error::Other(Box::new(e))),
+            }
+        })
+    }
 }
 
 /// The account at the CA: restored from `account.json`, or created and written there.
