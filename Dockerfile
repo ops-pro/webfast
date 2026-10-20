@@ -34,8 +34,31 @@ RUN --network=none \
     --mount=type=cache,id=webfast-target-${TARGETARCH},target=/src/target \
     CARGO_NET_OFFLINE=true TARGET="$(cat /target)" RUSTFLAGS="-Ctarget-feature=+crt-static" \
     sh pgo/build.sh /out \
- && mkdir -p /srv /etc/webfast /data && chown 10002:10002 /srv /data \
- && cp sample/Caddyfile sample/headers.caddy /etc/webfast/
+ && mkdir -p /srv /etc/webfast /data /config /caddy/etc /caddy/share && chown 10002:10002 /srv /data /config \
+ && cp sample/Caddyfile sample/headers.caddy /etc/webfast/ \
+ && cp sample/caddy/Caddyfile /caddy/etc/ && cp sample/caddy/index.html /caddy/share/
+
+# The Caddy-compatible image (`--target caddy`; published as the `-caddy` tags): the same binary
+# laid out as the official caddy image, so `image: caddy` can become `image: …/webfast:…-caddy`
+# with the Caddyfile, the volumes and the ports as they are — /etc/caddy/Caddyfile,
+# /usr/share/caddy, /data, /config, ports 80, 443 and 443/udp (docs/operations.md). Runs as
+# 10002 too: Docker lets a container bind the low ports without root (ip_unprivileged_port_start).
+FROM scratch AS caddy
+COPY --from=build /out/webfast /usr/bin/caddy
+COPY --from=build --chown=10002:10002 /caddy/etc /etc/caddy
+COPY --from=build --chown=10002:10002 /caddy/share /usr/share/caddy
+COPY --from=build --chown=10002:10002 /data /data
+COPY --from=build --chown=10002:10002 /config /config
+ENV LOG_LEVEL=info \
+    WEB_MAX_MEMORY=512MiB \
+    XDG_CONFIG_HOME=/config \
+    XDG_DATA_HOME=/data
+VOLUME /data /config
+USER 10002:10002
+EXPOSE 80 443 443/udp
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/caddy"]
+CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
 
 FROM scratch
 COPY --from=build /out/webfast /usr/local/bin/webfast

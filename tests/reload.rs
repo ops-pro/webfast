@@ -475,8 +475,64 @@ fn sighup_reloads_the_running_binary() {
     );
     assert!(get().ends_with("two"));
 
+    // `webfast reload --pid`: the command checks the file first (a broken one is refused there,
+    // nothing is sent), then signals the server.
+    write(":0 {\n\trespond \"three\"\n}\n");
+    let reload = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_webfast"))
+            .args(["reload", "--config"])
+            .arg(&caddyfile)
+            .args(extra)
+            .arg("--pid")
+            .arg(pid.to_string())
+            .output()
+            .unwrap()
+    };
+    let sent = reload(&["--adapter", "caddyfile"]);
+    assert!(sent.status.success(), "{}", String::from_utf8_lossy(&sent.stderr));
+    wait_for("configuration reloaded");
+    assert!(get().ends_with("three"));
+    write(":0 {\n\tnot_a_directive\n}\n");
+    let refused = reload(&[]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not_a_directive"));
+    assert!(get().ends_with("three"), "nothing was sent");
+
     // SAFETY: as above.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let status = child.wait().unwrap();
     assert!(status.success(), "{status}");
+}
+
+/// `--envfile`: the variables for the Caddyfile's `{$…}` placeholders, as `caddy run --envfile`.
+#[test]
+fn an_envfile_fills_the_placeholders() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let caddyfile = dir.path().join("Caddyfile");
+    std::fs::write(&caddyfile, ":0 {\n\trespond \"{$GREETING}\"\n}\n").unwrap();
+    let envfile = dir.path().join("env");
+    std::fs::write(
+        &envfile,
+        "# the greeting\nexport GREETING=\"hello there\"\n\nOTHER='x'\n",
+    )
+    .unwrap();
+    let ok = Command::new(env!("CARGO_BIN_EXE_webfast"))
+        .args(["validate", "--config"])
+        .arg(&caddyfile)
+        .arg("--envfile")
+        .arg(&envfile)
+        .output()
+        .unwrap();
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    std::fs::write(&envfile, "GREETING\n").unwrap();
+    let bad = Command::new(env!("CARGO_BIN_EXE_webfast"))
+        .args(["validate", "--config"])
+        .arg(&caddyfile)
+        .arg("--envfile")
+        .arg(&envfile)
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("line 1: not KEY=VALUE"));
 }

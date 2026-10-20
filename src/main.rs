@@ -1,6 +1,9 @@
-//! `webfast run [--config Caddyfile]` serves; `webfast validate [--config …]` checks the
-//! configuration and loads the site files without listening; `webfast healthcheck <http-url>`
-//! probes a running instance (the container HEALTHCHECK, so the image needs no curl).
+//! `webfast run [--config Caddyfile] [--envfile file]` serves; `webfast validate [--config …]`
+//! checks the configuration and loads the site files without listening; `webfast reload
+//! [--config …] [--pid n]` checks it and sends the server SIGHUP; `webfast healthcheck <http-url>`
+//! probes a running instance (the container HEALTHCHECK, so the image needs no curl). The
+//! commands take `caddy`'s names and flags (`--adapter caddyfile`, `--envfile`, `--watch`), so
+//! the Caddy-compatible image (Dockerfile, target caddy) runs the official image's command line.
 //! Environment: LOG_LEVEL (info), WEB_MAX_MEMORY (512MiB) for the site files held in memory,
 //! WEB_LOG_FLUSH_MS (10): how often access log lines are written out, in batches;
 //! WEB_LZ4_MIN_SAVING (25): files are kept in memory as LZ4 when that saves at least this many
@@ -44,8 +47,7 @@ use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_reusing, parse_
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const USAGE: &str =
-    "usage: webfast [run|validate] [--config <Caddyfile>] | healthcheck <http://host:port/path> | --version";
+const USAGE: &str = "usage: webfast [run|validate] [--config <Caddyfile>] [--envfile <file>] | reload [--config <Caddyfile>] [--pid <pid>] | healthcheck <http://host:port/path> | --version";
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
@@ -56,6 +58,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("healthcheck") => return healthcheck(args.get(1).map(String::as_str)),
+        Some("reload") => return reload(&args[1..]),
         Some(c @ ("run" | "validate")) => (c, &args[1..]),
         None => ("run", &args[..]),
         Some(other) if other.starts_with("--") => ("run", &args[..]),
@@ -78,6 +81,27 @@ fn main() -> ExitCode {
             }
             // Accepted for familiarity with `caddy run --adapter caddyfile`.
             "--adapter" if rest.get(i + 1).map(String::as_str) == Some("caddyfile") => i += 2,
+            // `caddy run --envfile`: KEY=VALUE lines into the environment, for the Caddyfile's
+            // `{$KEY}` placeholders.
+            "--envfile" => {
+                let Some(path) = rest.get(i + 1) else {
+                    eprintln!("--envfile needs a path; {USAGE}");
+                    return ExitCode::from(2);
+                };
+                if let Err(e) = load_envfile(std::path::Path::new(path)) {
+                    eprintln!("--envfile {path}: {e}");
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            // `caddy run --watch` reloads the configuration when its file changes; here the site
+            // files are watched anyway and the Caddyfile is reloaded on SIGHUP (`webfast reload`).
+            "--watch" => {
+                eprintln!(
+                    "--watch: site files are watched anyway; a changed Caddyfile is reloaded by SIGHUP or `webfast reload`"
+                );
+                i += 1;
+            }
             other => {
                 eprintln!("unknown argument {other:?}; {USAGE}");
                 return ExitCode::from(2);
@@ -475,6 +499,125 @@ async fn shutdown_signal() {
 }
 
 /// GET over plain HTTP; success on any 2xx status.
+/// `--envfile`: `KEY=VALUE` lines (blank lines and `#` comments passed by, an `export ` prefix and
+/// quotes around the value dropped), as `caddy run --envfile` reads them. The variables are set
+/// before the Caddyfile is read, at startup, before any thread.
+fn load_envfile(path: &std::path::Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {}: not KEY=VALUE", number + 1));
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("line {}: {key:?} is not a variable name", number + 1));
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        // SAFETY: at startup, on the main thread, before the runtime and its threads exist.
+        unsafe { std::env::set_var(key, value) };
+    }
+    Ok(())
+}
+
+/// `webfast reload [--config <Caddyfile>] [--pid <pid>]`: checks the configuration as `validate`
+/// would, then sends SIGHUP to the running server — the process given, or PID 1 when that is this
+/// binary (the container case; `caddy reload` has an admin API for this, there is none here).
+/// The server reads the file itself and refuses a broken one, keeping what runs.
+fn reload(args: &[String]) -> ExitCode {
+    let mut config_path = PathBuf::from("Caddyfile");
+    let mut pid: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" if args.get(i + 1).is_some() => {
+                config_path = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--adapter" if args.get(i + 1).map(String::as_str) == Some("caddyfile") => i += 2,
+            "--pid" if args.get(i + 1).is_some() => {
+                match args[i + 1].parse::<u32>() {
+                    Ok(n) => pid = Some(n),
+                    Err(_) => {
+                        eprintln!("--pid takes a number; {USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown argument {other:?}; {USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // The configuration is checked here too, so that a mistake is seen by whoever reloads (the
+    // server checks again, and keeps what runs when the file is broken).
+    let file = match caddyfile::parse_file(&config_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = webfast::load_parsed_reusing(
+        &file,
+        DEFAULT_MAX_MEMORY,
+        None,
+        Some(0),
+        webfast::watch::Watch::default(),
+        &[],
+    ) {
+        eprintln!("configuration error: {e}");
+        return ExitCode::from(2);
+    }
+    signal_reload(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_reload(pid: Option<u32>) -> ExitCode {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => {
+            // PID 1 in a container is the server itself; anywhere else it is init, not a target.
+            let own = std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok());
+            let init = std::fs::read_link("/proc/1/exe").ok();
+            if own.is_none() || own != init {
+                eprintln!("reload: PID 1 is not this server; give the server's PID with --pid, or send it SIGHUP");
+                return ExitCode::from(2);
+            }
+            1
+        }
+    };
+    // SAFETY: kill(2) with a signal the server handles; a wrong PID is an error, not a fault.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    if sent != 0 {
+        eprintln!(
+            "reload: cannot signal process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::FAILURE;
+    }
+    eprintln!("reload: SIGHUP sent to process {pid}; the server logs the outcome");
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_reload(pid: Option<u32>) -> ExitCode {
+    let _ = pid;
+    eprintln!("reload: send the server SIGHUP (this build cannot signal it)");
+    ExitCode::from(2)
+}
+
 fn healthcheck(url: Option<&str>) -> ExitCode {
     let Some(url) = url.and_then(|u| u.strip_prefix("http://")) else {
         eprintln!("healthcheck needs an http:// URL; {USAGE}");

@@ -5,6 +5,8 @@
 ```bash
 webfast run --config /etc/webfast/Caddyfile   # serve (also accepted: --adapter caddyfile)
 webfast validate --config Caddyfile           # parse, compile and load the files, then exit
+webfast reload --config Caddyfile --pid 1234  # check the file, then SIGHUP the server (PID 1 in a container)
+webfast run --config Caddyfile --envfile .env # KEY=VALUE lines for the {$…} placeholders
 webfast healthcheck http://127.0.0.1:8080/healthz   # exit 0 for a 2xx answer (the image's HEALTHCHECK)
 webfast --version
 ```
@@ -114,6 +116,36 @@ are believed, and with `trusted_proxies_strict` the client is the right-most add
 proxy (a client can write anything into the left-most). Requests from trusted proxies are not
 limited per address. Publish the port only to the proxy: anyone who can reach it from a private
 address may set `X-Forwarded-For`.
+
+### The Caddy-compatible image
+
+The same binary in the layout of the official `caddy` image (`Dockerfile`, target `caddy`; the
+tags with `-caddy`: `ghcr.io/ops-pro/webfast:latest-caddy`, `0.1.0-caddy`, `sha-…-caddy`), so
+that a Compose file or a `docker run` written for Caddy needs only its image changed:
+
+| What          | Where                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| binary        | `/usr/bin/caddy`, the entry point; `CMD run --config /etc/caddy/Caddyfile --adapter caddyfile`        |
+| configuration | `/etc/caddy/Caddyfile`: a static site from `/usr/share/caddy` on port 80, until replaced               |
+| site          | `/usr/share/caddy`, with a welcome page until replaced                                                 |
+| data, config  | `/data` (the certificates and the ACME account, `WEB_ACME_DIR=/data/acme`) and `/config`, volumes      |
+| user          | 10002:10002; Docker 20.10 and later let it bind 80 and 443 (`net.ipv4.ip_unprivileged_port_start=0` in every container) — elsewhere add `--sysctl net.ipv4.ip_unprivileged_port_start=0` or `cap_add: [NET_BIND_SERVICE]` |
+| ports         | 80, 443/tcp, 443/udp                                                                                    |
+| commands      | `caddy run`, `validate`, `reload` (SIGHUP to the server; `--pid` outside a container), `version`; `--config`, `--adapter caddyfile`, `--envfile`, `--watch` (a note: files are watched anyway) |
+
+```bash
+docker run -d --name web -p 80:80 -p 443:443 -p 443:443/udp \
+  -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$PWD/public:/usr/share/caddy:ro" \
+  -v caddy_data:/data -v caddy_config:/config ghcr.io/ops-pro/webfast:latest-caddy
+docker exec web caddy reload --config /etc/caddy/Caddyfile
+```
+
+What differs from the image it replaces: no admin API (port 2019 is not there; `caddy reload`
+works, `caddy adapt` and the API do not), no shell (`docker exec … sh` fails; `docker debug` or an
+ephemeral container instead), a Caddyfile outside the subset stops the start with the file and
+line (`docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" …:latest-caddy caddy validate
+--config /etc/caddy/Caddyfile` says so before anything is replaced), `LOG_LEVEL` and the `WEB_*`
+variables as for the other image. The access log is JSON on stdout as Caddy's is.
 
 ## TLS and HTTP/3
 

@@ -2,7 +2,8 @@
 # (profile-guided optimisation trains the build under a load, which emulation would make slow and
 # unrepresentative). The image goes to ghcr.io/<owner>/webfast as one multi-arch manifest: tagged
 # sha-<commit> on every push to main, and on a tag vX.Y.Z also X.Y.Z and latest. The binaries are
-# static (musl) and, on a tag, published as release assets with checksums. Every artifact gets a
+# static (musl) and, on a tag, published as release assets with checksums. The same build in the
+# layout of the official caddy image goes out as the -caddy tags. Every artifact gets a
 # provenance attestation (SLSA, Sigstore); a release also an SBOM attestation.
 name: Release
 
@@ -94,16 +95,34 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
-      - name: keep the digest for the manifest
+      # The Caddy-compatible layout of the same build (Dockerfile, target caddy): the build stage
+      # comes from the cache the first image filled.
+      - name: build and push the caddy image by digest
+        id: caddy
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: caddy
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.caddy.outputs.digest }}
+          push-to-registry: true
+      - name: keep the digests for the manifests
         run: |
-          mkdir -p digests
+          mkdir -p digests/webfast digests/caddy
           # Named by the hex alone: upload-artifact refuses a colon in a file name.
           digest="${{ steps.image.outputs.digest }}"
-          touch "digests/${digest#sha256:}"
+          touch "digests/webfast/${digest#sha256:}"
+          digest="${{ steps.caddy.outputs.digest }}"
+          touch "digests/caddy/${digest#sha256:}"
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
-          path: digests/*
+          path: digests/
           if-no-files-found: error
 
   manifest:
@@ -131,13 +150,34 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: one manifest for both architectures
-        working-directory: digests
+        working-directory: digests/webfast
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
       - name: what was published
         run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
+      # The same tags with -caddy for the Caddy-compatible layout.
+      - name: the caddy tags
+        id: meta_caddy
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: suffix=-caddy
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: one caddy manifest for both architectures
+        working-directory: digests/caddy
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta_caddy.outputs.json }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+      - name: what was published as caddy
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta_caddy.outputs.version }}"
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

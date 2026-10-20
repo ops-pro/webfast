@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A Caddy-compatible image (`Dockerfile` target `caddy`, the `-caddy` tags): the same binary in
+  the layout of the official `caddy` image (`/usr/bin/caddy`, `/etc/caddy/Caddyfile`,
+  `/usr/share/caddy`, `/data`, `/config`, ports 80 and 443), so a Compose file changes only its
+  image line. The commands take `caddy`'s names and flags: `reload` (checks the file, then SIGHUP
+  to the server; `--pid` outside a container), `--envfile`, `--adapter caddyfile`, `--watch`.
+  The README now says what the server is for: the static front end with an application behind
+  it, as a drop-in for Caddy there.
+
 - Automatic certificates (cargo feature `acme`, on by default; docs/acme.md): a site with a host
   name and no `tls` files gets its certificate from an ACME CA (Let's Encrypt, or `acme_ca`) by
   HTTP-01 or TLS-ALPN-01, renewed at two thirds of its life by a background thread, kept under

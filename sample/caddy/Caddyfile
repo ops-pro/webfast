@@ -1,0 +1,7 @@
+# The Caddy-compatible image's default configuration (Dockerfile, target caddy): what the official
+# caddy image starts with, a static site from /usr/share/caddy on port 80. Replace it by mounting
+# a Caddyfile at /etc/caddy/Caddyfile.
+:80 {
+	root * /usr/share/caddy
+	file_server
+}
