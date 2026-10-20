@@ -174,6 +174,7 @@ flowchart LR
         spec["API specs looked at again every refresh<br/>(conditional requests), compiled off the request threads"]
     end
     dns["webfast-dns: upstream names resolved again<br/>at their TTL; requests read a snapshot"]
+    acme["webfast-acme (acme): certificates ordered<br/>and renewed at two thirds of their life"]
     certs["certificates: files looked at every minute"]
     reload["SIGHUP: the Caddyfile read again,<br/>put in place without dropping connections"]
     logs["log-writer: access and event logs,<br/>written in batches"]
@@ -188,6 +189,7 @@ flowchart LR
 | `rate-limit`     | the `rate_limit` directive; `reverse_proxy` before the upstream               | requests per key and window; a client's requests at the upstreams at once                                  |
 | `proxy-cache`    | the `cache` directive; `reverse_proxy` on a miss                              | proxied answers kept in memory, in every encoding, stale answers while revalidating or when the upstream fails |
 | `compress-files` | `file_server` when a file has no precompressed sibling                        | compressed variants made in the background, served like siblings                                           |
+| `acme`           | `handle()` before the routes (HTTP-01); the certificate resolver (TLS-ALPN-01)  | certificates obtained from an ACME CA for the sites without `tls` files, renewed in the background          |
 | `mimalloc`       | the allocator                                                                 | mimalloc instead of the system's                                                                           |
 
 The request checks are configured outside the Caddyfile, so an edit there cannot switch them off;

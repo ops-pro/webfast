@@ -84,8 +84,9 @@ into; to look inside a running container use `docker debug` or an ephemeral cont
 | binary        | `/usr/local/bin/webfast`, the entry point; `CMD run --config /etc/webfast/Caddyfile`  |
 | configuration | `/etc/webfast/Caddyfile` and `/etc/webfast/headers.caddy`: the sample, until replaced |
 | site          | `/srv`, empty until a site is mounted or copied in                                    |
+| data          | `/data`, a volume: the certificates obtained and the ACME account (`WEB_ACME_DIR`, `/data/acme`) |
 | user          | 10002:10002, no capabilities needed (ports above 1024)                                |
-| port          | 8080; add 443/tcp and 443/udp when it terminates TLS itself                           |
+| port          | 8080; add 80, 443/tcp and 443/udp when it terminates TLS itself (80 for the ACME challenge and the redirect) |
 | health        | `webfast healthcheck http://127.0.0.1:8080/healthz` every 30 s                        |
 
 The sample configuration sends every path that is not a file to `app:8787` and the event stream to

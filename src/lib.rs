@@ -3,6 +3,8 @@
 //! docs/).
 
 pub mod accesslog;
+#[cfg(feature = "acme")]
+pub mod acme;
 #[cfg(feature = "api-firewall")]
 pub mod apifw;
 pub mod background;

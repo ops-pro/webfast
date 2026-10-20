@@ -36,7 +36,8 @@ compared request by request ([`compat/`](compat)).
 - **Built with profile-guided optimisation** (the Docker image): 10–20 % less CPU per request.
 - **Safe defaults against slow and greedy clients**: connection limits per address, header,
   idle and stall timeouts, a timeout for hung upstreams, bounded ranges, HTTP/3 frame limits.
-- **TLS** with rustls on aws-lc-rs (post-quantum key exchange preferred), certificates re-read when
+- **TLS** with rustls on aws-lc-rs (post-quantum key exchange preferred), certificates obtained
+  from Let's Encrypt (ACME, HTTP-01 and TLS-ALPN-01) and renewed, or your own files re-read when
   renewed; **HTTP/3** with 0-RTT for safe methods.
 - **Deltas after a deploy** (RFC 9842 compression dictionaries, `dcz`): a browser that has the
   previous version of a bundle gets the new one as a delta to it — 170 bytes instead of 229 KB in

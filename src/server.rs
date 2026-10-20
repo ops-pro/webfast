@@ -497,6 +497,12 @@ pub struct Ready {
 }
 
 impl Running {
+    /// The certificate resolvers of the TLS ports (the ACME thread tells them of new files).
+    #[cfg(feature = "acme")]
+    pub(crate) fn resolvers(&self) -> Vec<Arc<CertResolver>> {
+        self.ports.iter().filter_map(|p| p.resolver.clone()).collect()
+    }
+
     /// The site roots in memory (for loading a new configuration that takes them over).
     pub fn stores(&self) -> Vec<Arc<crate::files::FileStore>> {
         self.stores.clone()
@@ -515,6 +521,8 @@ impl Running {
         }
         // The new configuration's upstream names, resolved before it is taken (src/dns.rs).
         crate::dns::begin(&config)?;
+        #[cfg(feature = "acme")]
+        let acme = config.acme.clone();
         let Config {
             servers,
             stores,
@@ -590,6 +598,10 @@ impl Running {
         self.watcher = crate::watch::start(watch, &stores, &states, max_memory);
         self.stores = stores;
         self.ready = ready;
+        #[cfg(feature = "acme")]
+        if let Some(settings) = acme {
+            crate::acme::start(settings, self.resolvers());
+        }
         Ok(ready)
     }
 
@@ -646,6 +658,10 @@ pub async fn start(config: Config) -> Result<Running> {
     }
     let states: Vec<Arc<ServerState>> = running.ports.iter().map(|p| p.state.clone()).collect();
     started.finish(&states)?;
+    #[cfg(feature = "acme")]
+    if let Some(settings) = config.acme.clone() {
+        crate::acme::start(settings, running.resolvers());
+    }
     running.watcher = crate::watch::start(config.watch, &config.stores, &states, config.max_memory);
     running.stores = config.stores;
     Ok(running)
@@ -772,6 +788,10 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         if protocols.h1 {
             alpn.push(b"http/1.1");
         }
+        // TLS-ALPN-01 (src/acme): offered so that a validation handshake can ask for it; the
+        // resolver answers it only for a host with a challenge up.
+        #[cfg(feature = "acme")]
+        alpn.push(crate::acme::challenge::ALPN);
         let config = tls::server_config(resolver.clone(), &alpn, false)?;
         acceptor = Some(TlsAcceptor::from(Arc::new(config)));
         if protocols.h3 {

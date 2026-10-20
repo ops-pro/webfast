@@ -1,6 +1,7 @@
 # The checks of scripts/check.sh on every push and pull request: formatting, clippy with every
 # feature and with each alone, the tests on x86-64 and arm64, the tests on the minimum Rust
-# (Cargo.toml's rust-version), and cargo-deny (advisories, licenses, bans, sources).
+# (Cargo.toml's rust-version), cargo-deny (advisories, licenses, bans, sources), and the ACME flow
+# against Pebble.
 name: CI
 
 on:
@@ -39,7 +40,7 @@ jobs:
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: each extension alone
         run: |
-          for feature in mimalloc rate-limit proxy-cache jwt api-firewall compress-files; do
+          for feature in mimalloc rate-limit proxy-cache jwt api-firewall compress-files acme; do
             echo "::group::$feature"
             cargo clippy --locked --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
@@ -77,3 +78,26 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Automatic certificates against Pebble, Let's Encrypt's test CA (tests/acme.rs): an account,
+  # an order, the certificate served, the files reused at a restart. Never against a real CA.
+  acme:
+    runs-on: ubuntu-24.04
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        env:
+          PEBBLE_VA_ALWAYS_VALID: 1
+          PEBBLE_WFE_NONCEREJECT: 0
+        ports:
+          - 14000:14000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pebble's own root certificate (for its HTTPS; the same file in every Pebble image)
+        run: curl -sSfo pebble.minica.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem
+      - run: cargo test --locked --test acme -- --nocapture
+        env:
+          WEBFAST_PEBBLE_ROOT: ${{ github.workspace }}/pebble.minica.pem
+          WEBFAST_PEBBLE_DIRECTORY: https://localhost:14000/dir

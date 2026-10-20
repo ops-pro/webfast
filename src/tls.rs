@@ -57,7 +57,8 @@ pub struct CertResolver {
 #[derive(Debug, Clone)]
 struct LoadedEntry {
     spec: CertSpec,
-    key: Arc<CertifiedKey>,
+    /// `None`: a managed certificate (src/acme) whose files are not there yet.
+    key: Option<Arc<CertifiedKey>>,
     stamp: Stamp,
 }
 
@@ -80,6 +81,13 @@ fn stamp(spec: &CertSpec) -> Stamp {
 }
 
 fn load(spec: &CertSpec, provider: &CryptoProvider) -> Result<LoadedEntry> {
+    if spec.managed && !spec.cert.exists() {
+        return Ok(LoadedEntry {
+            spec: spec.clone(),
+            key: None,
+            stamp: stamp(spec),
+        });
+    }
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&spec.cert)
         .with_context(|| format!("reading certificate {}", spec.cert.display()))?
         .collect::<std::result::Result<_, _>>()
@@ -94,7 +102,7 @@ fn load(spec: &CertSpec, provider: &CryptoProvider) -> Result<LoadedEntry> {
         .with_context(|| format!("unsupported private key {}", spec.key.display()))?;
     Ok(LoadedEntry {
         spec: spec.clone(),
-        key: Arc::new(CertifiedKey::new(certs, signing)),
+        key: Some(Arc::new(CertifiedKey::new(certs, signing))),
         stamp: stamp(spec),
     })
 }
@@ -116,12 +124,19 @@ impl CertResolver {
             .iter()
             .map(|spec| {
                 let entry = load(spec, provider)?;
-                tracing::info!(
-                    cert = %spec.cert.display(),
-                    hosts = ?spec.hosts,
-                    key = ?entry.key.key.algorithm(),
-                    "certificate loaded"
-                );
+                match &entry.key {
+                    Some(key) => tracing::info!(
+                        cert = %spec.cert.display(),
+                        hosts = ?spec.hosts,
+                        key = ?key.key.algorithm(),
+                        "certificate loaded"
+                    ),
+                    None => tracing::info!(
+                        cert = %spec.cert.display(),
+                        hosts = ?spec.hosts,
+                        "certificate to be obtained: none for the host until then"
+                    ),
+                }
                 Ok(entry)
             })
             .collect::<Result<_>>()
@@ -205,8 +220,15 @@ impl CertResolver {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let loaded = self.loaded.read().ok()?;
         let name = hello.server_name().map(str::to_ascii_lowercase);
+        // TLS-ALPN-01 (src/acme): the challenge certificate for a handshake that asks for it.
+        #[cfg(feature = "acme")]
+        if let Some(name) = &name
+            && hello.alpn().is_some_and(crate::acme::challenge::offers_challenge)
+        {
+            return crate::acme::challenge::alpn_certificate(name);
+        }
+        let loaded = self.loaded.read().ok()?;
         let chosen = choose(&loaded, name.as_deref(), hello.signature_schemes(), self.strict_sni);
         if chosen.is_none() {
             // Scanners do this all the time: debug, not to flood the log.
@@ -215,7 +237,7 @@ impl ResolvesServerCert for CertResolver {
                 "TLS handshake refused: no site for this name"
             );
         }
-        chosen.map(|e| e.key.clone())
+        chosen.and_then(|e| e.key.clone())
     }
 }
 
@@ -250,9 +272,15 @@ fn choose<'a>(
     if strict_sni && !matches!(best, Some(0 | 1)) {
         return None;
     }
-    let candidates = || loaded.iter().filter(move |e| best.is_none() || fits(e) == best);
+    // An entry whose certificate is still to be obtained has none to give.
+    let candidates = || {
+        loaded
+            .iter()
+            .filter(move |e| best.is_none() || fits(e) == best)
+            .filter(|e| e.key.is_some())
+    };
     candidates()
-        .find(|e| e.key.key.choose_scheme(schemes).is_some())
+        .find(|e| e.key.as_ref().is_some_and(|k| k.key.choose_scheme(schemes).is_some()))
         .or_else(|| candidates().next())
 }
 
@@ -316,8 +344,9 @@ mod tests {
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
+                managed: false,
             },
-            key: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing)),
+            key: Some(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing))),
             stamp: Vec::new(),
         }
     }
@@ -336,8 +365,11 @@ mod tests {
             entry(&["example.test"], &rcgen::PKCS_ECDSA_P256_SHA256),
             entry(&["example.test"], &rcgen::PKCS_RSA_SHA256),
         ];
-        assert_eq!(loaded[0].key.key.algorithm(), SignatureAlgorithm::ECDSA);
-        assert_eq!(loaded[1].key.key.algorithm(), SignatureAlgorithm::RSA);
+        assert_eq!(
+            loaded[0].key.as_ref().unwrap().key.algorithm(),
+            SignatureAlgorithm::ECDSA
+        );
+        assert_eq!(loaded[1].key.as_ref().unwrap().key.algorithm(), SignatureAlgorithm::RSA);
         assert_eq!(chosen(&loaded, "example.test", &[EC, RSA]), 0, "both: the first listed");
         assert_eq!(
             chosen(&loaded, "example.test", &[RSA, EC]),
@@ -532,8 +564,9 @@ mod tests {
                     hosts: Vec::new(),
                     cert: std::path::PathBuf::new(),
                     key: std::path::PathBuf::new(),
+                    managed: false,
                 },
-                key: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing)),
+                key: Some(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing))),
                 stamp: Vec::new(),
             }]),
         });

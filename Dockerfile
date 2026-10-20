@@ -34,13 +34,16 @@ RUN --network=none \
     --mount=type=cache,id=webfast-target-${TARGETARCH},target=/src/target \
     CARGO_NET_OFFLINE=true TARGET="$(cat /target)" RUSTFLAGS="-Ctarget-feature=+crt-static" \
     sh pgo/build.sh /out \
- && mkdir -p /srv /etc/webfast && chown 10002:10002 /srv \
+ && mkdir -p /srv /etc/webfast /data && chown 10002:10002 /srv /data \
  && cp sample/Caddyfile sample/headers.caddy /etc/webfast/
 
 FROM scratch
 COPY --from=build /out/webfast /usr/local/bin/webfast
 COPY --from=build /etc/webfast /etc/webfast
 COPY --from=build --chown=10002:10002 /srv /srv
+# Obtained certificates and the ACME account (WEB_ACME_DIR, /data/acme): mount a volume here.
+COPY --from=build --chown=10002:10002 /data /data
+VOLUME /data
 ENV LOG_LEVEL=info \
     WEB_MAX_MEMORY=512MiB
 USER 10002:10002

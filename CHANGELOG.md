@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Automatic certificates (cargo feature `acme`, on by default; docs/acme.md): a site with a host
+  name and no `tls` files gets its certificate from an ACME CA (Let's Encrypt, or `acme_ca`) by
+  HTTP-01 or TLS-ALPN-01, renewed at two thirds of its life by a background thread, kept under
+  `WEB_ACME_DIR` (`/data/acme`; the image has a `/data` volume); `email`, `tls <email>`,
+  `acme_ca_root`, and `auto_https off | disable_redirects | disable_certs` as in Caddy, with the
+  HTTP to HTTPS redirect on `http_port`. The challenges are answered before any route; nothing
+  of it runs on a request. Not done: DNS-01 (wildcards), `tls internal`, `tls { … }` blocks.
 - `reverse_proxy` balances over several upstreams with Caddy's words: every `lb_policy`
   (`random_choose`, `weighted_round_robin`, `least_conn`, the hashes, `cookie`), `lb_retries`,
   passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`,

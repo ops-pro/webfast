@@ -380,9 +380,15 @@ type Variants = crate::variants::Hook;
 #[cfg(not(feature = "compress-files"))]
 type Variants = ();
 
-/// The checks before the routes, in order: the JWT first (the API firewall sees the claim headers
-/// it set, and the query parameters it hides from the event log).
-pub type RequestChecks = (Jwt, (ApiFirewall, ()));
+#[cfg(feature = "acme")]
+type Acme = Option<crate::acme::Http01>;
+#[cfg(not(feature = "acme"))]
+type Acme = ();
+
+/// The checks before the routes, in order: the ACME challenge answer first (nothing may stand
+/// before it: not a redirect, not a credential), then the JWT (the API firewall sees the claim
+/// headers it set, and the query parameters it hides from the event log).
+pub type RequestChecks = (Acme, (Jwt, (ApiFirewall, ())));
 /// The checks at a proxy, in the same order, then the client's slot at the upstreams (taken only
 /// for a request the checks let through).
 pub type UpstreamChecks = (Jwt, (ApiFirewall, (UpstreamLimit, ())));
@@ -464,16 +470,22 @@ fn within(bound: &[(Authority, &'static str)], known: &[Authority]) -> Result<()
 fn compose_request(config: &Config) -> RequestChecks {
     let _ = config;
     (
-        #[cfg(feature = "jwt")]
-        config.jwt.clone(),
-        #[cfg(not(feature = "jwt"))]
+        #[cfg(feature = "acme")]
+        config.acme.as_ref().map(|_| crate::acme::Http01),
+        #[cfg(not(feature = "acme"))]
         (),
         (
-            #[cfg(feature = "api-firewall")]
-            config.api_firewall.clone(),
-            #[cfg(not(feature = "api-firewall"))]
+            #[cfg(feature = "jwt")]
+            config.jwt.clone(),
+            #[cfg(not(feature = "jwt"))]
             (),
-            (),
+            (
+                #[cfg(feature = "api-firewall")]
+                config.api_firewall.clone(),
+                #[cfg(not(feature = "api-firewall"))]
+                (),
+                (),
+            ),
         ),
     )
 }
@@ -515,6 +527,10 @@ pub fn check_bindings(config: &Config) -> Result<()> {
 /// own, and a variable of one that is not built stops the start, as a misspelt one would.
 pub fn configure_from_env() -> std::result::Result<(), String> {
     crate::dns::configure_from_env()?;
+    #[cfg(feature = "acme")]
+    crate::acme::configure_from_env()?;
+    #[cfg(not(feature = "acme"))]
+    unbuilt("automatic certificates", "acme", &["WEB_ACME_DIR"])?;
     #[cfg(feature = "rate-limit")]
     crate::ratelimit::configure_from_env()?;
     #[cfg(not(feature = "rate-limit"))]

@@ -73,8 +73,9 @@ and on tags, each on a runner of its architecture.
 Cargo features, all on by default (docs/extensions.md): `mimalloc` (the allocator of the binary and of
 `examples/bench.rs`), `proxy-cache` (`cache` and `WEB_PROXY_CACHE_MEMORY`, src/cache.rs),
 `rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, src/ratelimit.rs), `jwt`
-(`WEB_JWT_CONFIG`, src/jwt), `api-firewall` (`WEB_API_FIREWALL_CONFIG`, src/apifw) and
-`compress-files` (`WEB_COMPRESSED_FILES_MEMORY`, src/variants.rs;
+(`WEB_JWT_CONFIG`, src/jwt), `api-firewall` (`WEB_API_FIREWALL_CONFIG`, src/apifw),
+`compress-files` (`WEB_COMPRESSED_FILES_MEMORY`, src/variants.rs) and `acme` (certificates
+obtained for the sites without `tls` files, `WEB_ACME_DIR`, src/acme;
 without a feature its directive and variables stop the startup with an error that
 says so). `--no-default-features` builds the server without
 them; clippy checks that build too.
@@ -108,6 +109,14 @@ gzip and identity with its ETags and 304s, HEAD included; what may not be stored
 Set-Cookie, Vary, 404, event streams, too large, excluded, ranges, no-store) reaches the upstream
 every time; `ttl` and `default_cache_control`; a stale answer while its revalidation brings a
 304, and in place of a 503; an upstream that sends gzip is asked for br and zstd and its br kept.
+`tests/balance.rs` balances over two upstreams written by hand: the policies, a dead upstream
+retried past and marked down, `least_conn`, the sticky cookie, a name resolved through
+`resolvers` before the start. `tests/acme.rs` (with the feature) obtains a certificate from Pebble,
+Let's Encrypt's test CA, and serves it, then starts again from the files on disk; it runs only
+with `WEBFAST_PEBBLE_ROOT` set (CI does; locally: `docker run -d --name pebble -e
+PEBBLE_VA_ALWAYS_VALID=1 ghcr.io/letsencrypt/pebble`, `docker cp pebble:/test/certs/pebble.minica.pem .`,
+then the test with `WEBFAST_PEBBLE_ROOT=$PWD/pebble.minica.pem` and Pebble reachable at
+`https://localhost:14000/dir`, or `WEBFAST_PEBBLE_DIRECTORY` naming where it is).
 
 ## The PGO build
 

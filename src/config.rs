@@ -53,6 +53,9 @@ pub struct Config {
     /// OpenAPI request validation (WEB_API_FIREWALL_CONFIG, src/apifw), after the JWT check.
     #[cfg(feature = "api-firewall")]
     pub api_firewall: Option<Arc<crate::apifw::ApiFirewall>>,
+    /// Certificates to obtain (src/acme): `None` when no site needs one.
+    #[cfg(feature = "acme")]
+    pub acme: Option<Arc<crate::acme::Settings>>,
 }
 
 pub struct ServerConfig {
@@ -158,6 +161,9 @@ pub struct CertSpec {
     pub hosts: Vec<String>,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// Written by the ACME thread (src/acme): the files may not exist yet, and the host has no
+    /// certificate until they do.
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +286,15 @@ struct Globals {
     /// The global `cache` option: where each `cache` directive starts from.
     #[cfg(feature = "proxy-cache")]
     cache: crate::cache::Settings,
+    /// `auto_https`: certificates obtained for the sites with a host name and no `tls` files
+    /// (`off` and `disable_certs` turn it off), and HTTP to HTTPS redirects for them (`off` and
+    /// `disable_redirects`).
+    auto_certs: bool,
+    auto_redirects: bool,
+    /// `email`, `acme_ca`, `acme_ca_root`.
+    email: Option<String>,
+    acme_ca: Option<String>,
+    acme_ca_root: Option<PathBuf>,
 }
 
 impl Default for Globals {
@@ -293,8 +308,25 @@ impl Default for Globals {
             order: DIRECTIVE_ORDER.iter().map(|s| s.to_string()).collect(),
             #[cfg(feature = "proxy-cache")]
             cache: crate::cache::Settings::default(),
+            auto_certs: true,
+            auto_redirects: true,
+            email: None,
+            acme_ca: None,
+            acme_ca_root: None,
         }
     }
+}
+
+/// Whether a site host can have its certificate obtained: a DNS name, not an address, not
+/// `localhost`, not a wildcard (DNS-01 is not done).
+fn manageable(host: &str) -> bool {
+    !host.is_empty()
+        && host != "*"
+        && !host.starts_with("*.")
+        && !host.eq_ignore_ascii_case("localhost")
+        && !host.ends_with(".localhost")
+        && host.parse::<std::net::IpAddr>().is_err()
+        && host.contains('.')
 }
 
 /// Whether the global options ask for debug logs (read before logging is set up).
@@ -321,6 +353,10 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         at: Location,
     }
     let mut placed: Vec<Placed> = Vec::new();
+    #[cfg(feature = "acme")]
+    let acme_dir = crate::acme::dir_from_env();
+    #[cfg(feature = "acme")]
+    let mut managed: Vec<crate::acme::Managed> = Vec::new();
     for block in &file.sites {
         let mut addresses = Vec::new();
         for key in &block.keys {
@@ -334,6 +370,8 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         // Several `tls` lines: several certificates for the site's hosts (an ECDSA and an RSA one,
         // say); a handshake gets the first the client can verify, as in Caddy (src/tls.rs).
         let mut tls: Vec<(PathBuf, PathBuf)> = Vec::new();
+        // `tls <email>`: the site's contact for the certificates obtained for it.
+        let mut tls_email: Option<String> = None;
         let mut log: Option<Arc<AccessLog>> = None;
         let mut body = Vec::new();
         let mut error_blocks = Vec::new();
@@ -341,10 +379,21 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
             match line.name() {
                 "handle_errors" => error_blocks.push(line),
                 "tls" => {
+                    if line.block.is_none() && line.tokens.len() == 2 {
+                        let arg = static_text(&line.tokens[1])?;
+                        if arg == "internal" {
+                            bail!(at_err(&line.at, "tls internal is not supported (no local CA)"));
+                        }
+                        if !arg.contains('@') {
+                            bail!(at_err(&line.at, "tls: `tls <cert_file> <key_file>`, or `tls <email>`"));
+                        }
+                        tls_email = Some(arg);
+                        continue;
+                    }
                     if line.block.is_some() || line.tokens.len() != 3 {
                         bail!(at_err(
                             &line.at,
-                            "tls: only `tls <cert_file> <key_file>` is supported (no automatic certificates)"
+                            "tls: `tls <cert_file> <key_file>`, or `tls <email>` (a tls block is not supported)"
                         ));
                     }
                     let cert = PathBuf::from(static_text(&line.tokens[1])?);
@@ -393,31 +442,61 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                 Some("https") => true,
                 _ => !tls.is_empty() || port == globals.https_port,
             };
-            if secure && tls.is_empty() {
-                bail!(at_err(
-                    &block.at,
-                    format!(
-                        "{}: HTTPS needs `tls <cert_file> <key_file>` (certificates are not obtained automatically)",
-                        address.text
-                    )
-                ));
-            }
             let hosts = if address.host.is_empty() || address.host == "*" {
                 Vec::new()
             } else {
                 vec![address.host.clone()]
             };
-            let specs: Vec<CertSpec> = if secure {
+            #[cfg_attr(not(feature = "acme"), allow(unused_mut))]
+            let mut specs: Vec<CertSpec> = if secure {
                 tls.iter()
                     .map(|(cert, key)| CertSpec {
                         hosts: hosts.clone(),
                         cert: cert.clone(),
                         key: key.clone(),
+                        managed: false,
                     })
                     .collect()
             } else {
                 Vec::new()
             };
+            if secure && tls.is_empty() {
+                // No files: the certificate is obtained (src/acme) when the host allows it.
+                #[cfg(not(feature = "acme"))]
+                let _ = &tls_email;
+                let obtained = cfg!(feature = "acme") && globals.auto_certs && manageable(&address.host);
+                if !obtained {
+                    let why = if !cfg!(feature = "acme") {
+                        "built without the acme feature"
+                    } else if !globals.auto_certs {
+                        "auto_https is off"
+                    } else if address.host.starts_with("*.") {
+                        "a wildcard needs DNS-01, which is not supported"
+                    } else {
+                        "certificates are obtained only for DNS names"
+                    };
+                    bail!(at_err(
+                        &block.at,
+                        format!("{}: HTTPS needs `tls <cert_file> <key_file>` ({why})", address.text)
+                    ));
+                }
+                #[cfg(feature = "acme")]
+                {
+                    let directory = globals.acme_ca.as_deref().unwrap_or(crate::acme::LETS_ENCRYPT);
+                    let (cert, key) = crate::acme::cert_paths(&acme_dir, directory, &address.host);
+                    specs.push(CertSpec {
+                        hosts: hosts.clone(),
+                        cert,
+                        key,
+                        managed: true,
+                    });
+                    managed.push(crate::acme::Managed {
+                        host: address.host.clone(),
+                        email: tls_email.clone(),
+                        http01: false,
+                    });
+                }
+            }
             placed.push(Placed {
                 port,
                 tls: specs,
@@ -503,8 +582,114 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
     if servers.is_empty() {
         bail!("the Caddyfile defines no sites");
     }
+    #[cfg(feature = "acme")]
+    let acme = if managed.is_empty() {
+        None
+    } else {
+        // HTTP to HTTPS for the managed hosts, on http_port, unless a site of the Caddyfile
+        // already listens there for the host (Caddy's rule); where the server listens on
+        // http_port for a host, HTTP-01 answers its challenge, else TLS-ALPN-01.
+        let http_port = globals.http_port;
+        let serves_on_http = |servers: &[ServerConfig], host: &str| {
+            servers
+                .iter()
+                .filter(|s| s.port == http_port && s.tls.is_none())
+                .flat_map(|s| s.sites.iter())
+                .any(|site| site.hosts.iter().any(|h| crate::matcher::host_matches(h, host)))
+        };
+        if globals.auto_redirects {
+            if servers.iter().any(|s| s.port == http_port && s.tls.is_some()) {
+                bail!(
+                    "port {http_port} serves HTTPS, so the HTTP to HTTPS redirects for the sites with obtained certificates cannot listen there (auto_https disable_redirects, or http_port)"
+                );
+            }
+            let to = if globals.https_port == 443 {
+                "https://{host}{uri}".to_string()
+            } else {
+                format!("https://{{host}}:{}{{uri}}", globals.https_port)
+            };
+            let redirect = Template::parse(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut sites = Vec::new();
+            for host in &managed {
+                if serves_on_http(&servers, &host.host) {
+                    continue;
+                }
+                let route = Route {
+                    matcher: None,
+                    group: None,
+                    handler: Handler::Redir {
+                        to: redirect.clone(),
+                        status: StatusCode::PERMANENT_REDIRECT,
+                        html: false,
+                    },
+                };
+                sites.push(Site {
+                    hosts: vec![host.host.clone()],
+                    routes: vec![route].into(),
+                    errors: None,
+                    log: None,
+                    answers: arc_swap::ArcSwapOption::empty(),
+                });
+            }
+            if !sites.is_empty() {
+                let opts = server_opts(&globals, http_port);
+                match servers.iter_mut().find(|s| s.port == http_port) {
+                    Some(server) => {
+                        // Before the catch-all, after the sites that name their host.
+                        let at = server
+                            .sites
+                            .iter()
+                            .position(|s| s.hosts.is_empty())
+                            .unwrap_or(server.sites.len());
+                        server.sites.splice(at..at, sites);
+                    }
+                    None => servers.push(ServerConfig {
+                        port: http_port,
+                        tls: None,
+                        strict_sni: false,
+                        strict_host: opts.strict_host.unwrap_or(true),
+                        protocols: Protocols {
+                            h2: false,
+                            h3: false,
+                            ..opts.protocols.unwrap_or_default()
+                        },
+                        trusted_proxies: opts.trusted.clone().unwrap_or_default(),
+                        trusted_strict: opts.strict.unwrap_or(false),
+                        client_ip_headers: opts
+                            .client_ip_headers
+                            .clone()
+                            .unwrap_or_else(|| vec![HeaderName::from_static("x-forwarded-for")]),
+                        limits: Limits {
+                            read_header: opts.read_header.unwrap_or(Limits::default().read_header),
+                            idle: opts.idle.unwrap_or(Limits::default().idle),
+                            ..Limits::default()
+                        },
+                        per_core: cfg!(unix),
+                        workers: None,
+                        reload: ReloadMode::default(),
+                        sites,
+                    }),
+                }
+            }
+        }
+        for host in &mut managed {
+            host.http01 = serves_on_http(&servers, &host.host);
+        }
+        Some(Arc::new(crate::acme::Settings {
+            directory: globals
+                .acme_ca
+                .clone()
+                .unwrap_or_else(|| crate::acme::LETS_ENCRYPT.to_string()),
+            root: globals.acme_ca_root.clone(),
+            email: globals.email.clone(),
+            dir: acme_dir,
+            hosts: managed,
+        }))
+    };
     Ok(Config {
         servers,
+        #[cfg(feature = "acme")]
+        acme,
         files: crate::files::Totals::default(),
         stores: Vec::new(),
         max_memory: 0,
@@ -599,18 +784,43 @@ fn parse_globals(lines: &[Line]) -> Result<Globals> {
         let args = &line.tokens[1..];
         match line.name() {
             "auto_https" => {
-                let ok = args.len() == 1
-                    && matches!(
-                        args[0].text.as_str(),
-                        "off" | "disable_redirects" | "disable_certs" | "ignore_loaded_certs"
-                    );
-                if !ok {
+                for arg in args {
+                    match arg.text.as_str() {
+                        "off" => {
+                            g.auto_certs = false;
+                            g.auto_redirects = false;
+                        }
+                        "disable_redirects" => g.auto_redirects = false,
+                        "disable_certs" => g.auto_certs = false,
+                        "ignore_loaded_certs" => {}
+                        _ => bail!(at_err(
+                            &line.at,
+                            "auto_https: off / disable_redirects / disable_certs / ignore_loaded_certs"
+                        )),
+                    }
+                }
+                if args.is_empty() {
                     bail!(at_err(
                         &line.at,
-                        "auto_https: only off / disable_redirects / disable_certs (no automatic HTTPS here)"
+                        "auto_https takes off, disable_redirects or disable_certs"
                     ));
                 }
             }
+            "email" => {
+                let email = one_arg(line)?;
+                if !email.contains('@') {
+                    bail!(at_err(&line.at, "email: not an address"));
+                }
+                g.email = Some(email);
+            }
+            "acme_ca" => {
+                let url = one_arg(line)?;
+                if !url.starts_with("https://") {
+                    bail!(at_err(&line.at, "acme_ca: an https:// directory URL"));
+                }
+                g.acme_ca = Some(url);
+            }
+            "acme_ca_root" => g.acme_ca_root = Some(PathBuf::from(one_arg(line)?)),
             "admin" => {
                 if args.len() != 1 || args[0].text != "off" {
                     bail!(at_err(&line.at, "admin: only `admin off` (there is no admin endpoint)"));
@@ -2578,19 +2788,160 @@ mod tests {
         assert!(s.protocols.h2c && !s.protocols.h3);
     }
 
+    #[cfg(feature = "acme")]
+    #[test]
+    fn a_host_without_tls_files_gets_its_certificate_obtained() {
+        let config = compile_text("{\n\temail ops@example.com\n}\nexample.com {\n\trespond x\n}\n").unwrap();
+        let acme = config.acme.as_ref().expect("a managed host");
+        assert_eq!(acme.directory, crate::acme::LETS_ENCRYPT);
+        assert_eq!(acme.email.as_deref(), Some("ops@example.com"));
+        assert_eq!(acme.hosts.len(), 1);
+        assert_eq!(acme.hosts[0].host, "example.com");
+        assert!(acme.hosts[0].http01, "the redirect server on :80 answers HTTP-01");
+        let https = config.servers.iter().find(|s| s.port == 443).unwrap();
+        let spec = &https.tls.as_ref().unwrap()[0];
+        assert!(spec.managed);
+        assert!(
+            spec.cert.ends_with("certs/example.com/cert.pem"),
+            "{}",
+            spec.cert.display()
+        );
+        let http = config
+            .servers
+            .iter()
+            .find(|s| s.port == 80)
+            .expect("the redirect server");
+        assert!(http.tls.is_none() && !http.protocols.h2 && http.protocols.h1);
+        assert_eq!(http.sites.len(), 1);
+        assert_eq!(http.sites[0].hosts, vec!["example.com".to_string()]);
+        assert!(matches!(
+            &http.sites[0].routes[0].handler,
+            Handler::Redir { status, .. } if *status == StatusCode::PERMANENT_REDIRECT
+        ));
+    }
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn redirects_and_challenges_follow_what_listens_on_the_http_port() {
+        // The site's own http:// block keeps the redirect out; HTTP-01 is still possible.
+        let own = compile_text(
+            "http://example.com {\n\trespond plain\n}\nexample.com {\n\ttls ops@example.com\n\trespond x\n}\n",
+        )
+        .unwrap();
+        let http = own.servers.iter().find(|s| s.port == 80).unwrap();
+        assert_eq!(http.sites.len(), 1, "no redirect site added");
+        assert!(matches!(&http.sites[0].routes[0].handler, Handler::Respond { .. }));
+        let acme = own.acme.as_ref().unwrap();
+        assert!(acme.hosts[0].http01);
+        assert_eq!(acme.hosts[0].email.as_deref(), Some("ops@example.com"), "tls <email>");
+        // Without redirects nothing listens on :80: TLS-ALPN-01.
+        let alpn = compile_text("{\n\tauto_https disable_redirects\n}\nexample.com {\n\trespond x\n}\n").unwrap();
+        assert!(alpn.servers.iter().all(|s| s.port != 80));
+        assert!(!alpn.acme.as_ref().unwrap().hosts[0].http01);
+        // Another HTTPS port: the redirect names it.
+        let port = compile_text("{\n\thttps_port 8443\n}\nexample.com {\n\trespond x\n}\n").unwrap();
+        let http = port.servers.iter().find(|s| s.port == 80).unwrap();
+        assert!(matches!(&http.sites[0].routes[0].handler, Handler::Redir { to, .. } if to.as_static().is_none()));
+        // A test CA.
+        let ca = compile_text(
+            "{\n\tacme_ca https://localhost:14000/dir\n\tacme_ca_root /tmp/pebble.pem\n}\nexample.com {\n\trespond x\n}\n",
+        )
+        .unwrap();
+        let acme = ca.acme.as_ref().unwrap();
+        assert_eq!(acme.directory, "https://localhost:14000/dir");
+        assert_eq!(acme.root.as_deref(), Some(Path::new("/tmp/pebble.pem")));
+        assert!(acme.hosts[0].http01);
+        let https = ca.servers.iter().find(|s| s.port == 443).unwrap();
+        assert!(
+            https.tls.as_ref().unwrap()[0]
+                .cert
+                .to_string_lossy()
+                .contains("localhost_14000")
+        );
+    }
+
+    #[test]
+    fn what_cannot_have_a_certificate_obtained_says_why() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "{\n\tauto_https off\n}\nexample.com {\n\trespond x\n}\n",
+                if cfg!(feature = "acme") {
+                    "auto_https is off"
+                } else {
+                    "acme feature"
+                },
+            ),
+            (
+                "{\n\tauto_https disable_certs\n}\nexample.com {\n\trespond x\n}\n",
+                if cfg!(feature = "acme") {
+                    "auto_https is off"
+                } else {
+                    "acme feature"
+                },
+            ),
+            (
+                "*.example.com {\n\trespond x\n}\n",
+                if cfg!(feature = "acme") {
+                    "wildcard needs DNS-01"
+                } else {
+                    "acme feature"
+                },
+            ),
+            (
+                "localhost {\n\trespond x\n}\n",
+                if cfg!(feature = "acme") {
+                    "only for DNS names"
+                } else {
+                    "acme feature"
+                },
+            ),
+            (
+                "https://10.0.0.1 {\n\trespond x\n}\n",
+                if cfg!(feature = "acme") {
+                    "only for DNS names"
+                } else {
+                    "acme feature"
+                },
+            ),
+            (
+                "example.com {\n\ttls internal\n\trespond x\n}\n",
+                "tls internal is not supported",
+            ),
+            (
+                "example.com {\n\ttls {\n\t\tca x\n\t}\n\trespond x\n}\n",
+                "a tls block is not supported",
+            ),
+            ("{\n\temail nope\n}\n:80 {\n}\n", "not an address"),
+            (
+                "{\n\tacme_ca http://ca.test\n}\n:80 {\n}\n",
+                "an https:// directory URL",
+            ),
+        ];
+        for (text, message) in cases {
+            let err = compile_text(text).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains(message), "{text:?}: {err}");
+        }
+        #[cfg(feature = "acme")]
+        {
+            let err = compile_text("a.test:80 {\n\ttls /c.pem /k.pem\n\trespond x\n}\nexample.com {\n\trespond y\n}\n")
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("port 80 serves HTTPS"), "{err}");
+        }
+    }
+
     #[test]
     fn rejects_what_is_not_supported() {
         for (text, message) in [
             (":80 {\n\tphp_fastcgi x:9000\n}\n", "unsupported directive"),
             (":80 {\n\tfile_server\n}\n", "need a site root"),
-            ("example.com {\n\trespond x\n}\n", "HTTPS needs `tls"),
             (":80 {\n\trespond @nope 404\n}\n", "@nope is not defined"),
             (
                 ":80 {\n\t@m expression {path} == '/'\n\trespond @m 1\n}\n",
                 "unsupported matcher",
             ),
             (":80 {\n\treverse_proxy https://x\n}\n", "not supported"),
-            ("{\n\temail a@b.c\n}\n:80 {\n}\n", "unsupported global option"),
             (":80 {\n\theader X\n}\n", "a value is required"),
             (":80 {\n\trespond {nope}\n}\n", "unknown placeholder"),
             (":80 {\n}\n:80 {\n}\n", "more than once"),

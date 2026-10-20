@@ -14,8 +14,8 @@ Docker image starts with it.
 | Kind           | Supported                                                                                                                                                                                                                                                                                                                                      |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                                                    |
-| Global options | `auto_https off`, `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host [on|insecure_off], timeouts { read_header, idle } }`, `cache { … }` (Proxy cache)                                                                           |
-| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify); `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
+| Global options | `auto_https off|disable_redirects|disable_certs`, `email`, `acme_ca`, `acme_ca_root` (Automatic certificates), `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host [on|insecure_off], timeouts { read_header, idle } }`, `cache { … }` (Proxy cache)                                                                           |
+| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify), `tls <email>`, or no `tls` at all: the certificate is obtained (Automatic certificates); `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
 | Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `request_body { max_size }`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
 | reverse_proxy  | upstreams by address or name (resolved at start, refreshed at their TTL), `to`, every `lb_policy` (`random`, `random_choose`, `first`, `round_robin`, `weighted_round_robin`, `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`, `cookie`), `lb_retries`, `lb_try_duration`, `lb_try_interval`, passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`), `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }` (Upstreams) |
@@ -240,6 +240,33 @@ example.com {
 - `cache_name` is the name in `Cache-Status`. Not supported: the plugin's storages (`redis`,
   `badger`, `nuts`, `otter`, `olric`, `etcd`: the cache is in memory), `cdn`, `api`, `key`,
   `cache_keys` and the other modes.
+
+### Automatic certificates
+
+A site with a host name and no `tls` files gets its certificate from an ACME certificate
+authority, Let's Encrypt unless `acme_ca` says otherwise, and has it renewed at two thirds of its
+life (cargo feature `acme`, on by default; docs/acme.md). As in Caddy: `email` is the account's
+contact, `tls <email>` one for the site, `auto_https off` or `disable_certs` turns it off, and a
+server on `http_port` answers the host with 308 to `https://` unless `auto_https
+disable_redirects` or a site of the Caddyfile listens there for it.
+
+```caddyfile
+{
+	email admin@example.com
+}
+example.com {
+	root * /srv
+	file_server
+}
+```
+
+The challenge is HTTP-01 when the server listens on `http_port` for the host, else TLS-ALPN-01;
+both are answered before any route, so nothing in the site stands in the way. The certificates
+and the account live under `WEB_ACME_DIR` (`/data/acme`; in the image, a volume on `/data`),
+0600 for the keys. Until a host's certificate is there a handshake for it ends with no
+certificate, as for a name no site serves; a failure keeps what is on disk and is tried again with
+a back-off, never within a minute. Not done: wildcards (DNS-01), `tls internal`, `tls { … }`
+blocks, on-demand TLS, several replicas sharing one directory.
 
 ### Upstreams
 
@@ -498,6 +525,10 @@ Those an answer shows are checked by `compat/`:
   of the dictionary's hash for a `dcz` delta; an upstream's ETag gets `.` and the letter instead),
   not modification time and size; there is no
   `Last-Modified`.
+- Automatic HTTPS obtains certificates by HTTP-01 or TLS-ALPN-01 only (no DNS-01, so no
+  wildcards), has no `tls internal`, no `tls { … }` block, no on-demand TLS, and orders one
+  certificate at a time; a host whose certificate is not there yet gets no certificate at all in a
+  handshake (Caddy serves none either, but answers plain HTTP meanwhile).
 - `reverse_proxy` balances over addresses, not names: an upstream name with several addresses is
   as many servers for `lb_policy` and the health settings (Caddy: one upstream, the dialler
   trying its addresses in turn). With every server down the request gets 503, as in Caddy; a name
@@ -579,6 +610,7 @@ Those an answer shows are checked by `compat/`:
 | `WEB_TLS_STRICT_SNI`               | `off`       | `on`: a TLS handshake without SNI, or for a name no site names exactly or by a wildcard, gets no certificate and ends with an alert (docs/operations.md, TLS and HTTP/3) |
 | `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
+| `WEB_ACME_DIR`                     | `/data/acme` | where the obtained certificates, their keys and the ACME account are kept (Automatic certificates) |
 | `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX` | `5s`, `1h`  | the TTL of an upstream name's answer is kept within these; the name is resolved again at 90% of it (docs/dns.md) |
 | `WEB_DNS_TIMEOUT`                  | `5s`        | one DNS query at most; at start a name that does not resolve in time is an error |
 | `WEB_DNS_IPV6`                     | `on`        | `off`: upstream names are resolved to IPv4 addresses only |
