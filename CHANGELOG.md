@@ -32,6 +32,11 @@
   up only by DT_HASH, which the arm64 vDSO of recent kernels (6.12) no longer has, so every clock
   read — tokio's and hyper's timers, the access log, about eight per request — was a system call.
   The binary now finds `clock_gettime` by DT_GNU_HASH or DT_HASH itself (`src/vdso.rs`).
+- Ready answers for redirects: a `redir` whose target is made of the path alone (`{re.html.1}`,
+  `{path}/`) is prepared with the site's files, for their `.html` paths and their directories
+  without the slash; the `.html` redirect is a table lookup instead of the whole chain (on a 4-core
+  Neoverse-N1, 67k → 94k requests per second). A target with `{query}`, `{host}` or other request
+  placeholders still takes the chain.
 - ETags are 8 characters of base64url (48 bits of the BLAKE3 hash) instead of 20 of hex; a
   representation `encode` makes on the fly gets a ninth character (`b`, `g`, `z`) instead of
   `-br` / `-gzip` / `-zstd`, a `dcz` delta `d` and 8 characters of its dictionary's hash, an

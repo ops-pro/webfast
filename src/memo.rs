@@ -5,11 +5,13 @@
 //! request for that path is then a table lookup and a copy of a header map.
 //!
 //! Kept are only answers that `file_server` gave from a stored file unchanged (not compressed on
-//! the fly). What a request's Accept-Encoding changes is decided by which of zstd, br and gzip it
-//! accepts and how their q-values compare — 26 cases in all — so answers are prepared for each and
-//! any Accept-Encoding finds its own. Everything else goes through the chain as before: other paths
-//! or other spellings of them, ranges, If-Match, an If-None-Match that is not exactly the answer's
-//! ETag, methods other than GET and HEAD.
+//! the fly), and the redirects `redir` gave to a target made of the path alone (`{re.html.1}`,
+//! `{path}/`: a site's `.html` and trailing-slash redirects, asked for its files' paths with
+//! `.html` or without the slash). What a request's Accept-Encoding changes is decided by which of
+//! zstd, br and gzip it accepts and how their q-values compare — 26 cases in all — so answers are
+//! prepared for each and any Accept-Encoding finds its own. Everything else goes through the chain
+//! as before: other paths or other spellings of them, ranges, If-Match, an If-None-Match that is
+//! not exactly the answer's ETag (a redirect has none), methods other than GET and HEAD.
 
 use crate::body::{Body, empty, full};
 use crate::encode::AcceptEncoding;
@@ -73,6 +75,11 @@ pub fn keeps(request: &http::request::Parts) -> bool {
 #[derive(Debug, Clone)]
 pub struct FromFile(pub Arc<FileEntry>);
 
+/// Marks a redirect `redir` made to a target that only the path decides, without a body. Only for
+/// `Preparing` requests, as `FromFile`.
+#[derive(Debug, Clone, Copy)]
+pub struct Redirected;
+
 /// A path's answer for each prepared Accept-Encoding signature.
 type PerSignature = Box<[Option<Arc<Answer>>]>;
 
@@ -87,10 +94,12 @@ pub struct Answers {
 }
 
 struct Answer {
+    /// 200, or a redirect's 3xx.
+    status: StatusCode,
     headers: HeaderMap,
     /// The file sent: its bytes are taken (or, kept in LZ4, decompressed) for each response, never
-    /// copied into the answer.
-    file: Arc<FileEntry>,
+    /// copied into the answer. `None`: a redirect, without a body.
+    file: Option<Arc<FileEntry>>,
     etag: Option<HeaderValue>,
     /// The 304 for an If-None-Match of exactly `etag`.
     not_modified: Option<HeaderMap>,
@@ -99,7 +108,13 @@ struct Answer {
 impl Answer {
     /// The same answer (bodies compared by where they are first: a file's body is one buffer).
     fn same(&self, other: &Answer) -> bool {
-        Arc::ptr_eq(&self.file, &other.file)
+        let same_file = match (&self.file, &other.file) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_file
+            && self.status == other.status
             && self.headers == other.headers
             && self.etag == other.etag
             && self.not_modified == other.not_modified
@@ -124,7 +139,9 @@ impl Answers {
         let variant = self.signatures.iter().position(|s| *s == signature)?;
         let answer = answers[variant].as_ref()?;
         // A compressed variant (src/variants.rs) answered from here counts as asked for.
-        answer.file.touch();
+        if let Some(file) = &answer.file {
+            file.touch();
+        }
         if let Some(if_none_match) = headers.get(IF_NONE_MATCH) {
             // What browsers send back is the ETag they got; anything else takes the long way.
             let (Some(etag), Some(not_modified)) = (&answer.etag, &answer.not_modified) else {
@@ -138,7 +155,12 @@ impl Answers {
             *response.headers_mut() = not_modified.clone();
             return Some(response);
         }
-        let mut response = Response::new(if head { empty() } else { full(answer.file.body()) });
+        let body = match &answer.file {
+            Some(file) if !head => full(file.body()),
+            _ => empty(),
+        };
+        let mut response = Response::new(body);
+        *response.status_mut() = answer.status;
         *response.headers_mut() = answer.headers.clone();
         Some(response)
     }
@@ -253,6 +275,7 @@ impl Answer {
     fn kept(&self, strings: &mut FxHashSet<&'static str>) -> Answer {
         let headers = permanent(&self.headers, strings);
         Answer {
+            status: self.status,
             etag: headers.get(ETAG).cloned(),
             not_modified: self.not_modified.as_ref().map(|h| permanent(h, strings)),
             headers,
@@ -286,7 +309,18 @@ async fn prepare_path(
 /// A draft: the chain's own header maps.
 async fn prepare_one(routes: &Arc<[Route]>, conn: &Arc<ConnInfo>, path: &str, accept: &str) -> Option<Answer> {
     let response = run(routes, conn, path, accept, None).await?;
-    if response.status() != StatusCode::OK {
+    let status = response.status();
+    if status.is_redirection() && response.extensions().get::<Redirected>().is_some() {
+        // Its If-None-Match, Range and If-Match change nothing, but such requests take the chain.
+        return Some(Answer {
+            status,
+            headers: response.into_parts().0.headers,
+            file: None,
+            etag: None,
+            not_modified: None,
+        });
+    }
+    if status != StatusCode::OK {
         return None;
     }
     let file = response.extensions().get::<FromFile>()?.0.clone();
@@ -302,8 +336,9 @@ async fn prepare_one(routes: &Arc<[Route]>, conn: &Arc<ConnInfo>, path: &str, ac
         not_modified = Some(response.into_parts().0.headers);
     }
     Some(Answer {
+        status,
         headers,
-        file,
+        file: Some(file),
         etag,
         not_modified,
     })
@@ -350,7 +385,8 @@ fn permanent(headers: &HeaderMap, strings: &mut FxHashSet<&'static str>) -> Head
 }
 
 /// Request paths that may serve a stored file: the file's own path, without `.html`, and the
-/// directory of an index file. Precompressed siblings are left out; the chain decides the rest.
+/// directory of an index file — and that may redirect to one: the file's own `.html` path, the
+/// directory without its slash. Precompressed siblings are left out; the chain decides the rest.
 fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
     let mut paths = FxHashSet::default();
     for store in stores {
@@ -373,6 +409,9 @@ fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
                     && dir.ends_with('/')
                 {
                     paths.insert(encode_path(dir));
+                    if dir.len() > 1 {
+                        paths.insert(encode_path(&dir[..dir.len() - 1]));
+                    }
                 }
             }
         }
@@ -422,8 +461,8 @@ pub(crate) fn collect_stores(routes: &[Route], out: &mut Vec<Arc<FileStore>>) {
 /// The routes reach their decisions and build their responses from the request path alone (and
 /// Accept-Encoding, which the answers are keyed by): no matcher on host, method, headers or
 /// addresses, no `request_header`, no placeholder other than path-derived ones. What a request is
-/// answered with by a handler that ends the chain elsewhere (redirect, respond, proxy) does not
-/// matter: those answers are never kept.
+/// answered with by a handler that ends the chain elsewhere (respond, proxy, a redirect to a target
+/// that is not the path's alone) does not matter: those answers are never kept.
 fn decided_by_path(routes: &[Route]) -> bool {
     routes.iter().all(|route| {
         route.matcher.as_ref().is_none_or(MatcherSet::depends_on_path_only)

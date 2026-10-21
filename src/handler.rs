@@ -986,6 +986,10 @@ impl Handler {
                 if let Ok(value) = HeaderValue::from_str(&location) {
                     response.headers_mut().insert(LOCATION, value);
                 }
+                // The same redirect for every request with this path: a ready answer (src/memo.rs).
+                if to.depends_on_path_only() && crate::memo::keeps(&ctx.req) {
+                    response.extensions_mut().insert(crate::memo::Redirected);
+                }
                 ctx.respond(response)
             }
             Handler::Encode(encode) => {

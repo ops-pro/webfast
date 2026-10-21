@@ -1192,8 +1192,9 @@ async fn ready_answers_are_what_the_chain_answers() {
     let routes = config.servers[0].sites[0].routes.clone();
     let answers = webfast::memo::Answers::prepare(&routes, false).expect("this site decides by the path");
     // /en/, contact, blog/, the asset, sw.js, the catalog — and /en/index, /en/blog/index,
-    // which the chain serves too ({path}.html), as Caddy does.
-    assert_eq!(answers.paths(), 8);
+    // which the chain serves too ({path}.html), as Caddy does; and the redirects of /en, /en/blog
+    // and the three .html paths.
+    assert_eq!(answers.paths(), 13);
 
     let accepts = [
         "gzip, deflate, br, zstd",
@@ -1247,12 +1248,43 @@ async fn ready_answers_are_what_the_chain_answers() {
         }
     }
 
+    // The redirects to the path without .html and to the directory with its slash.
+    let redirects = [
+        ("/en/contact.html", "/en/contact"),
+        ("/en/contact.html?utm_source=x", "/en/contact"),
+        ("/en/index.html", "/en/index"),
+        ("/en/blog/index.html", "/en/blog/index"),
+        ("/en", "/en/"),
+        ("/en/blog", "/en/blog/"),
+    ];
+    for (path, location) in redirects {
+        for accept in accepts {
+            let mut headers: Vec<(&str, &str)> = Vec::new();
+            if !accept.is_empty() {
+                headers.push(("accept-encoding", accept));
+            }
+            for method in [Method::GET, Method::HEAD] {
+                let (parts, _) = request_head(&method, path, &headers);
+                let ready = answers
+                    .answer(&parts)
+                    .unwrap_or_else(|| panic!("no ready answer for {method} {path} {accept:?}"));
+                let ready = collected(ready).await;
+                let expected = through_chain(&routes, &method, path, &headers).await;
+                assert_eq!(ready, expected, "{method} {path} accept={accept:?}");
+                assert_eq!(ready.0, StatusCode::PERMANENT_REDIRECT, "{path}");
+                assert_eq!(ready.1["location"], location, "{path}");
+            }
+        }
+    }
+
     // The long way: no ready answer.
     type Case<'a> = (Method, &'a str, &'a [(&'a str, &'a str)]);
     let compressible = [("accept-encoding", "gzip")];
     let cases: &[Case] = &[
-        (Method::GET, "/en", &[]),
-        (Method::GET, "/en/contact.html", &[]),
+        (Method::GET, "/en/contact.html", &[("if-none-match", "\"x\"")]),
+        (Method::GET, "/en/contact.html", &[("range", "bytes=0-3")]),
+        (Method::POST, "/en/contact.html", &[]),
+        (Method::GET, "/en/missing.html", &[]),
         (Method::GET, "/healthz", &[]),
         (Method::GET, "/api/forms", &[]),
         (Method::GET, "/EN/contact", &[]),
@@ -1301,6 +1333,17 @@ async fn sites_that_look_beyond_the_path_get_no_ready_answers() {
     let (parts, _) = request_head(&Method::GET, "/sw.js", &[]);
     let ready = collected(answers.answer(&parts).unwrap()).await;
     assert_eq!(ready.1["x-path"], "/sw.js");
+
+    // A redirect whose target is more than the path's takes the chain each time.
+    let config = load(&format!(
+        ":0 {{\n\troot * {root}\n\t@html path_regexp html ^(.*)\\.html$\n\tredir @html {{re.html.1}}?{{query}} 308\n\tfile_server\n}}\n"
+    ));
+    let routes = config.servers[0].sites[0].routes.clone();
+    let answers = webfast::memo::Answers::prepare(&routes, false).expect("the matchers look at the path");
+    let (parts, _) = request_head(&Method::GET, "/en/contact.html", &[]);
+    assert!(answers.answer(&parts).is_none());
+    let (parts, _) = request_head(&Method::GET, "/sw.js", &[]);
+    assert!(answers.answer(&parts).is_some());
 }
 
 #[tokio::test]
