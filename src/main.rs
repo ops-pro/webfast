@@ -47,6 +47,11 @@ use webfast::{DEFAULT_MAX_MEMORY, caddyfile, config, load_parsed_reusing, parse_
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// clock_gettime through the vDSO for the static musl build (musl misses the arm64 vDSO).
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+mod vdso;
+
 const USAGE: &str = "usage: webfast [run|validate] [--config <Caddyfile>] [--envfile <file>] | reload [--config <Caddyfile>] [--pid <pid>] | healthcheck <http://host:port/path> | --version";
 
 fn main() -> ExitCode {

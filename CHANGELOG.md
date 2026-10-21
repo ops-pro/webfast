@@ -28,6 +28,10 @@
 
 - Requests read the compressed variants from a snapshot (`ArcSwap`) instead of under a `RwLock`;
   the proxy cache hashes its keys with ahash (keyed per process) instead of SipHash.
+- The static musl build reads the clock through the vDSO on arm64 too: musl looks vDSO functions
+  up only by DT_HASH, which the arm64 vDSO of recent kernels (6.12) no longer has, so every clock
+  read — tokio's and hyper's timers, the access log, about eight per request — was a system call.
+  The binary now finds `clock_gettime` by DT_GNU_HASH or DT_HASH itself (`src/vdso.rs`).
 - ETags are 8 characters of base64url (48 bits of the BLAKE3 hash) instead of 20 of hex; a
   representation `encode` makes on the fly gets a ninth character (`b`, `g`, `z`) instead of
   `-br` / `-gzip` / `-zstd`, a `dcz` delta `d` and 8 characters of its dictionary's hash, an
