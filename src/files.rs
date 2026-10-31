@@ -1294,16 +1294,25 @@ mod tests {
         let (waste, _) = chunk_waste(&store.files().files);
         assert!(waste > 0 && waste < CHUNK, "{waste}");
 
-        // Most changed: everything goes into new buffers, nothing held besides the live files.
-        for i in 0..30 {
+        // Most changed, one file left in each buffer: everything goes into new buffers, nothing held
+        // besides the live files. Which files share a buffer follows the order the directory lists
+        // them in, so the ones kept are picked from the buffers, not by name.
+        let mut kept: FxHashMap<*const Chunk, usize> = FxHashMap::default();
+        for i in 0..40 {
+            let entry = store.file(&format!("/{i}.bin")).unwrap();
+            kept.entry(Arc::as_ptr(entry.chunk.as_ref().unwrap())).or_insert(i);
+        }
+        let kept: Vec<usize> = kept.into_values().collect();
+        let changed: Vec<usize> = (0..40).filter(|i| !kept.contains(i)).collect();
+        for &i in &changed {
             std::fs::write(dir.path().join(format!("{i}.bin")), file(i, 2)).unwrap();
         }
-        assert_eq!(store.rescan(1 << 30).unwrap().changed, 30);
+        assert_eq!(store.rescan(1 << 30).unwrap().changed, changed.len());
         let (waste, live) = chunk_waste(&store.files().files);
         assert_eq!(waste, 0);
         assert_eq!(live as u64, store.totals().stored);
-        for i in [0, 29, 30, 39] {
-            let want = file(i, if i < 30 { 2 } else { 0 });
+        for i in 0..40 {
+            let want = file(i, if changed.contains(&i) { 2 } else { u8::from(i < 4) });
             assert_eq!(&store.file(&format!("/{i}.bin")).unwrap().body()[..], &want[..], "{i}");
         }
     }
