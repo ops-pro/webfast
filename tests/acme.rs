@@ -137,4 +137,38 @@ async fn a_certificate_is_obtained_from_the_test_ca_and_kept() {
         .expect("the certificate from disk");
     assert_eq!(on_disk, certificate);
     again.shutdown(Duration::from_secs(1)).await;
+
+    // Revoked at the CA: its renewal window (ARI) is then in the past, and the server started again
+    // orders a new certificate at once, as the replacement of this one, though the record says it
+    // is not due.
+    let http = webfast::acme::http_client(Some(Path::new(&root))).unwrap();
+    let credentials: instant_acme::AccountCredentials =
+        serde_json::from_slice(&std::fs::read(ca_dir.join("account.json")).unwrap()).unwrap();
+    let account = instant_acme::Account::builder_with_http(http)
+        .from_credentials(credentials)
+        .await
+        .unwrap();
+    account
+        .revoke(&instant_acme::RevocationRequest {
+            certificate: &certificate,
+            reason: None,
+        })
+        .await
+        .unwrap();
+    let renewed = server::start(load(&text)).await.unwrap();
+    let port = renewed.bound[0].1.port();
+    let started = Instant::now();
+    loop {
+        if let Some(cert) = presented(port, "example.test").await
+            && cert != certificate
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "no new certificate within 90 s of the revocation"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    renewed.shutdown(Duration::from_secs(1)).await;
 }

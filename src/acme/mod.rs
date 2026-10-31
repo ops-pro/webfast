@@ -1,7 +1,7 @@
 //! Automatic certificates (docs/acme.md; cargo feature `acme`). A site with a host name on the
 //! HTTPS port and no `tls` files is managed: its certificate is ordered from the ACME CA
-//! (`acme_ca`, Let's Encrypt unless set) and renewed at two thirds of its life, by one background
-//! thread. The site is a `tls` site whose files this module writes (`WEB_ACME_DIR`); the resolver
+//! (`acme_ca`, Let's Encrypt unless set) and renewed in the window the CA suggests (ARI, RFC 9773),
+//! or at two thirds of its life when the CA has none, by one background thread. The site is a `tls` site whose files this module writes (`WEB_ACME_DIR`); the resolver
 //! (src/tls.rs) serves them as soon as they are there, and none for the host until then.
 //!
 //! The challenges are answered without touching the site: HTTP-01 by a request check that runs
@@ -21,12 +21,13 @@ pub use challenge::Http01;
 use crate::background::Worker;
 use crate::tls::CertResolver;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
-    RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier, ChallengeType, Identifier, NewAccount,
+    NewOrder, OrderStatus, RetryPolicy,
 };
-use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, Der};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -143,10 +144,13 @@ static WORKER: LazyLock<Worker<Plan>> = LazyLock::new(|| {
                 // Every host of the new plan is looked at now; the states of hosts that stay
                 // keep their back-off.
                 for host in &plan.settings.hosts {
-                    shared
+                    let state = shared
                         .hosts
                         .entry(host.host.clone())
                         .or_insert(HostState { due: now, failures: 0 });
+                    if state.failures == 0 {
+                        state.due = now;
+                    }
                 }
                 shared
                     .hosts
@@ -273,6 +277,75 @@ impl Record {
     }
 }
 
+/// What the CA said of a certificate's renewal (ARI, RFC 9773).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ari {
+    /// The suggested window (unix seconds) and when to ask again (seconds from now).
+    Window { start: u64, end: u64, retry_after: u64 },
+    /// The CA has no ARI: renewal at two thirds of the life alone.
+    Unsupported,
+    /// The CA could not be asked: two thirds of the life until it can.
+    Failed,
+}
+
+/// ARI's Retry-After, kept within these bounds (seconds): an hour, a day.
+const ARI_MIN_RETRY: u64 = 3600;
+const ARI_MAX_RETRY: u64 = 86_400;
+/// When to ask again after a failure, or after a certificate was obtained.
+const ARI_AGAIN: u64 = 6 * 3600;
+
+/// When to renew and when to look again (unix seconds), from the record and the CA's ARI answer.
+/// A window is followed when it ends within the certificate's life: renewal at a point of it
+/// chosen at random (RFC 9773 §4.2), the same for the same certificate and window, so that asking
+/// again does not move it; a window in the past is renewal now. Without one, two thirds of the
+/// life, and the CA asked again in a few hours unless it has no ARI.
+fn schedule(record: &Record, ari: Ari, id: &str, now: u64) -> (u64, u64) {
+    match ari {
+        Ari::Window {
+            start,
+            end,
+            retry_after,
+        } if start <= end && end <= record.not_after => {
+            let mut hasher = std::hash::DefaultHasher::new();
+            id.hash(&mut hasher);
+            let at = start + hasher.finish() % (end - start).max(1);
+            let again = now + retry_after.clamp(ARI_MIN_RETRY, ARI_MAX_RETRY);
+            (at, at.min(again))
+        }
+        Ari::Unsupported => (record.renew_at, record.renew_at),
+        Ari::Window { .. } | Ari::Failed => (record.renew_at, record.renew_at.min(now + ARI_AGAIN)),
+    }
+}
+
+/// Asks the CA when to renew the certificate `id` names.
+async fn renewal_info(settings: &Settings, host: &Managed, id: &CertificateIdentifier<'_>) -> Ari {
+    let email = host.email.as_deref().or(settings.email.as_deref());
+    let account = match account(settings, email).await {
+        Ok(account) => account,
+        Err(error) => {
+            tracing::debug!(host = %host.host, %error, "no renewal information: no account");
+            return Ari::Failed;
+        }
+    };
+    match account.renewal_info(id).await {
+        Ok((info, retry_after)) => {
+            let start = u64::try_from(info.suggested_window.start.unix_timestamp()).unwrap_or(0);
+            let end = u64::try_from(info.suggested_window.end.unix_timestamp()).unwrap_or(0);
+            tracing::debug!(host = %host.host, start, end, explanation = ?info.explanation_url, "renewal window from the CA");
+            Ari::Window {
+                start,
+                end,
+                retry_after: retry_after.as_secs(),
+            }
+        }
+        Err(instant_acme::Error::Unsupported(_)) => Ari::Unsupported,
+        Err(error) => {
+            tracing::debug!(host = %host.host, %error, "no renewal information from the CA");
+            Ari::Failed
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -287,27 +360,47 @@ async fn handle(plan: &Plan, host: &Managed) -> Result<Instant, String> {
     let settings = &plan.settings;
     let (cert, _) = cert_paths(&settings.dir, &settings.directory, &host.host);
     let record_path = cert.with_file_name("record.json");
+    // The certificate this one replaces, for the order (ARI's `replaces`), when the CA has ARI.
+    let mut replaces = None;
     if cert.is_file()
         && let Some(record) = Record::read(&record_path)
-        && unix_now() < record.renew_at
     {
-        tracing::debug!(host = %host.host, renew_at = record.renew_at, "certificate on disk, not due");
-        return Ok(instant_of(record.renew_at));
+        let id = CertificateDer::pem_file_iter(&cert)
+            .ok()
+            .and_then(|mut certs| certs.next()?.ok())
+            .and_then(|leaf| certificate_id(&leaf));
+        let ari = match &id {
+            Some(id) => renewal_info(settings, host, id).await,
+            None => Ari::Unsupported,
+        };
+        let now = unix_now();
+        let name = id.as_ref().map(ToString::to_string).unwrap_or_default();
+        let (renew_at, again) = schedule(&record, ari, &name, now);
+        if now < renew_at {
+            tracing::debug!(host = %host.host, renew_at, look_again = again, "certificate on disk, not due");
+            return Ok(instant_of(again));
+        }
+        if renew_at < record.renew_at {
+            tracing::info!(host = %host.host, renew_at, "renewal due early: the CA's renewal window says so");
+        }
+        replaces = id.filter(|_| matches!(ari, Ari::Window { .. }));
     }
-    let record = obtain(settings, host).await?;
+    let record = obtain(settings, host, replaces).await?;
     tracing::info!(host = %host.host, not_after = record.not_after, renew_at = record.renew_at, "certificate obtained");
     let provider = crate::tls::provider();
     for resolver in plan.resolvers.iter().filter_map(Weak::upgrade) {
         resolver.reload_changed(&provider);
     }
-    Ok(instant_of(record.renew_at))
+    // The CA's window for the new certificate is asked for a few hours on.
+    Ok(instant_of(record.renew_at.min(unix_now() + ARI_AGAIN)))
 }
 
 static ACCOUNT: Mutex<Option<(String, Account)>> = Mutex::new(None);
 
 /// The HTTP client the ACME client talks through: the Mozilla roots built in (the image has no
-/// CA store), or `acme_ca_root` alone for a test CA.
-fn http_client(root: Option<&Path>) -> Result<Box<dyn instant_acme::HttpClient>, String> {
+/// CA store), or `acme_ca_root` alone for a test CA. Public for tests/acme.rs, which acts at the
+/// test CA as the server's account.
+pub fn http_client(root: Option<&Path>) -> Result<Box<dyn instant_acme::HttpClient>, String> {
     let builder = hyper_rustls::HttpsConnectorBuilder::new();
     let builder = match root {
         Some(path) => {
@@ -404,15 +497,34 @@ async fn account(settings: &Settings, email: Option<&str>) -> Result<Account, St
     Ok(account)
 }
 
-/// Orders the certificate, answers the challenge, writes the files.
-async fn obtain(settings: &Settings, host: &Managed) -> Result<Record, String> {
+/// Orders the certificate (as the replacement of `replaces`, when given), answers the challenge,
+/// writes the files.
+async fn obtain(
+    settings: &Settings,
+    host: &Managed,
+    replaces: Option<CertificateIdentifier<'static>>,
+) -> Result<Record, String> {
     let email = host.email.as_deref().or(settings.email.as_deref());
     let account = account(settings, email).await?;
     let identifiers = [Identifier::Dns(host.host.clone())];
-    let mut order = account
-        .new_order(&NewOrder::new(&identifiers))
-        .await
-        .map_err(|e| format!("ordering: {e}"))?;
+    let replacement = match replaces {
+        Some(id) => match account.new_order(&NewOrder::new(&identifiers).replaces(id)).await {
+            Ok(order) => Some(order),
+            Err(error) => {
+                // Already replaced, say, by an order that did not finish: a plain order then.
+                tracing::debug!(host = %host.host, %error, "the order as a replacement was refused");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut order = match replacement {
+        Some(order) => order,
+        None => account
+            .new_order(&NewOrder::new(&identifiers))
+            .await
+            .map_err(|e| format!("ordering: {e}"))?,
+    };
     // What was put up for the challenges, taken down whatever the outcome.
     let mut put_up: Vec<Answer> = Vec::new();
     let outcome = answer_challenges(&mut order, host, &mut put_up).await;
@@ -579,28 +691,76 @@ fn element(der: &[u8], at: usize) -> Option<(u8, usize, usize)> {
     (end <= der.len()).then_some((tag, start, end))
 }
 
-/// `notBefore` and `notAfter` of a certificate, unix seconds (RFC 5280 §4.1: the validity is the
-/// fifth element of the TBSCertificate, after an optional version, the serial, the signature
-/// algorithm and the issuer).
-pub fn validity(der: &[u8]) -> Option<(u64, u64)> {
+/// The elements of a certificate's TBSCertificate but its optional version (RFC 5280 §4.1): the
+/// serial, the signature algorithm, the issuer, the validity, the subject, the key, then the
+/// optional unique IDs and extensions (`[3]`).
+fn tbs_fields(der: &[u8]) -> Option<Vec<(u8, usize, usize)>> {
     let (_, tbs_start, _) = element(der, 0)?; // Certificate
     let (_, mut at, tbs_end) = element(der, tbs_start)?; // TBSCertificate
-    if let Some((0xA0, _, end)) = element(der, at) {
-        at = end; // version
+    let mut fields = Vec::with_capacity(8);
+    while at < tbs_end {
+        let field = element(der, at)?;
+        if field.2 > tbs_end {
+            return None;
+        }
+        at = field.2;
+        if !(fields.is_empty() && field.0 == 0xA0) {
+            fields.push(field);
+        }
     }
-    for _ in 0..3 {
-        let (_, _, end) = element(der, at)?; // serial, signature algorithm, issuer
-        at = end;
-    }
-    let (0x30, start, end) = element(der, at)? else {
+    Some(fields)
+}
+
+/// `notBefore` and `notAfter` of a certificate, unix seconds.
+pub fn validity(der: &[u8]) -> Option<(u64, u64)> {
+    let &(0x30, start, _) = tbs_fields(der)?.get(3)? else {
         return None;
     };
-    if end > tbs_end {
-        return None;
-    }
     let (tag_a, a_start, a_end) = element(der, start)?;
     let (tag_b, b_start, _) = element(der, a_end)?;
     Some((time(tag_a, &der[a_start..a_end])?, time(tag_b, &der[b_start..])?))
+}
+
+/// What ARI names a certificate by (RFC 9773 §4.1): the `keyIdentifier` of its Authority Key
+/// Identifier extension and its serial number, each as the contents of its DER element.
+fn certificate_id(der: &[u8]) -> Option<CertificateIdentifier<'static>> {
+    let fields = tbs_fields(der)?;
+    let &(0x02, serial_start, serial_end) = fields.first()? else {
+        return None;
+    };
+    let &(_, extensions, _) = fields.iter().find(|field| field.0 == 0xA3)?;
+    let (0x30, mut at, end) = element(der, extensions)? else {
+        return None;
+    };
+    while at < end {
+        // Extension: the OID, `critical` when it is set, the value as an OCTET STRING.
+        let (_, start, next) = element(der, at)?;
+        at = next;
+        let (0x06, oid_start, oid_end) = element(der, start)? else {
+            return None;
+        };
+        if der[oid_start..oid_end] != [0x55, 0x1D, 0x23] {
+            continue; // not 2.5.29.35, the Authority Key Identifier
+        }
+        let mut value = element(der, oid_end)?;
+        if value.0 == 0x01 {
+            value = element(der, value.2)?;
+        }
+        let (0x04, value_start, _) = value else {
+            return None;
+        };
+        // AuthorityKeyIdentifier: a SEQUENCE whose `[0] keyIdentifier` comes first when present.
+        let (0x30, key_at, sequence_end) = element(der, value_start)? else {
+            return None;
+        };
+        let (0x80, key_start, key_end) = element(der, key_at).filter(|_| key_at < sequence_end)? else {
+            return None;
+        };
+        let key = Der::from_slice(&der[key_start..key_end]);
+        let serial = Der::from_slice(&der[serial_start..serial_end]);
+        return Some(CertificateIdentifier::new(key, serial).into_owned());
+    }
+    None
 }
 
 /// A UTCTime (`YYMMDDHHMMSSZ`) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) as unix seconds.
@@ -683,6 +843,93 @@ mod tests {
             "two thirds in"
         );
         assert!(validity(&cert.der()[..40]).is_none(), "a cut certificate");
+    }
+
+    #[test]
+    fn a_certificate_is_named_for_ari_by_its_issuer_s_key_and_its_serial() {
+        // The example of RFC 9773 §4.1.
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(vec![
+            0x69, 0x88, 0x5B, 0x6B, 0x87, 0x46, 0x40, 0x41, 0xE1, 0xB3, 0x7B, 0x84, 0x7B, 0xA0, 0xAE, 0x2C, 0xDE, 0x01,
+            0xC8, 0xD4,
+        ]);
+        let issuer = rcgen::Issuer::new(ca, ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["example.test".to_string()]).unwrap();
+        params.serial_number = Some(vec![0x00, 0x87, 0x65, 0x43, 0x21].into());
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = rcgen::date_time_ymd(2026, 3, 1);
+        params.not_after = rcgen::date_time_ymd(2026, 5, 30);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        let id = certificate_id(cert.der()).unwrap();
+        assert_eq!(id.to_string(), "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE");
+        assert!(
+            validity(cert.der()).is_some(),
+            "the validity found past the version as before"
+        );
+
+        params.use_authority_key_identifier_extension = false;
+        let without = params.self_signed(&key).unwrap();
+        assert!(certificate_id(without.der()).is_none(), "no Authority Key Identifier");
+        assert!(certificate_id(&cert.der()[..60]).is_none(), "a cut certificate");
+    }
+
+    #[test]
+    fn renewal_follows_the_ca_s_window() {
+        let record = Record::new(1_000_000, 1_900_000); // renewal at 1_600_000 without ARI
+        let now = 1_100_000;
+        let window = |start, end| Ari::Window {
+            start,
+            end,
+            retry_after: 21_600,
+        };
+
+        let (at, again) = schedule(&record, window(1_550_000, 1_560_000), "a.b", now);
+        assert!((1_550_000..1_560_000).contains(&at), "{at}");
+        assert_eq!(again, now + 21_600, "asked again at its Retry-After");
+        assert_eq!(
+            schedule(&record, window(1_550_000, 1_560_000), "a.b", now + 5).0,
+            at,
+            "the same point"
+        );
+        let other = (0..20).map(|i| schedule(&record, window(1_550_000, 1_560_000), &format!("{i}"), now).0);
+        assert!(
+            other.collect::<std::collections::HashSet<_>>().len() > 10,
+            "spread over the window"
+        );
+
+        // Revoked, say: a window in the past is renewal now.
+        let (at, _) = schedule(&record, window(1_000_000, 1_000_100), "a.b", now);
+        assert!(at < now);
+        // Retry-After kept within an hour and a day; the point itself, when it comes first.
+        let short = Ari::Window {
+            start: 1_550_000,
+            end: 1_560_000,
+            retry_after: 5,
+        };
+        assert_eq!(schedule(&record, short, "a.b", now).1, now + ARI_MIN_RETRY);
+        let long = Ari::Window {
+            start: now + 100,
+            end: now + 100,
+            retry_after: 1 << 40,
+        };
+        assert_eq!(schedule(&record, long, "a.b", now), (now + 100, now + 100));
+
+        // A window past the end of the certificate's life is not followed, nor is a reversed one.
+        assert_eq!(
+            schedule(&record, window(1_950_000, 1_960_000), "a.b", now),
+            (1_600_000, now + ARI_AGAIN)
+        );
+        assert_eq!(
+            schedule(&record, window(1_560_000, 1_550_000), "a.b", now),
+            (1_600_000, now + ARI_AGAIN)
+        );
+        // No ARI: two thirds of the life; the CA not reached: that too, and asked again.
+        assert_eq!(schedule(&record, Ari::Unsupported, "a.b", now), (1_600_000, 1_600_000));
+        assert_eq!(schedule(&record, Ari::Failed, "a.b", now), (1_600_000, now + ARI_AGAIN));
+        assert_eq!(schedule(&record, Ari::Failed, "a.b", 1_599_000), (1_600_000, 1_600_000));
     }
 
     #[test]

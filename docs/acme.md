@@ -28,12 +28,19 @@ the log: the order is polled at the CA, as the protocol has it.
 
 **The work is one background thread** (`Worker`, `webfast-acme`, its own runtime for the ACME
 client): at start, every managed host whose certificate is missing or due is ordered; from then
-on a check an hour renews what is due. Nothing of it runs on a request or a connection. One order
+on each host is looked at again when it is due, or when the CA said to ask it again. Nothing of it runs on a request or a connection. One order
 at a time, so a Caddyfile with many hosts does not burst the CA.
 
-**Renewal is due at two thirds of the certificate's life** (Caddy's default; a 90-day certificate
-at 60 days, a 6-day one at 4), and the server starts serving the new certificate as soon as it is
-written: the resolver re-reads the files when told, as it does when they change on disk.
+**Renewal is due in the window the CA suggests** (ARI, RFC 9773; Let's Encrypt and Pebble have
+it): at start, at a reload, and then as often as the CA's `Retry-After` says (kept between an hour
+and a day), the server asks the CA when to renew the certificate on disk, and renews at a point of
+that window chosen at random, the same for the same certificate and window. A certificate the CA
+revoked gets a window in the past, and is renewed at once; the order names the certificate it
+replaces. **Without ARI it is due at two thirds of the certificate's life** (Caddy's default; a
+90-day certificate at 60 days, a 6-day one at 4): when the CA has no `renewalInfo`, when its window
+does not end within the certificate's life, and while it cannot be reached (asked again every six
+hours). The server starts serving the new certificate as soon as it is written: the resolver
+re-reads the files when told, as it does when they change on disk.
 
 **Storage:** `WEB_ACME_DIR` (`/data/acme`; the image has `/data` for the user it runs as), a
 directory per CA: `account.json` (the account's key and URL), `certs/<host>/cert.pem` and
@@ -46,7 +53,8 @@ certificate, as for any `tls` file.
 with a back-off (2 minutes doubling to 1 day: five tries in the first hour, the most Let's Encrypt allows a name) and logged at warn, then at debug. The CA's rate
 limits (Let's Encrypt: 5 certificates per set of names per week, 300 orders per account per 3
 hours) are the one thing the back-off protects: an order is never repeated within two minutes, and a
-certificate that is valid is never ordered again.
+certificate that is valid is never ordered again before its window. A replacement the CA refuses
+(one already replaced, say) is ordered again as a plain order.
 
 **Several replicas:** each obtains its own certificate for its own directory. A shared volume
 would need a lock, which this does not take; it is not a cluster certificate store.

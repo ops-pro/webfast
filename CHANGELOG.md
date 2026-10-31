@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Automatic certificates are renewed in the window the CA suggests (ARI, RFC 9773): asked at
+  start, at a reload and as often as the CA's `Retry-After` says, a point of the window chosen at
+  random; a certificate the CA revoked is renewed at once, and the order names the certificate it
+  replaces. Two thirds of the life as before when the CA has no ARI or cannot be reached. A reload
+  now looks at every managed host at once (a host in back-off keeps it).
+
 - A Caddy-compatible image (`Dockerfile` target `caddy`, the `-caddy` tags): the same binary in
   the layout of the official `caddy` image (`/usr/bin/caddy`, `/etc/caddy/Caddyfile`,
   `/usr/share/caddy`, `/data`, `/config`, ports 80 and 443), so a Compose file changes only its
