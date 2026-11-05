@@ -1,6 +1,6 @@
 # Development
 
-Rust 1.88 or later (`rust-version` in Cargo.toml; CI checks it). Everything below also runs in
+Rust 1.89 or later (`rust-version` in Cargo.toml; CI checks it). Everything below also runs in
 Docker, so the host needs nothing but Docker and a POSIX shell.
 
 ## Layout

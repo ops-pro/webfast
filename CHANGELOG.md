@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The JWT and API firewall files and OpenAPI specs in YAML are read with serde-saphyr (pure Rust)
+  instead of serde_yaml_ng, whose libyaml port (unsafe-libyaml) is unmaintained
+  (RUSTSEC-2024-0449); read as before (YAML 1.2 booleans, the last of a repeated key, `<<` an
+  ordinary key), errors on one line without the file's text. A mapping key `~` is now an error.
+  Reading a spec takes a third of the allocations and 40 % of the peak memory, and half as much
+  time again (the GitHub REST API's, 10 MB: 356 ms against 236).
+  The minimum Rust version is 1.89 (serde-saphyr's).
+
 - Automatic certificates are renewed in the window the CA suggests (ARI, RFC 9773): asked at
   start, at a reload and as often as the CA's `Retry-After` says, a point of the window chosen at
   random; a certificate the CA revoked is renewed at once, and the order names the certificate it

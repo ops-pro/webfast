@@ -198,7 +198,7 @@ impl ApiFirewall {
     }
 
     pub fn from_yaml(text: &str, base: &Path) -> Result<ApiFirewall> {
-        let file: FileConfig = serde_yaml_ng::from_str(text)?;
+        let file: FileConfig = crate::yaml::from_str(text)?;
         let mut apis = Vec::new();
         for config in file.apis {
             let source = source::Source::from_config(&config.spec, base)?;
@@ -222,7 +222,7 @@ impl ApiFirewall {
 
     /// An API from a spec given as text (tests, tools).
     pub fn from_spec(spec_text: &str, config_yaml: &str) -> Result<ApiFirewall> {
-        let config: ApiConfig = serde_yaml_ng::from_str(config_yaml)?;
+        let config: ApiConfig = crate::yaml::from_str(config_yaml)?;
         let api = api(config, source::Source::inline())?;
         let compiled = api.compile(spec_text.as_bytes(), true)?;
         api.install(compiled);
@@ -493,7 +493,7 @@ impl Api {
         let document: Value = if text.trim_start().starts_with('{') {
             serde_json::from_str(text)?
         } else {
-            serde_yaml_ng::from_str(text)?
+            crate::yaml::from_str(text)?
         };
         let spec = spec::compile(document, self.strict).with_context(|| format!("OpenAPI document {}", self.name))?;
         let mut modes = vec![self.mode; spec.operations.len()];

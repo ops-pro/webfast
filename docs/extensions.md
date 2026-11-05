@@ -59,7 +59,7 @@ pub trait ResponseObserver: Send + Sync {
 
 `Result<Body, Response<Body>>` is the body to go on with, or the answer that refuses: exactly what
 `Checks::check` returns today; the trait only names it. The methods are `async fn` in traits
-(Rust 1.75; the MSRV is 1.88), so no future is boxed.
+(Rust 1.75; the MSRV is 1.89), so no future is boxed.
 
 ### Hooks are composed at compile time, not listed at run time
 

@@ -128,7 +128,7 @@ replaced, [`sample/Caddyfile`](sample/Caddyfile), which sends what is not a file
 docker run --rm -p 8080:8080 -v "$PWD/public:/srv:ro" -v "$PWD/Caddyfile:/etc/webfast/Caddyfile:ro" ghcr.io/ops-pro/webfast:latest
 ```
 
-From source (Rust 1.88 or later):
+From source (Rust 1.89 or later):
 
 ```bash
 cargo build --release

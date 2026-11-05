@@ -339,7 +339,7 @@ mod tests {
     use super::*;
 
     fn config(yaml: &str) -> Result<Source> {
-        let config: SpecConfig = serde_yaml_ng::from_str(yaml)?;
+        let config: SpecConfig = crate::yaml::from_str(yaml)?;
         Source::from_config(&config, Path::new("/etc/web"))
     }
 

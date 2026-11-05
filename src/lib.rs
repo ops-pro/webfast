@@ -42,6 +42,8 @@ pub mod upstreams;
 #[cfg(feature = "compress-files")]
 pub mod variants;
 pub mod watch;
+#[cfg(any(feature = "jwt", feature = "api-firewall"))]
+pub mod yaml;
 
 use std::path::Path;
 use std::time::Duration;

@@ -294,7 +294,7 @@ impl JwtAuth {
     }
 
     pub fn from_yaml(text: &str, base: &Path) -> Result<JwtAuth> {
-        let file: FileConfig = serde_yaml_ng::from_str(text)?;
+        let file: FileConfig = crate::yaml::from_str(text)?;
         let names: Vec<&String> = file.providers.keys().collect();
         let mut providers = Vec::new();
         for (name, config) in &file.providers {

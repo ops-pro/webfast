@@ -2,8 +2,8 @@
 name = "webfast"
 version = "0.1.0"
 edition = "2024"
-# let chains (`if let … && let …`).
-rust-version = "1.88"
+# let chains (`if let … && let …`): 1.88; serde-saphyr: 1.89.
+rust-version = "1.89"
 description = "A static-first web server: the site from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a strict subset of the Caddyfile"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -36,10 +36,10 @@ proxy-cache = []
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # JWT validation at the edge (src/jwt), on when WEB_JWT_CONFIG names its file; without the feature
 # none of its code or dependencies is built.
-jwt = ["dep:hyper-rustls", "dep:serde", "dep:serde_yaml_ng"]
+jwt = ["dep:hyper-rustls", "dep:serde", "dep:serde-saphyr"]
 # OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
 # file; without the feature none of its code or dependencies is built.
-api-firewall = ["dep:hyper-rustls", "dep:jsonschema", "dep:serde", "dep:serde_yaml_ng"]
+api-firewall = ["dep:hyper-rustls", "dep:jsonschema", "dep:serde", "dep:serde-saphyr"]
 
 [dependencies]
 anyhow = "1"
@@ -48,8 +48,9 @@ hyper-rustls = { version = "0.27", optional = true, default-features = false, fe
 # OpenAPI schemas compiled into validators once (src/apifw); no fetching of remote references.
 jsonschema = { version = "0.60", optional = true, default-features = false }
 serde = { version = "1", optional = true, features = ["derive"] }
-# The JWT configuration file (src/jwt); serde_yaml's maintained fork.
-serde_yaml_ng = { version = "0.10", optional = true }
+# The YAML of the JWT and API firewall files and of OpenAPI specs (src/yaml.rs): pure Rust, with
+# limits on what a document may expand to.
+serde-saphyr = { version = "2.1", optional = true, default-features = false, features = ["deserialize"] }
 # The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
 # requests load them without counting references.
 # Keys of the proxy cache hashed with a per-process random key: safe against made-up collisions
