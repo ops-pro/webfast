@@ -942,7 +942,7 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| Encoding::parse(&v.trim().to_ascii_lowercase()));
     let identity = match origin {
-        Some(encoding) => match decode(encoding, &raw, cap) {
+        Some(encoding) => match decode(encoding, &raw, cap, 0) {
             Some(identity) => identity,
             None => {
                 tracing::debug!(uri = %miss.key.uri, "not stored: its body does not decode within max_cacheable_body_bytes");
@@ -1039,9 +1039,11 @@ fn encodes(encode: &Encode, status: StatusCode, headers: &HeaderMap, len: usize)
     encode.types.iter().any(|t| type_matches(t, &content_type))
 }
 
-/// Decodes a body, giving up past `cap` bytes.
-fn decode(encoding: Encoding, data: &[u8], cap: usize) -> Option<Bytes> {
-    let mut out = Vec::new();
+/// Decodes a body, giving up past `cap` bytes; `expected`: the length it should have, when known
+/// (0: not known), for a buffer of that size at once. The bytes may be kept in the cache: they hold
+/// no more memory than their length (`exact`).
+fn decode(encoding: Encoding, data: &[u8], cap: usize, expected: usize) -> Option<Bytes> {
+    let mut out = Vec::with_capacity(expected.min(cap));
     let limit = cap as u64 + 1;
     let read = match encoding {
         Encoding::Gzip => flate2::read::MultiGzDecoder::new(data)
@@ -1050,7 +1052,7 @@ fn decode(encoding: Encoding, data: &[u8], cap: usize) -> Option<Bytes> {
         Encoding::Br => brotli::Decompressor::new(data, 4096).take(limit).read_to_end(&mut out),
         Encoding::Zstd => zstd::stream::read::Decoder::new(data).and_then(|d| d.take(limit).read_to_end(&mut out)),
     };
-    (read.is_ok() && out.len() <= cap).then(|| Bytes::from(out))
+    (read.is_ok() && out.len() <= cap).then(|| crate::encode::exact(out))
 }
 
 /// The upstream's own body in `encoding`, when it has one that decodes to the same content.
@@ -1067,7 +1069,9 @@ async fn fetch_encoded(fetch: &Fetch, encoding: Encoding, identity: &Bytes, cap:
         return None;
     }
     let body = collect(response.into_body(), cap).await?;
-    let same = decode(encoding, &body, cap).is_some_and(|decoded| decoded == *identity);
+    // The same content is the identity's length: decoded into a buffer of that size, and given up
+    // as soon as it is longer (not at `cap`: a small identity's look-alike cannot expand to it).
+    let same = decode(encoding, &body, identity.len(), identity.len()).is_some_and(|decoded| decoded == *identity);
     same.then_some(body)
 }
 
@@ -1348,8 +1352,16 @@ mod tests {
         for encoding in [Encoding::Gzip, Encoding::Br, Encoding::Zstd] {
             let packed = crate::encode::compress_best(encoding, text.as_bytes()).unwrap();
             assert!(packed.len() < text.len());
-            assert_eq!(decode(encoding, &packed, 1 << 20).unwrap(), text.as_bytes());
-            assert!(decode(encoding, &packed, 100).is_none(), "{encoding:?} past the cap");
+            assert_eq!(decode(encoding, &packed, 1 << 20, 0).unwrap(), text.as_bytes());
+            assert_eq!(
+                decode(encoding, &packed, text.len(), text.len()).unwrap(),
+                text.as_bytes()
+            );
+            assert!(decode(encoding, &packed, 100, 0).is_none(), "{encoding:?} past the cap");
+            assert!(
+                decode(encoding, &packed, text.len() - 1, text.len() - 1).is_none(),
+                "{encoding:?} longer"
+            );
         }
     }
 }
