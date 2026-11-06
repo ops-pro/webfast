@@ -301,14 +301,15 @@ impl Ctx {
         self.regexps.push((name, captures));
     }
 
-    pub fn regexp(&self, name: &str, group: &str) -> Option<String> {
+    /// A group of what a regexp matcher captured, borrowed from the request.
+    pub fn regexp(&self, name: &str, group: &str) -> Option<&str> {
         let (_, caps) = self.regexps.iter().find(|(n, _)| &**n == name)?;
         let index = match group.parse::<usize>() {
             Ok(i) => i,
             Err(_) => caps.names.iter().find(|(n, _)| n == group)?.1,
         };
         let (start, end) = (*caps.groups.get(index)?)?;
-        caps.text.get(start..end).map(str::to_string)
+        caps.text.get(start..end)
     }
 
     /// A response carrying the headers `header` set earlier (the response's own fields win).

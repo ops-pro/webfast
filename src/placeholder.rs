@@ -12,6 +12,21 @@ use http::HeaderName;
 pub struct Template {
     parts: Vec<Part>,
     source: String,
+    /// What `render` reserves: the literal text, and `PER_VAR` bytes for each placeholder.
+    reserve: usize,
+}
+
+/// A guess at a placeholder's length (an address, a host, a short path or header).
+const PER_VAR: usize = 24;
+
+fn reserve_of(parts: &[Part]) -> usize {
+    parts
+        .iter()
+        .map(|part| match part {
+            Part::Text(t) => t.len(),
+            Part::Var(_) => PER_VAR,
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -101,21 +116,24 @@ impl Template {
             parts.push(Part::Text(literal));
         }
         Ok(Template {
+            reserve: reserve_of(&parts),
             parts,
             source: text.to_string(),
         })
     }
 
     pub fn literal(text: &str) -> Template {
+        let parts = vec![Part::Text(text.to_string())];
         Template {
-            parts: vec![Part::Text(text.to_string())],
+            reserve: reserve_of(&parts),
+            parts,
             source: text.to_string(),
         }
     }
 
     /// The text when it has no placeholders.
     pub fn as_static(&self) -> Option<String> {
-        let mut out = String::new();
+        let mut out = String::with_capacity(self.reserve);
         for part in &self.parts {
             match part {
                 Part::Text(t) => out.push_str(t),
@@ -165,18 +183,18 @@ impl Template {
     }
 
     pub fn render(&self, ctx: &Ctx) -> String {
-        let mut out = String::new();
+        let mut out = String::with_capacity(self.reserve);
         self.render_into(ctx, &mut out);
         out
     }
 
-    /// Appends the filled-in text to `out` (the request path without a copy).
+    /// Appends the filled-in text to `out`, each placeholder written in place (no string of its
+    /// own).
     pub fn render_into(&self, ctx: &Ctx, out: &mut String) {
         for part in &self.parts {
             match part {
                 Part::Text(t) => out.push_str(t),
-                Part::Var(Var::Path) => out.push_str(ctx.path()),
-                Part::Var(v) => out.push_str(&value(v, ctx)),
+                Part::Var(v) => write_value(v, ctx, out),
             }
         }
     }
@@ -264,75 +282,94 @@ fn var_of(key: &str) -> Option<Var> {
     })
 }
 
-fn value(var: &Var, ctx: &Ctx) -> String {
+/// A placeholder's value, appended to `out`.
+fn write_value(var: &Var, ctx: &Ctx, out: &mut String) {
+    use std::fmt::Write as _;
+    fn path_and_query(uri: &http::Uri) -> &str {
+        uri.path_and_query().map_or("/", |p| p.as_str())
+    }
     match var {
-        Var::Path => ctx.path().to_string(),
+        Var::Path => out.push_str(ctx.path()),
         Var::Dir => {
             let path = ctx.path();
-            match path.rfind('/') {
-                Some(i) => path[..=i].to_string(),
-                None => "/".to_string(),
+            out.push_str(path.rfind('/').map_or("/", |i| &path[..=i]));
+        }
+        Var::File => out.push_str(ctx.path().rsplit('/').next().unwrap_or("")),
+        Var::Query => out.push_str(ctx.req.uri.query().unwrap_or("")),
+        Var::Uri => out.push_str(path_and_query(&ctx.req.uri)),
+        Var::Host => {
+            let host = crate::handler::strip_port(ctx.hostport());
+            out.extend(host.chars().map(|c| c.to_ascii_lowercase()));
+        }
+        Var::HostPort => out.push_str(ctx.hostport()),
+        Var::Method => out.push_str(ctx.req.method.as_str()),
+        Var::Scheme => out.push_str(if ctx.conn.tls { "https" } else { "http" }),
+        Var::Remote => {
+            let _ = write!(out, "{}", ctx.conn.remote);
+        }
+        Var::RemoteHost => {
+            let _ = write!(out, "{}", ctx.conn.remote.ip());
+        }
+        Var::RemotePort => {
+            let _ = write!(out, "{}", ctx.conn.remote.port());
+        }
+        Var::ClientIp => {
+            let _ = write!(out, "{}", ctx.client_ip);
+        }
+        Var::OrigUri => out.push_str(path_and_query(&ctx.orig_uri)),
+        Var::OrigPath => {
+            out.push_str(&percent_encoding::percent_decode_str(ctx.orig_uri.path()).decode_utf8_lossy());
+        }
+        Var::Header(name) => {
+            let values = ctx.req.headers.get_all(name).iter().filter_map(|v| v.to_str().ok());
+            for (i, value) in values.enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(value);
             }
         }
-        Var::File => {
-            let path = ctx.path();
-            path.rsplit('/').next().unwrap_or("").to_string()
+        Var::Regexp { name, group } => out.push_str(ctx.regexp(name, group).unwrap_or("")),
+        Var::FileRelative => {
+            if let Some(m) = &ctx.file_match {
+                out.push_str(&m.relative);
+            }
         }
-        Var::Query => ctx.req.uri.query().unwrap_or("").to_string(),
-        Var::Uri => ctx
-            .req
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".into()),
-        Var::Host => ctx.host(),
-        Var::HostPort => ctx.hostport().to_string(),
-        Var::Method => ctx.req.method.as_str().to_string(),
-        Var::Scheme => (if ctx.conn.tls { "https" } else { "http" }).to_string(),
-        Var::Remote => ctx.conn.remote.to_string(),
-        Var::RemoteHost => ctx.conn.remote.ip().to_string(),
-        Var::RemotePort => ctx.conn.remote.port().to_string(),
-        Var::ClientIp => ctx.client_ip.to_string(),
-        Var::OrigUri => ctx
-            .orig_uri
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".into()),
-        Var::OrigPath => crate::handler::decode_path(ctx.orig_uri.path()),
-        Var::Header(name) => {
-            let values: Vec<&str> = ctx
-                .req
-                .headers
-                .get_all(name)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .collect();
-            values.join(",")
+        Var::FileAbsolute => {
+            if let Some(m) = &ctx.file_match {
+                let _ = write!(out, "{}{}", m.root.root.display(), m.relative);
+            }
         }
-        Var::Regexp { name, group } => ctx.regexp(name, group).unwrap_or_default(),
-        Var::FileRelative => ctx.file_match.as_ref().map(|m| m.relative.clone()).unwrap_or_default(),
-        Var::FileAbsolute => ctx.file_match.as_ref().map(|m| m.absolute()).unwrap_or_default(),
-        Var::FileType => ctx.file_match.as_ref().map(|m| m.kind.to_string()).unwrap_or_default(),
-        Var::FileRemainder => String::new(),
-        Var::Env(name) => std::env::var(name).unwrap_or_default(),
-        Var::ErrorStatusCode => ctx
-            .error
-            .as_ref()
-            .map(|e| e.status.as_str().to_string())
-            .unwrap_or_default(),
-        Var::ErrorStatusText => ctx
-            .error
-            .as_ref()
-            .and_then(|e| e.status.canonical_reason())
-            .unwrap_or_default()
-            .to_string(),
-        Var::ErrorMessage => ctx.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
-        Var::RateLimitZone => ctx
-            .error
-            .as_ref()
-            .and_then(|e| e.zone.as_deref())
-            .unwrap_or_default()
-            .to_string(),
+        Var::FileType => {
+            if let Some(m) = &ctx.file_match {
+                out.push_str(m.kind);
+            }
+        }
+        Var::FileRemainder => {}
+        Var::Env(name) => {
+            if let Ok(value) = std::env::var(name) {
+                out.push_str(&value);
+            }
+        }
+        Var::ErrorStatusCode => {
+            if let Some(e) = &ctx.error {
+                out.push_str(e.status.as_str());
+            }
+        }
+        Var::ErrorStatusText => {
+            out.push_str(
+                ctx.error
+                    .as_ref()
+                    .and_then(|e| e.status.canonical_reason())
+                    .unwrap_or(""),
+            );
+        }
+        Var::ErrorMessage => {
+            if let Some(e) = &ctx.error {
+                out.push_str(&e.message);
+            }
+        }
+        Var::RateLimitZone => out.push_str(ctx.error.as_ref().and_then(|e| e.zone.as_deref()).unwrap_or("")),
     }
 }
 
@@ -356,5 +393,59 @@ mod tests {
         assert!(Template::parse("{re.onlyname}").is_err());
         assert!(Template::parse("{err.status_code} {http.error.status_text} {err.message}").is_ok());
         assert!(Template::parse("{err.trace}").is_err());
+    }
+
+    #[test]
+    fn every_value_is_written_in_place() {
+        use crate::handler::ConnInfo;
+        use std::sync::Arc;
+        let conn = Arc::new(ConnInfo {
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            tls: false,
+            trusted: false,
+            sni: None,
+        });
+        let (parts, body) = http::Request::get("/a%20b/c.html?x=1+2")
+            .header("host", "Example.COM:8443")
+            .header("x-a", "1")
+            .header("x-a", http::HeaderValue::from_bytes(b"\xff").unwrap())
+            .header("x-a", "2")
+            .body(crate::body::empty())
+            .unwrap()
+            .into_parts();
+        let ctx = Ctx::new(conn, parts, body, "10.1.2.3".parse().unwrap());
+        let keys = [
+            ("path", "/a b/c.html"),
+            ("dir", "/a b/"),
+            ("file", "c.html"),
+            ("query", "x=1+2"),
+            ("uri", "/a%20b/c.html?x=1+2"),
+            ("host", "example.com"),
+            ("hostport", "Example.COM:8443"),
+            ("method", "GET"),
+            ("scheme", "http"),
+            ("remote", "127.0.0.1:5000"),
+            ("remote_host", "127.0.0.1"),
+            ("remote_port", "5000"),
+            ("client_ip", "10.1.2.3"),
+            ("http.request.orig_uri", "/a%20b/c.html?x=1+2"),
+            ("http.request.orig_uri.path", "/a b/c.html"),
+            ("header.X-A", "1,2"),
+            ("header.X-None", ""),
+            ("re.none.1", ""),
+            ("file_match.relative", ""),
+            ("err.status_code", ""),
+            ("err.status_text", ""),
+            ("env.WEBFAST_PLACEHOLDER_TEST_UNSET", ""),
+        ];
+        for (key, want) in keys {
+            let template = Template::parse(&format!("<{{{key}}}>")).unwrap();
+            assert_eq!(template.render(&ctx), format!("<{want}>"), "{{{key}}}");
+        }
+        let all: String = keys.iter().map(|(k, _)| format!("{{{k}}}|")).collect();
+        let want: String = keys.iter().map(|(_, v)| format!("{v}|")).collect();
+        let mut out = String::from("before:");
+        Template::parse(&all).unwrap().render_into(&ctx, &mut out);
+        assert_eq!(out, format!("before:{want}"));
     }
 }
