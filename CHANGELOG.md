@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.1.2 — 2026-11-06
+
+Fewer allocations on the request path, buffers sized once where their size is known, and bounds
+where a client chose them: range answers, compression, the proxy's headers, placeholders, rate
+limit keys, path cleaning, the API firewall's query strings and forms.
+
+Worth knowing when upgrading from 0.1.1:
+
+- The API firewall reads at most 1000 pairs of a query string or form body; more is a violation
+  (`request-query:too-many`, or the body's reason), 403 in `block`.
+
+- A `multipart/byteranges` answer is built in one buffer of its final size, without a string per
+  part (the same bytes as before).
+- Compressed variants (`compress_best`, the whole-body path of `encode`) and decoded cache bodies
+  hold their length, no more: a Bytes kept the Vec's capacity, up to twice the length the memory
+  budgets count. Checking an upstream's encoded variant decodes it at most to its identity's
+  length (it was up to `max_cacheable_body_bytes`).
+- Placeholders write their values into the rendered text in place; a `rate_limit` zone keyed by
+  a template hashes it from a buffer the thread keeps.
+- `X-Forwarded-For/-Proto/-Host`, `handle_path`, path cleaning, `encode { match }` content types,
+  the JWT claim headers, the access log line and a `Location` with control characters are built
+  without intermediate strings.
+- The API firewall decodes a query string or form in one pass and counts its pairs first (a
+  1 MB body of `a&a&…` was a million allocations and 51 MB); a body's buffer reserves at most
+  64 KiB of what `Content-Length` declares; a `Range` header keeps at most one range past the 64
+  it may have.
+
+Measured in process (a single-threaded runtime pinned to one core, Linux, the release profile,
+mimalloc with a counting allocator), the mean of two runs of each build, per request or call:
+
+| Case                                                   | 0.1.1    | 0.1.2          | Allocations   | Reallocations | Allocated         |
+| ------------------------------------------------------ | -------- | -------------- | ------------- | ------------- | ----------------- |
+| Range, 8 × 64 KiB (multipart)                          | 67.8 µs  | 18.2 µs        | 58 → 25       | 53 → 4        | 2.05 MB → 537 KB  |
+| Range, 2 × 100 B (multipart)                           | 4.3 µs   | 3.3 µs         | 34 → 25       | 18 → 2        | 13.8 → 11.3 KB    |
+| Range, 1500 ranges (the whole file is sent)            | 53 µs    | 56 µs ¹        | 15 → 15       | 9 → 5         | 75.5 → 14.1 KB    |
+| `rate_limit`, key `{remote_host}-{header.X-Api-Key}`   | 1.95 µs  | 1.75 µs        | 20 → 16       | 2 → 0         | 8.3 → 8.1 KB      |
+| Proxy, 8 KiB, identity                                 | 19.1 µs  | 18.9 µs        | 53 → 49       | 2 → 2         | =                 |
+| Proxy, 8 KiB, gzip                                     | 104 µs   | 102 µs ²       | 70 → 66       | 4 → 2         | +1 KB             |
+| Proxy, 8 KiB, gzip, `match` types without `*`          | 110 µs   | 106 µs         | 74 → 67       | 7 → 2         | +1 KB             |
+| Proxy, 8 KiB, br                                       | 113 µs ² | 113 µs         | 89 → 86       | 2 → 2         | +2.8 KB           |
+| Proxy, chunked 16 × 4 KiB, gzip / br / zstd            | =        | =              | −4 each       | =             | =                 |
+| `handle_path`                                          | 1.7 µs   | 1.7 µs         | 18 → 17       | 0 → 0         | =                 |
+| `compressible("text/html; charset=utf-8")`             | 170 ns   | 73 ns          | 0 → 0         | 0 → 0         | 0                 |
+| Path cleaning, `/a/./b//c/../d/e/f/`                   | 124 ns   | 80 ns          | 2 → 1         | 1 → 0         | 211 → 21 B        |
+| Placeholders, `{scheme}://{host}{uri}`                 | 215 ns   | 85 ns          | 4 → 1         | 2 → 0         | 134 → 75 B        |
+| Placeholders, `{method} {uri} {client_ip}`             | 244 ns   | 100 ns         | 4 → 1         | 2 → 0         | 175 → 74 B        |
+| Placeholders, `{remote_host}-{header.X-Api-Key}`       | 255 ns   | 110 ns         | 4 → 1         | 2 → 0         | 146 → 49 B        |
+| API firewall, a query string of 7 pairs                | 1.05 µs  | 650 ns         | 29 → 15       | 1 → 0         | 706 → 401 B       |
+| API firewall, a 1 MB form body of `a&a&…`              | 44 ms    | 1.4 ms (a 403) | 1 000 000 → 0 | 17 → 0        | 51.3 MB → 0       |
+| A 256 KiB variant, held (gzip / zstd / br)             | =        | =              | =             | 2 / 1 / 3 → 0 | 48.5 / 44.1 / 32.8 → 24.3 / 22.0 / 22.6 KB |
+
+¹ The same loop with one comparison more: between builds it is 5 % slower or 10 % faster, as the
+code is laid out; the memory is what changed.
+
+² Without one run's outlier (119 µs, 164 µs); the other run and earlier ones agree.
+
 ## 0.1.1 — 2026-11-06
 
 Automatic certificates (ACME, with ARI renewal windows), load balancing over several upstreams,

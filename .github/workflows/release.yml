@@ -204,9 +204,17 @@ jobs:
       - name: the release
         env:
           GH_TOKEN: ${{ github.token }}
+        # The notes: the version's section of CHANGELOG.md (a tag without one fails), then where
+        # the image and binaries are.
         run: |
           cp webfast-${{ github.ref_name }}.spdx.json assets/
+          version="${GITHUB_REF_NAME#v}"
+          awk -v head="## $version " 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' \
+            CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
+          printf '\n---\n\nImage: `%s:%s` (linux/amd64, linux/arm64). Binaries: static (musl), with provenance and SBOM attestations (`gh attestation verify`).\n' \
+            "${{ env.IMAGE }}" "$version" >> notes.md
           gh release create "${{ github.ref_name }}" assets/* \
             --title "webfast ${{ github.ref_name }}" \
-            --notes "Image: \`${{ env.IMAGE }}:${GITHUB_REF_NAME#v}\` (linux/amd64, linux/arm64). Binaries: static (musl), with provenance and SBOM attestations (\`gh attestation verify\`). Changes: CHANGELOG.md." \
+            --notes-file notes.md \
             --verify-tag
