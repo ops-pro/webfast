@@ -945,19 +945,20 @@ fn limit_body(ctx: &mut Ctx, max: u64) {
 }
 
 fn strip_prefix(ctx: &mut Ctx, prefix: &str) {
-    let path = ctx.path().to_string();
+    let path = ctx.path();
     // Compared byte by byte, ASCII case-insensitively: `to_lowercase` may change the byte length of
     // a path with non-ASCII letters, and slicing by the prefix's length would then cut a character.
     let has_prefix = path.len() >= prefix.len()
         && path.is_char_boundary(prefix.len())
         && path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
     if has_prefix {
+        // The new path made once, from the borrowed one (no copy of the whole path first).
         let rest = &path[prefix.len()..];
-        let stripped = if rest.starts_with('/') {
-            rest.to_string()
-        } else {
-            format!("/{rest}")
-        };
+        let mut stripped = String::with_capacity(rest.len() + 1);
+        if !rest.starts_with('/') {
+            stripped.push('/');
+        }
+        stripped.push_str(rest);
         let uri = ctx.req.uri.clone();
         ctx.set_path_and_query(stripped, uri.query());
     }
