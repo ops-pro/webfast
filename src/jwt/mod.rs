@@ -620,7 +620,8 @@ impl JwtAuth {
                 return Err(Failure::Audience);
             }
         }
-        let mut headers = Vec::new();
+        let mut headers =
+            Vec::with_capacity(provider.claim_headers.len() + usize::from(provider.payload_header.is_some()));
         if let Some(name) = &provider.payload_header
             && let Ok(value) = HeaderValue::from_str(parsed.payload)
         {

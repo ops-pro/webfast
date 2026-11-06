@@ -563,10 +563,15 @@ fn escape_controls(location: String) -> String {
     if !location.bytes().any(|b| b.is_ascii_control()) {
         return location;
     }
-    let mut out = String::with_capacity(location.len() + 8);
+    let controls = location.bytes().filter(u8::is_ascii_control).count();
+    let mut out = String::with_capacity(location.len() + 2 * controls);
     for ch in location.chars() {
         if ch.is_ascii_control() {
-            out.push_str(&format!("%{:02X}", ch as u32));
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let b = ch as u8;
+            out.push('%');
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0xF)] as char);
         } else {
             out.push(ch);
         }
@@ -1230,6 +1235,7 @@ mod tests {
         assert_eq!(same("/\tpage"), "/\tpage", "one slash: on the site");
         assert_eq!(escape_controls("/\tpage".into()), "/%09page");
         assert_eq!(escape_controls("/a b".into()), "/a b");
+        assert_eq!(escape_controls("/\x7f\r\n\0д".into()), "/%7F%0D%0A%00д");
         assert_eq!(
             same("https://example.com/"),
             "https://example.com/",

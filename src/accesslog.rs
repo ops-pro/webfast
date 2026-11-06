@@ -259,7 +259,9 @@ impl AccessLog {
         let duration = info.started.elapsed().as_secs_f64();
         let host = info.host.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
         let uri = info.uri.path_and_query().map_or("/", |pq| pq.as_str());
-        let mut line = String::with_capacity(320);
+        // The fixed part of a JSON line is about 300 bytes; host and URI on top (escaping may
+        // still grow it, which is rare).
+        let mut line = String::with_capacity(320 + host.len() + uri.len());
         match self.format {
             Format::Json => {
                 let ts = SystemTime::now()
