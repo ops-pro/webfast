@@ -315,24 +315,36 @@ impl FileServer {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let boundary = boundary();
-            let mut multipart = Vec::new();
+            // The whole answer in one buffer of its final size: the parts' bytes (at most the file:
+            // checked above) and, per part, its boundary line and headers (three numbers of at most
+            // 20 digits each in Content-Range).
+            let data: u64 = ranges.iter().map(|(_, len)| len).sum();
+            let per_part = "\r\n--\r\nContent-Range: bytes -/\r\n\r\n".len()
+                + boundary.len()
+                + 3 * 20
+                + part_type.as_ref().map_or(0, |t| "Content-Type: \r\n".len() + t.len());
+            let closing = "\r\n----\r\n".len() + boundary.len();
+            let mut multipart = Vec::with_capacity(data as usize + ranges.len() * per_part + closing);
             for (i, (start, length)) in ranges.iter().enumerate() {
-                let open = if i == 0 {
-                    format!("--{boundary}\r\n")
-                } else {
-                    format!("\r\n--{boundary}\r\n")
-                };
-                multipart.extend_from_slice(open.as_bytes());
-                multipart.extend_from_slice(
-                    format!("Content-Range: {}\r\n", content_range(*start, *length, total)).as_bytes(),
-                );
+                if i > 0 {
+                    multipart.extend_from_slice(b"\r\n");
+                }
+                multipart.extend_from_slice(b"--");
+                multipart.extend_from_slice(boundary.as_bytes());
+                multipart.extend_from_slice(b"\r\nContent-Range: ");
+                write_content_range(&mut multipart, *start, *length, total);
+                multipart.extend_from_slice(b"\r\n");
                 if let Some(part_type) = &part_type {
-                    multipart.extend_from_slice(format!("Content-Type: {part_type}\r\n").as_bytes());
+                    multipart.extend_from_slice(b"Content-Type: ");
+                    multipart.extend_from_slice(part_type.as_bytes());
+                    multipart.extend_from_slice(b"\r\n");
                 }
                 multipart.extend_from_slice(b"\r\n");
                 multipart.extend_from_slice(&body[*start as usize..(*start + *length) as usize]);
             }
-            multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            multipart.extend_from_slice(b"\r\n--");
+            multipart.extend_from_slice(boundary.as_bytes());
+            multipart.extend_from_slice(b"--\r\n");
             body = bytes::Bytes::from(multipart);
             status = StatusCode::PARTIAL_CONTENT;
             let value = format!("multipart/byteranges; boundary={boundary}");
@@ -875,6 +887,12 @@ fn ranges_are_bounded(ranges: &[(u64, u64)]) -> bool {
 
 fn content_range(start: u64, length: u64, total: u64) -> String {
     format!("bytes {start}-{}/{total}", (start + length).saturating_sub(1))
+}
+
+/// `content_range` appended to `out` (a part of a multipart answer: no string of its own).
+fn write_content_range(out: &mut Vec<u8>, start: u64, length: u64, total: u64) {
+    use std::io::Write;
+    let _ = write!(out, "bytes {start}-{}/{total}", (start + length).saturating_sub(1));
 }
 
 /// A random multipart boundary (60 hex digits, as Go's).
