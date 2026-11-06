@@ -4,7 +4,7 @@
 //!   global options  auto_https off|disable_redirects|disable_certs, admin off, http_port, https_port,
 //!                   grace_period, debug, order, servers { trusted_proxies static …,
 //!                   trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host,
-//!                   timeouts { read_header, idle } }
+//!                   timeouts { read_header, idle }, max_header_size }
 //!   site            addresses (`:port`, `host`, `host:port`, `http://…`, `https://…`), tls <cert> <key>
 //!                   (repeatable: e.g. an ECDSA and an RSA certificate, chosen per client), log,
 //!                   handle_errors [<status codes>]
@@ -135,6 +135,9 @@ pub struct Limits {
     pub grace: Duration,
     /// HTTP/3: the largest frame other than DATA, i.e. a request's encoded headers.
     pub h3_frame: u64,
+    /// A request's header fields at most, each counted as its name, its value and 32 bytes
+    /// (RFC 9113 §6.5.2, RFC 9114 §4.2.2): more is 431 on every protocol (`max_header_size`).
+    pub max_header: usize,
     /// TCP congestion control for the clients' connections (`None`: the system's; src/sockets.rs).
     pub tcp_congestion: Option<&'static str>,
 }
@@ -150,6 +153,8 @@ impl Default for Limits {
             stall: Duration::from_secs(30),
             grace: Duration::from_secs(10),
             h3_frame: 64 * 1024,
+            // Caddy's default since 2.11.6, and HTTP/2's in hyper.
+            max_header: 16 * 1024,
             tcp_congestion: Some("bbr"),
         }
     }
@@ -274,6 +279,7 @@ struct ServerOpts {
     strict_host: Option<bool>,
     read_header: Option<Duration>,
     idle: Option<Duration>,
+    max_header: Option<usize>,
 }
 
 struct Globals {
@@ -534,6 +540,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     limits: Limits {
                         read_header: opts.read_header.unwrap_or(Limits::default().read_header),
                         idle: opts.idle.unwrap_or(Limits::default().idle),
+                        max_header: opts.max_header.unwrap_or(Limits::default().max_header),
                         ..Limits::default()
                     },
                     per_core: cfg!(unix),
@@ -662,6 +669,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                         limits: Limits {
                             read_header: opts.read_header.unwrap_or(Limits::default().read_header),
                             idle: opts.idle.unwrap_or(Limits::default().idle),
+                            max_header: opts.max_header.unwrap_or(Limits::default().max_header),
                             ..Limits::default()
                         },
                         per_core: cfg!(unix),
@@ -729,6 +737,9 @@ fn server_opts(globals: &Globals, port: u16) -> ServerOpts {
         }
         if opts.idle.is_some() {
             out.idle = opts.idle;
+        }
+        if opts.max_header.is_some() {
+            out.max_header = opts.max_header;
         }
     }
     out
@@ -954,6 +965,15 @@ fn parse_server_opts(line: &Line) -> Result<ServerOpts> {
                             format!("timeouts: unsupported option {other:?} (only read_header and idle)")
                         )),
                     }
+                }
+            }
+            "max_header_size" => {
+                let arg = one_arg(sub)?;
+                // 1 KiB to 1 MiB: HTTP/2 announces it in 32 bits, and hyper buffers HTTP/1.1
+                // heads up to ~400 KiB anyway.
+                match crate::parse_size(&arg) {
+                    Some(size) if (1024..=1 << 20).contains(&size) => opts.max_header = Some(size as usize),
+                    _ => bail!(at_err(&sub.at, "max_header_size: a size from 1KiB to 1MiB, like 32KiB")),
                 }
             }
             other => bail!(at_err(&sub.at, format!("servers: unsupported option {other:?}"))),

@@ -667,6 +667,88 @@ async fn https_over_http2_and_http3() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+#[tokio::test]
+async fn headers_over_max_header_size_get_431_on_every_protocol() {
+    let (certified, dir) = self_signed();
+    let text = format!(
+        "{{\n\tservers {{\n\t\tmax_header_size 4KiB\n\t}}\n}}\nlocalhost:0 {{\n\ttls {cert} {key}\n\trespond \"ok\"\n}}\n",
+        cert = dir.path().join("cert.pem").display(),
+        key = dir.path().join("key.pem").display()
+    );
+    let file = webfast::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+    let config = webfast::load_parsed(&file, 1 << 20).unwrap();
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+    let fits = "a".repeat(3 * 1024);
+    let over = "a".repeat(5 * 1024);
+
+    for alpn in [&b"http/1.1"[..], b"h2"] {
+        for (value, want) in [(&fits, 200), (&over, 431)] {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(&certified.cert, alpn)));
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let tls = connector.connect("localhost".try_into().unwrap(), tcp).await.unwrap();
+            let request = Request::get(format!("https://localhost:{port}/"))
+                .header("host", format!("localhost:{port}"))
+                .header("x-big", value.as_str())
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let status = if alpn == b"h2" {
+                let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                    .await
+                    .unwrap();
+                tokio::spawn(conn);
+                sender.send_request(request).await.unwrap().status()
+            } else {
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+                tokio::spawn(conn);
+                sender.send_request(request).await.unwrap().status()
+            };
+            assert_eq!(
+                status,
+                want,
+                "{} with {} bytes",
+                String::from_utf8_lossy(alpn),
+                value.len()
+            );
+        }
+    }
+
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(&certified.cert, b"h3")).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    for (value, want) in [(&fits, 200), (&over, 431)] {
+        let conn = endpoint
+            .connect(SocketAddr::from(([127, 0, 0, 1], port)), "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+        let request = Request::get(format!("https://localhost:{port}/"))
+            .header("x-big", value.as_str())
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(request).await.unwrap();
+        stream.finish().await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), want, "h3 with {} bytes", value.len());
+        drop(send_request);
+        drive.abort();
+    }
+    endpoint.close(0u32.into(), b"done");
+
+    assert!(
+        webfast::caddyfile::parse_str(
+            "{\n\tservers {\n\t\tmax_header_size 10\n\t}\n}\n:0 {\n}\n",
+            Path::new("C")
+        )
+        .map(|file| webfast::load_parsed(&file, 1 << 20))
+        .is_ok_and(|config| config.is_err()),
+        "a size under 1 KiB"
+    );
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
 /// A client whose handshake offers only these signature schemes (it verifies nothing else).
 fn client_offering(roots: &[&rcgen::Certificate], schemes: &[rustls::SignatureScheme]) -> rustls::ClientConfig {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();

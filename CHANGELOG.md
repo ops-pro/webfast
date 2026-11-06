@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Request headers are limited to 16 KiB on every protocol (`servers { max_header_size <size> }`,
+  1 KiB to 1 MiB, as Caddy 2.11.6): more is 431. HTTP/2 had hyper's 16 KiB already; HTTP/3 took
+  up to 64 KiB, HTTP/1.1 up to hyper's ~400 KiB buffer. Each field counts its name, its value and
+  32 bytes, as HTTP/2 and HTTP/3 count it.
+
 - Request headers spelled like a header the server sets or trusts, but with `_` or `.` for a `-`
   (`X_User`, `X.Forwarded.For`, `X_Real_IP`), are taken off before the request goes upstream. PHP,
   CGI, WSGI and Rack read them as the same variable (`HTTP_X_USER`), so a client could pass one

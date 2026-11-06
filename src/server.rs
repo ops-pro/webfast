@@ -49,6 +49,8 @@ pub struct ServerState {
     /// TLS with the Host check on (`strict_sni_host`, on unless `insecure_off`): the certificates,
     /// to tell whether a request's Host is served with the connection's one.
     host_check: Option<Arc<CertResolver>>,
+    /// `max_header_size`: HTTP/2 and HTTP/3 refuse more themselves (431), HTTP/1.1 in `handle`.
+    max_header: usize,
     /// The extensions' hooks (src/extensions.rs): the checks before the routes, and those bound to
     /// upstreams for the proxies.
     hooks: &'static Hooks,
@@ -259,6 +261,17 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let (mut parts, body) = request.into_parts();
     let remote = connection.info.remote;
     let version = parts.version;
+    // HTTP/1.1 heads are only bounded by hyper's buffer (~400 KiB); HTTP/2 and HTTP/3 refused
+    // more than this before (431), by the same count.
+    if field_section_size(&parts.headers) > connection.state.max_header {
+        let mut response = Response::new(crate::body::empty());
+        *response.status_mut() = StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
+        response
+            .headers_mut()
+            .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+        common_headers(&connection.state, version, &mut response);
+        return response;
+    }
     // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
     // A request the server makes of itself (src/apifw: a spec given as a path) passes both by.
     let internal = parts.extensions.get::<InternalRequest>().is_some();
@@ -385,6 +398,15 @@ pub fn stall_limited(request: Request<Body>, stall: Duration) -> Request<Body> {
 /// What every response gets: `Date` from the shared clock (a proxied response keeps the upstream's,
 /// as in Caddy; hyper's own date is left for the error responses it writes itself) and, with
 /// HTTP/3 on, `Alt-Svc` over TCP.
+/// The size of a request's header fields as HTTP/2 and HTTP/3 count it: name, value and 32 bytes
+/// of each (RFC 9113 §6.5.2).
+fn field_section_size(headers: &http::HeaderMap) -> usize {
+    headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len() + 32)
+        .sum()
+}
+
 fn common_headers(state: &ServerState, version: Version, response: &mut Response<Body>) {
     let headers = response.headers_mut();
     headers.entry(http::header::DATE).or_insert_with(crate::date::now);
@@ -813,6 +835,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         tls: state_tls,
         alt_svc: None,
         host_check,
+        max_header: limits.max_header,
         hooks,
     };
     let mut quic_endpoint = None;
@@ -937,6 +960,7 @@ async fn accept_loop(
     builder
         .http2()
         .timer(TokioTimer::new())
+        .max_header_list_size(u32::try_from(limits.max_header).unwrap_or(u32::MAX))
         .max_concurrent_streams(250)
         .keep_alive_interval(Some(Duration::from_secs(60)));
     loop {

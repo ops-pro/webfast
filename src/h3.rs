@@ -124,9 +124,13 @@ async fn connection(
     let served = served.with_sni(sni.as_deref());
     let quic = conn.clone();
     let activity = Activity::new();
+    // Headers past `max_header_size` get 431 from h3; a frame may still hold them encoded.
     let mut h3 = h3::server::builder()
-        .max_field_section_size(limits.h3_frame)
-        .build::<_, Bytes>(crate::h3limit::Connection::new(conn, limits.h3_frame))
+        .max_field_section_size(limits.max_header as u64)
+        .build::<_, Bytes>(crate::h3limit::Connection::new(
+            conn,
+            limits.h3_frame.max(limits.max_header as u64),
+        ))
         .await?;
     let mut stopping = *stop.borrow();
     if stopping {
