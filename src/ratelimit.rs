@@ -264,11 +264,11 @@ impl RateLimit {
                 ctx.req.extensions.insert(crate::memo::Unkept);
                 return None;
             }
-            let (hash, shown) = zone.key_of(ctx);
+            let hash = zone.key_of(ctx);
             if let Some(wait) = zone.state.take(hash, now) {
                 zone.state.limited.fetch_add(1, Ordering::Relaxed);
                 if zone.state.log_key {
-                    zone.state.remember(shown.unwrap_or_else(|| zone.shown_key(ctx)));
+                    zone.state.remember(zone.shown_key(ctx));
                 }
                 if DRY_RUN.load(Ordering::Relaxed) {
                     continue;
@@ -345,20 +345,30 @@ impl Zone {
         }
     }
 
-    /// The request's key hash, and the key as text when it was rendered anyway.
-    fn key_of(&self, ctx: &Ctx) -> (u64, Option<String>) {
+    /// The request's key hash. A template is rendered into a buffer kept by the thread: the key
+    /// is made a string of its own only when it is logged (a refused request, with `log_key`).
+    fn key_of(&self, ctx: &Ctx) -> u64 {
+        /// A key longer than this (a long header) is not kept in the buffer after it is hashed.
+        const KEPT: usize = 1024;
+        thread_local! {
+            static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
         let state = &self.state;
         match &self.key {
-            Key::Static => (0, None),
-            Key::Address(sole) => (state.hash_address(address(sole, ctx)), None),
-            Key::Template(template) => {
-                let text = template.render(ctx);
+            Key::Static => 0,
+            Key::Address(sole) => state.hash_address(address(sole, ctx)),
+            Key::Template(template) => KEY.with_borrow_mut(|text| {
+                text.clear();
+                template.render_into(ctx, text);
                 let hash = match text.parse::<IpAddr>() {
                     Ok(ip) if state.ipv4_prefix > 0 || state.ipv6_prefix > 0 => state.hash_address(ip),
                     _ => state.hasher.hash_one(text.as_bytes()),
                 };
-                (hash, Some(text))
-            }
+                if text.capacity() > KEPT {
+                    *text = String::new();
+                }
+                hash
+            }),
         }
     }
 
