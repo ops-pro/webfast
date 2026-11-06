@@ -829,6 +829,8 @@ fn parse_ranges(header: &str, size: u64) -> Result<Vec<(u64, u64)>, RangeError> 
     let Some(spec) = header.strip_prefix("bytes=") else {
         return Err(RangeError::Invalid);
     };
+    // At most MAX_RANGES + 1 are kept: one more is enough for `ranges_are_bounded` to refuse
+    // them, and the rest of the header is still read, so a broken item is still an error.
     let mut ranges = Vec::new();
     let mut no_overlap = false;
     for item in spec.split(',') {
@@ -846,7 +848,9 @@ fn parse_ranges(header: &str, size: u64) -> Result<Vec<(u64, u64)>, RangeError> 
             }
             let suffix: u64 = end.parse().map_err(|_| RangeError::Invalid)?;
             let suffix = suffix.min(size);
-            ranges.push((size - suffix, suffix));
+            if ranges.len() <= MAX_RANGES {
+                ranges.push((size - suffix, suffix));
+            }
             continue;
         }
         let start: u64 = start.parse().map_err(|_| RangeError::Invalid)?;
@@ -863,7 +867,9 @@ fn parse_ranges(header: &str, size: u64) -> Result<Vec<(u64, u64)>, RangeError> 
             }
             end.min(size - 1) - start + 1
         };
-        ranges.push((start, length));
+        if ranges.len() <= MAX_RANGES {
+            ranges.push((start, length));
+        }
     }
     if no_overlap && ranges.is_empty() {
         return Err(RangeError::NoOverlap);
@@ -964,6 +970,24 @@ mod tests {
         assert!(ranges_are_bounded(&many));
         let too_many: Vec<(u64, u64)> = (0..=MAX_RANGES as u64).map(|i| (i * 2, 1)).collect();
         assert!(!ranges_are_bounded(&too_many));
+    }
+
+    #[test]
+    fn a_long_range_header_keeps_one_range_past_the_most() {
+        let items: Vec<String> = (0..10_000).map(|i| format!("{}-{}", i * 2, i * 2)).collect();
+        let header = format!("bytes={}", items.join(","));
+        let Ok(ranges) = parse_ranges(&header, 1 << 20) else {
+            panic!("a valid header");
+        };
+        assert_eq!(ranges.len(), MAX_RANGES + 1);
+        assert!(!ranges_are_bounded(&ranges), "so the whole file is sent, as before");
+        assert!(
+            matches!(
+                parse_ranges(&format!("{header},x-1"), 1 << 20),
+                Err(RangeError::Invalid)
+            ),
+            "items past the most are still read"
+        );
     }
 
     #[test]
