@@ -301,25 +301,27 @@ pub fn needs_clean(path: &str) -> bool {
 /// `path.Clean` that keeps a trailing slash; `merge_slashes` folds `//` into `/`.
 pub fn clean_path(path: &str, merge_slashes: bool) -> String {
     let trailing = path.len() > 1 && path.ends_with('/');
-    let mut out: Vec<&str> = Vec::new();
+    // Segments go straight into the answer, each as `/` and its text; `..` cuts the last one off.
+    // `+ 2`: a path without its leading `/` gains one, and the trailing one may be put back.
+    let mut cleaned = String::with_capacity(path.len() + 2);
     for (i, seg) in path.split('/').enumerate() {
         match seg {
             "" => {
                 if i != 0 && !merge_slashes {
-                    out.push("");
+                    cleaned.push('/');
                 }
             }
             "." => {}
             ".." => {
-                out.pop();
+                if let Some(last) = cleaned.rfind('/') {
+                    cleaned.truncate(last);
+                }
             }
-            s => out.push(s),
+            s => {
+                cleaned.push('/');
+                cleaned.push_str(s);
+            }
         }
-    }
-    let mut cleaned = String::with_capacity(path.len());
-    for seg in &out {
-        cleaned.push('/');
-        cleaned.push_str(seg);
     }
     if cleaned.is_empty() || (trailing && !cleaned.ends_with('/')) {
         cleaned.push('/');
@@ -468,6 +470,51 @@ mod tests {
         }
         for dirty in ["", "a", "//a", "/a/./b", "/a/../b", "/a/.", "/a/.."] {
             assert!(needs_clean(dirty), "{dirty}");
+        }
+    }
+
+    /// Cleaning straight into the answer gives what the list of segments gave, on every path of
+    /// up to six pieces out of `""`, `.`, `..`, `a` and `bc`.
+    #[test]
+    fn cleaning_as_with_a_list_of_segments() {
+        fn by_list(path: &str, merge_slashes: bool) -> String {
+            let trailing = path.len() > 1 && path.ends_with('/');
+            let mut out: Vec<&str> = Vec::new();
+            for (i, seg) in path.split('/').enumerate() {
+                match seg {
+                    "" if i != 0 && !merge_slashes => out.push(""),
+                    "" | "." => {}
+                    ".." => {
+                        out.pop();
+                    }
+                    s => out.push(s),
+                }
+            }
+            let mut cleaned: String = out.iter().flat_map(|s| ["/", s]).collect();
+            if cleaned.is_empty() || (trailing && !cleaned.ends_with('/')) {
+                cleaned.push('/');
+            }
+            cleaned
+        }
+        const PIECES: [&str; 5] = ["", ".", "..", "a", "bc"];
+        let mut paths = vec![String::new()];
+        let mut frontier = vec![Vec::<&str>::new()];
+        for _ in 0..6 {
+            let mut next = Vec::new();
+            for pieces in &frontier {
+                for piece in PIECES {
+                    let mut longer = pieces.clone();
+                    longer.push(piece);
+                    paths.push(longer.join("/"));
+                    next.push(longer);
+                }
+            }
+            frontier = next;
+        }
+        for path in &paths {
+            for merge in [true, false] {
+                assert_eq!(clean_path(path, merge), by_list(path, merge), "{path:?} merge={merge}");
+            }
         }
     }
 
