@@ -391,25 +391,45 @@ pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
 }
 
 /// Compresses at the encoding's highest level, for work done once in the background (the proxy
-/// cache's worker, src/cache.rs; the files' compressed variants, src/variants.rs).
+/// cache's worker, src/cache.rs; the files' compressed variants, src/variants.rs). The result is
+/// kept in memory, counted by its length: it holds no more than that (see `exact`).
 pub fn compress_best(encoding: Encoding, data: &[u8]) -> std::io::Result<Bytes> {
-    let out = match encoding {
+    // Text at these levels comes out at a fifth to a tenth: room for a quarter, grown when that is
+    // not enough.
+    let mut out = Vec::with_capacity(data.len() / 4 + 64);
+    match encoding {
         Encoding::Gzip => {
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            let mut encoder = flate2::write::GzEncoder::new(&mut out, flate2::Compression::best());
             encoder.write_all(data)?;
-            encoder.finish()?
+            encoder.finish()?;
         }
-        Encoding::Zstd => zstd::stream::encode_all(data, 19)?,
+        // What `zstd::stream::encode_all` does, into the buffer made here.
+        Encoding::Zstd => zstd::stream::copy_encode(data, &mut out, 19)?,
         Encoding::Br => {
-            let mut out = Vec::new();
-            {
-                let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
-                writer.write_all(data)?;
-            }
-            out
+            let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
+            writer.write_all(data)?;
         }
-    };
-    Ok(Bytes::from(out))
+    }
+    Ok(exact(out))
+}
+
+/// The buffer's bytes in an allocation of their size. `Bytes::from(Vec)` keeps the vector's whole
+/// capacity — up to twice the length after it grew by doubling — for as long as the bytes are
+/// kept, and memory budgets count the length only: past an eighth more, the bytes are copied out.
+pub(crate) fn exact(buffer: Vec<u8>) -> Bytes {
+    if buffer.capacity() - buffer.len() > buffer.len() / 8 {
+        Bytes::copy_from_slice(&buffer)
+    } else {
+        Bytes::from(buffer)
+    }
+}
+
+/// Room for what compressing a whole body of `len` bytes on the fly gives (header, data and
+/// trailer come in several writes): about half for text at the default levels, grown in the rare
+/// case that is too little. The bytes go out to the client and are dropped: the spare room is not
+/// kept.
+fn room_for(len: usize) -> usize {
+    len / 2 + 64
 }
 
 /// Whether a response says each part of it is to reach the client as it comes: `Incremental: ?1`
@@ -464,7 +484,19 @@ impl Encoder {
         }
     }
 
+    /// The buffer the compressed bytes go to; `None` once finished.
+    fn buffer(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            Encoder::Gzip(e) => Some(e.get_mut()),
+            Encoder::Zstd(e) => e.as_mut().map(|e| e.get_mut()),
+            Encoder::Br(e) => e.as_mut().map(|e| e.get_mut()),
+        }
+    }
+
     fn write(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
+        // No room made ahead here (measured): the compressors hand a flushed part over in one write
+        // of its size, so the empty buffer takes exactly that, and `Bytes` of a full vector needs
+        // no allocation of its own — spare room would cost both.
         fn out(buffer: &mut Vec<u8>) -> Bytes {
             Bytes::from(std::mem::take(buffer))
         }
@@ -490,6 +522,9 @@ impl Encoder {
 
     /// A whole body: no intermediate flushes.
     fn compress_all(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
+        if let Some(buffer) = self.buffer() {
+            buffer.reserve(room_for(data.len()));
+        }
         match self {
             Encoder::Gzip(e) => e.write_all(data)?,
             Encoder::Zstd(Some(e)) => e.write_all(data)?,
