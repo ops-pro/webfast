@@ -386,7 +386,10 @@ pub fn etag_without(tagged: &str, letter: char) -> Option<String> {
 pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => content_type.starts_with(prefix),
-        None => content_type == pattern || content_type.starts_with(&format!("{pattern};")),
+        // `pattern` alone, or followed by its parameters (no string made for the comparison).
+        None => content_type
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(';')),
     }
 }
 
