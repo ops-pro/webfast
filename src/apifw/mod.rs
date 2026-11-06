@@ -826,7 +826,10 @@ async fn read_body(mut body: Body, max: usize) -> std::result::Result<Bytes, Vio
     if hint.lower() > max as u64 {
         return Err(too_large());
     }
-    let mut collected = bytes::BytesMut::with_capacity(hint.exact().map_or(0, |n| n as usize));
+    // Room for what `Content-Length` declares, but at most READ_AHEAD: a client may declare
+    // `max_body_size` on many connections and send nothing; past it the buffer grows as bytes come.
+    const READ_AHEAD: u64 = 64 * 1024;
+    let mut collected = bytes::BytesMut::with_capacity(hint.exact().map_or(0, |n| n.min(READ_AHEAD) as usize));
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(frame) => {
