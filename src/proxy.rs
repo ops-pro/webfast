@@ -101,6 +101,36 @@ pub const CLIENT_IDENTITY_HEADERS: &[&str] = &[
     "x-real-ip",
 ];
 
+/// The headers the proxy writes itself (`forwarded_headers`).
+const FORWARDED_HEADERS: &[&str] = &["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"];
+
+/// Whether CGI, PHP, WSGI and Rack read the two (lowercase) field names as one variable: they turn
+/// `-` into `_`, so `X_User`, `X.User` and `X-User` are all `HTTP_X_USER` there.
+fn same_cgi_name(a: &str, b: &str) -> bool {
+    let fold = |c: u8| if c == b'_' || c == b'.' { b'-' } else { c };
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| fold(x) == fold(y))
+}
+
+/// Takes off the fields spelled as one of `names` with `_` or `.` for a `-` (the names themselves
+/// stay): an upstream that reads headers as CGI variables would take such a field for the real one,
+/// one the server sets or only a trusted proxy may (Caddy drops every field with `_` or `.`).
+pub(crate) fn remove_lookalikes<S: AsRef<str>>(headers: &mut HeaderMap, names: &[S]) {
+    let lookalikes: Vec<HeaderName> = headers
+        .keys()
+        .filter(|field| {
+            let field = field.as_str();
+            field.bytes().any(|c| c == b'_' || c == b'.')
+                && names
+                    .iter()
+                    .any(|name| name.as_ref() != field && same_cgi_name(field, name.as_ref()))
+        })
+        .cloned()
+        .collect();
+    for field in lookalikes {
+        headers.remove(field);
+    }
+}
+
 pub(crate) fn remove_hop_headers(headers: &mut HeaderMap) {
     let listed: Vec<HeaderName> = headers
         .get_all(CONNECTION)
@@ -515,6 +545,9 @@ impl<H: Held> http_body::Body for Holding<H> {
 fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
     let peer = ctx.conn.remote.ip().to_string();
     let trusted = ctx.conn.trusted;
+    // Look-alikes from anyone: no proxy writes `X_Real_IP`.
+    remove_lookalikes(headers, CLIENT_IDENTITY_HEADERS);
+    remove_lookalikes(headers, FORWARDED_HEADERS);
     if !trusted {
         for name in CLIENT_IDENTITY_HEADERS {
             headers.remove(*name);
@@ -620,5 +653,43 @@ mod tests {
         assert_eq!(headers["x-real-ip"], "6.6.6.6");
         assert_eq!(headers["x-forwarded-for"], "6.6.6.6, 10.0.0.5");
         assert_eq!(headers["x-forwarded-proto"], "https");
+    }
+
+    #[test]
+    fn look_alikes_of_identity_headers_come_from_no_one() {
+        let sent = [
+            ("x_real_ip", "6.6.6.6"),
+            ("x.forwarded.for", "6.6.6.6"),
+            ("x_forwarded_host", "admin.test"),
+            ("cf_connecting.ip", "6.6.6.6"),
+            ("x_custom", "kept"),
+            ("x-real_ip-x", "kept"),
+        ];
+        for (peer, trusted) in [("203.0.113.9:4000", false), ("10.0.0.5:4000", true)] {
+            let ctx = ctx_from(peer, trusted, &sent);
+            let mut headers = ctx.req.headers.clone();
+            forwarded_headers(&ctx, &mut headers);
+            for gone in ["x_real_ip", "x.forwarded.for", "x_forwarded_host", "cf_connecting.ip"] {
+                assert!(headers.get(gone).is_none(), "{gone} from {peer}");
+            }
+            assert_eq!(headers["x_custom"], "kept");
+            assert_eq!(headers["x-real_ip-x"], "kept");
+            assert_eq!(headers["x-forwarded-host"], "example.test");
+        }
+    }
+
+    #[test]
+    fn cgi_names_fold_underscores_and_dots_only() {
+        assert!(same_cgi_name("x_user", "x-user"));
+        assert!(same_cgi_name("x.user", "x-user"));
+        assert!(same_cgi_name("x_user", "x.user"));
+        assert!(!same_cgi_name("x_users", "x-user"));
+        assert!(!same_cgi_name("xauser", "x-user"));
+        let mut h = HeaderMap::new();
+        h.insert("x-user", HeaderValue::from_static("real"));
+        h.insert("x_user", HeaderValue::from_static("forged"));
+        remove_lookalikes(&mut h, &["x-user"]);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h["x-user"], "real");
     }
 }

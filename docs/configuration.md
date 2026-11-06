@@ -413,7 +413,8 @@ cache: { tokens: 10000 }
   A token signed with a key id not known yet asks for an early read and waits for it — at most one
   every 30 s, so made-up key ids cannot make the server hammer the issuer.
 - The headers claims are written to are taken off every request first: a client cannot send
-  `X-User` itself, also on paths no rule covers.
+  `X-User` itself, also on paths no rule covers. Nor `X_User` or `X.User`, which PHP, CGI, WSGI
+  and Rack read as the same `HTTP_X_USER`.
 - Verified tokens are kept (by their BLAKE3 hash; 16 shards, two generations): a token seen again
   costs 0.6–0.85 µs, a new one 20 µs (RS256), 43 µs (EdDSA) or 68 µs (ES256) — release build.
 

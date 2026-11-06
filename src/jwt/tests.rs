@@ -181,21 +181,31 @@ async fn rules_decide_which_requests_need_a_token() {
 async fn claim_headers_cannot_come_from_the_client() {
     let signer = Signer::ec();
     let auth = auth(&signer, "");
+    // Look-alikes as well: PHP, CGI and WSGI read `X_User` and `X.Roles` as `X-User`, `X-Roles`.
+    let forged = [
+        ("x-user", "admin"),
+        ("X-Roles", "root"),
+        ("X_User", "admin"),
+        ("x.roles", "root"),
+    ];
     for path in ["/index.html", "/api/public/x", "/api/open/x"] {
-        let mut parts = request(path, &[("x-user", "admin"), ("X-Roles", "root")]);
+        let mut parts = request(path, &forged);
         auth.check(&mut parts, ip()).await.unwrap();
-        assert!(
-            parts.headers.get("x-user").is_none() && parts.headers.get("x-roles").is_none(),
-            "{path}"
-        );
+        let left: Vec<&str> = parts.headers.keys().map(|k| k.as_str()).collect();
+        assert_eq!(left, ["host"], "{path}");
     }
     let token = signer.token("k1", &claims(json!({"sub": "u2"})));
     let mut parts = request(
         "/api/orders",
-        &[("authorization", &bearer(&token)), ("x-user", "admin")],
+        &[
+            ("authorization", &bearer(&token)),
+            ("x-user", "admin"),
+            ("x_user", "admin"),
+        ],
     );
     auth.check(&mut parts, ip()).await.unwrap();
     assert_eq!(parts.headers.get_all("x-user").iter().collect::<Vec<_>>(), ["u2"]);
+    assert!(parts.headers.get("x_user").is_none());
 }
 
 #[tokio::test]

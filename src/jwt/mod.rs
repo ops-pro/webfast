@@ -400,6 +400,8 @@ impl JwtAuth {
         for name in &self.reserved {
             parts.headers.remove(name);
         }
+        // `X_User` and `X.User` too: a CGI-style upstream reads them as `X-User`.
+        crate::proxy::remove_lookalikes(&mut parts.headers, &self.reserved);
         match self.rule_for(parts, None) {
             Some(rule) => self.apply(rule, parts, client_ip).await,
             None => Ok(()),

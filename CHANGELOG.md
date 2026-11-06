@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Request headers spelled like a header the server sets or trusts, but with `_` or `.` for a `-`
+  (`X_User`, `X.Forwarded.For`, `X_Real_IP`), are taken off before the request goes upstream. PHP,
+  CGI, WSGI and Rack read them as the same variable (`HTTP_X_USER`), so a client could pass one
+  for a JWT claim header (even without a token, on an `allow_missing` rule) or for its own
+  address. Kept: every other header with `_` or `.` (Caddy 2.11.4 and 2.11.6 drop them all).
+
 - The JWT and API firewall files and OpenAPI specs in YAML are read with serde-saphyr (pure Rust)
   instead of serde_yaml_ng, whose libyaml port (unsafe-libyaml) is unmaintained
   (RUSTSEC-2024-0449); read as before (YAML 1.2 booleans, the last of a repeated key, `<<` an
