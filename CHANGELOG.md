@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-06
+
+Automatic certificates (ACME, with ARI renewal windows), load balancing over several upstreams,
+a Caddy-compatible image, error pages, reloads without dropped connections, compression
+dictionaries, rate limits, a proxy cache, JWT and OpenAPI checks at the edge, and the hardening
+Caddy 2.11.4–2.11.9 brought that applies here (look-alike headers, a header size limit, Host
+checks, `Incremental`).
+
+Worth knowing when upgrading from 0.1.0:
+
+- Rust 1.89 or later builds it (serde-saphyr).
+- Request headers over 16 KiB get 431 on every protocol (`servers { max_header_size }`).
+- A Host that names no host, two Hosts, or a Host for another host than the `:authority` get 400.
+- Request headers spelled like a trusted one with `_` or `.` (`X_User`, `X_Real_IP`) are dropped.
+- In the JWT and API firewall YAML files a mapping key `~` (null) is an error.
 
 - A response with `Incremental: ?1` (RFC 10036, the standard form of NGINX's
   `X-Accel-Buffering: no`, as Caddy 2.11.7) is neither compressed by `encode` nor kept by `cache`,
