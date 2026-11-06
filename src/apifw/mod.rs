@@ -616,8 +616,15 @@ impl Api {
         path_params: &[(std::sync::Arc<str>, String)],
         parts: &http::request::Parts,
     ) -> std::result::Result<(), Violation> {
-        let query = params::query_pairs(parts.uri.query().unwrap_or(""))
-            .ok_or_else(|| Violation::new("request-query:encoding", "the query string does not decode"))?;
+        let query = params::query_pairs(parts.uri.query().unwrap_or("")).map_err(|unreadable| match unreadable {
+            params::Unreadable::Encoding => {
+                Violation::new("request-query:encoding", "the query string does not decode")
+            }
+            params::Unreadable::TooMany => Violation::new(
+                "request-query:too-many",
+                format!("more than {} parameters", params::MAX_PAIRS),
+            ),
+        })?;
         let needs_cookies = op.params.iter().any(|p| p.location == Location::Cookie)
             || op.security.iter().flatten().any(|c| matches!(c, Credential::Cookie(_)));
         let cookies = if needs_cookies {
@@ -854,7 +861,12 @@ fn validate_body(media: &spec::Media, bytes: &Bytes) -> std::result::Result<(), 
         ),
         BodyFormat::Form => {
             let text = std::str::from_utf8(bytes).map_err(|_| Violation::new(reason(), "not UTF-8"))?;
-            let pairs = params::query_pairs(text).ok_or_else(|| Violation::new(reason(), "does not decode"))?;
+            let pairs = params::query_pairs(text).map_err(|unreadable| match unreadable {
+                params::Unreadable::Encoding => Violation::new(reason(), "does not decode"),
+                params::Unreadable::TooMany => {
+                    Violation::new(reason(), format!("more than {} fields", params::MAX_PAIRS))
+                }
+            })?;
             let mut object = Map::new();
             for (name, raw) in pairs {
                 let kind = media.fields.iter().find(|(n, _)| *n == name).map(|(_, k)| k);

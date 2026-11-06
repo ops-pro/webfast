@@ -136,38 +136,67 @@ fn is_json_number(text: &str) -> bool {
 
 /// Percent-decoding that refuses broken escapes and text that is not UTF-8.
 pub(super) fn decode_strict(text: &str) -> Option<String> {
+    decode(text, false)
+}
+
+/// `decode_strict`, with `+` read as a space when `plus_is_space` (forms and query strings): one
+/// pass and one string, the decoded text being at most as long as the encoded.
+fn decode(text: &str, plus_is_space: bool) -> Option<String> {
     let bytes = text.as_bytes();
-    if !bytes.contains(&b'%') {
+    if !bytes.iter().any(|&b| b == b'%' || (plus_is_space && b == b'+')) {
         return Some(text.to_string());
     }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = |b: u8| (b as char).to_digit(16);
-            let (hi, lo) = (hex(*bytes.get(i + 1)?)?, hex(*bytes.get(i + 2)?)?);
-            out.push((hi * 16 + lo) as u8);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+        match bytes[i] {
+            b'%' => {
+                let hex = |b: u8| (b as char).to_digit(16);
+                let (hi, lo) = (hex(*bytes.get(i + 1)?)?, hex(*bytes.get(i + 2)?)?);
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     String::from_utf8(out).ok()
 }
 
-/// A query string's pairs, decoded as forms are (`+` is a space); `None` when a part does not
-/// decode.
-pub(super) fn query_pairs(query: &str) -> Option<Vec<(String, String)>> {
-    let mut pairs = Vec::new();
-    for part in query.split('&').filter(|p| !p.is_empty()) {
-        let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        pairs.push((
-            decode_strict(&key.replace('+', " "))?,
-            decode_strict(&value.replace('+', " "))?,
-        ));
+/// The most pairs one query string or form body is read into (as PHP's `max_input_vars` and
+/// Django's `DATA_UPLOAD_MAX_NUMBER_FIELDS`): a body of `a&a&a…` would otherwise become half a
+/// million pairs of strings per megabyte.
+pub(super) const MAX_PAIRS: usize = 1000;
+
+/// Why a query string or form body was not read into pairs.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Unreadable {
+    /// A part does not decode.
+    Encoding,
+    /// More than `MAX_PAIRS` pairs.
+    TooMany,
+}
+
+/// A query string's pairs, decoded as forms are (`+` is a space).
+pub(super) fn query_pairs(query: &str) -> Result<Vec<(String, String)>, Unreadable> {
+    let parts = || query.split('&').filter(|p| !p.is_empty());
+    let count = parts().count();
+    if count > MAX_PAIRS {
+        return Err(Unreadable::TooMany);
     }
-    Some(pairs)
+    let mut pairs = Vec::with_capacity(count);
+    for part in parts() {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let decoded = |text| decode(text, true).ok_or(Unreadable::Encoding);
+        pairs.push((decoded(key)?, decoded(value)?));
+    }
+    Ok(pairs)
 }
 
 /// The request's cookies, as `name=value` pairs.
@@ -246,6 +275,20 @@ mod tests {
                 ("d".into(), "=".into())
             ]
         );
-        assert!(query_pairs("a=%G1").is_none());
+        assert_eq!(query_pairs("a=%G1"), Err(Unreadable::Encoding));
+        assert_eq!(query_pairs("a=%2B+%2b").unwrap(), vec![("a".into(), "+ +".into())]);
+        assert_eq!(query_pairs("a+b=%").map(|_| ()), Err(Unreadable::Encoding));
+    }
+
+    #[test]
+    fn pairs_are_bounded() {
+        let at_most = "a&".repeat(MAX_PAIRS);
+        assert_eq!(query_pairs(&at_most).unwrap().len(), MAX_PAIRS);
+        assert_eq!(
+            query_pairs(&format!("{at_most}&&&")).unwrap().len(),
+            MAX_PAIRS,
+            "empty parts are not pairs"
+        );
+        assert_eq!(query_pairs(&format!("{at_most}b")), Err(Unreadable::TooMany));
     }
 }

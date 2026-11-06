@@ -440,7 +440,8 @@ apis:
   for present (presence only: the JWT module verifies tokens). In `block` a violation answers 403
   with an empty body (`reason_header: true` adds `apifw-validation-status`); in `log_only` it is
   written to the event log and the request goes on. A body over `max_body_size` gets 413 and a
-  compressed one 415, in any mode.
+  compressed one 415, in any mode. A query string or form body of more than 1000 pairs is a
+  violation (`request-query:too-many`, or the body's reason): it is not read further.
 - The spec is compiled once: a trie of path segments to operations, typed readers for the
   parameters, JSON Schema 2020-12 validators (OpenAPI 3.0 schemas converted: `nullable`, boolean
   exclusive bounds, `int32` ranges, `readOnly` properties refused in requests; patterns with the
