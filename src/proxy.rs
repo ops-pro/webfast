@@ -543,7 +543,7 @@ impl<H: Held> http_body::Body for Holding<H> {
 }
 
 fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
-    let peer = ctx.conn.remote.ip().to_string();
+    let peer = ctx.conn.remote.ip();
     let trusted = ctx.conn.trusted;
     // Look-alikes from anyone: no proxy writes `X_Real_IP`.
     remove_lookalikes(headers, CLIENT_IDENTITY_HEADERS);
@@ -553,43 +553,50 @@ fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
             headers.remove(*name);
         }
     }
-    let prior: Vec<&str> = ctx
-        .req
-        .headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    let xff = if trusted && !prior.is_empty() {
-        format!("{}, {peer}", prior.join(", "))
-    } else {
-        peer
+    // The trusted proxy's entries, then the peer: one string of its final size (an address is at
+    // most 39 characters).
+    let prior = || {
+        ctx.req
+            .headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
     };
+    let prior_len: usize = if trusted { prior().map(|v| v.len() + 2).sum() } else { 0 };
+    let mut xff = String::with_capacity(prior_len + 39);
+    if trusted {
+        for value in prior() {
+            xff.push_str(value);
+            xff.push_str(", ");
+        }
+    }
+    {
+        use std::fmt::Write as _;
+        let _ = write!(xff, "{peer}");
+    }
     if let Ok(value) = HeaderValue::from_str(&xff) {
         headers.insert("x-forwarded-for", value);
     }
+    // A trusted proxy's last value as it came (the same bytes: no string made of it).
     let last = |name: &str| {
         ctx.req
             .headers
             .get_all(name)
             .iter()
             .next_back()
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
+            .filter(|v| v.to_str().is_ok_and(|v| !v.is_empty()))
     };
     let proto = match last("x-forwarded-proto") {
-        Some(prior) if trusted => prior.to_string(),
-        _ => (if ctx.conn.tls { "https" } else { "http" }).to_string(),
+        Some(prior) if trusted => prior.clone(),
+        _ => HeaderValue::from_static(if ctx.conn.tls { "https" } else { "http" }),
     };
-    if let Ok(value) = HeaderValue::from_str(&proto) {
-        headers.insert("x-forwarded-proto", value);
-    }
+    headers.insert("x-forwarded-proto", proto);
     let host = match last("x-forwarded-host") {
-        Some(prior) if trusted => prior.to_string(),
-        _ => ctx.hostport().to_string(),
+        Some(prior) if trusted => Some(prior.clone()),
+        _ => HeaderValue::from_str(ctx.hostport()).ok(),
     };
-    if let Ok(value) = HeaderValue::from_str(&host) {
-        headers.insert("x-forwarded-host", value);
+    if let Some(host) = host {
+        headers.insert("x-forwarded-host", host);
     }
 }
 
