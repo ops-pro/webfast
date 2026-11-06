@@ -6,7 +6,7 @@
   instead of serde_yaml_ng, whose libyaml port (unsafe-libyaml) is unmaintained
   (RUSTSEC-2024-0449); read as before (YAML 1.2 booleans, the last of a repeated key, `<<` an
   ordinary key), errors on one line without the file's text. A mapping key `~` is now an error.
-  Reading a spec takes a third of the allocations and 40 % of the peak memory, and half as much
+  Reading a spec takes a quarter of the allocations and 40 % of the peak memory, and half as much
   time again (the GitHub REST API's, 10 MB: 356 ms against 236).
   The minimum Rust version is 1.89 (serde-saphyr's).
 

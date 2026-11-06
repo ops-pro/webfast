@@ -78,6 +78,14 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_document_is_null() {
+        // serde-saphyr 2.1.0 refused these (yanked for it).
+        for text in ["", "\n", "# a comment\n", "---\n"] {
+            assert_eq!(read(text), Value::Null, "{text:?}");
+        }
+    }
+
+    #[test]
     fn errors_are_one_line_without_the_text() {
         let error = from_str::<Value>("token: s3cret\nlist:\n\t- 1\n")
             .unwrap_err()
