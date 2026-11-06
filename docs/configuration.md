@@ -206,7 +206,7 @@ example.com {
 
 - What is kept: the answer to a GET with status 200, whole, of at most `max_cacheable_body_bytes`
   (a sixteenth of `WEB_PROXY_CACHE_MEMORY` unless set), without Set-Cookie, not `private`,
-  `no-store` or `no-cache`, varying on nothing but Accept-Encoding, not an event stream; the answer
+  `no-store` or `no-cache`, varying on nothing but Accept-Encoding, not an event stream nor `Incremental: ?1`; the answer
   to a request with Authorization only when it is `public` (or has `s-maxage` or
   `must-revalidate`). It is fresh for its `s-maxage`, `max-age` or `Expires`, otherwise for
   `ttl` (120 s); `default_cache_control` is the Cache-Control of an answer that has none (the
@@ -544,7 +544,8 @@ Those an answer shows are checked by `compat/`:
   proxy failure is the status text (Caddy's is the network error, with the upstream's address);
   the blocks see the request's headers as the client sent them (Caddy: as `request_header` left
   them); `{err.id}` and `{err.trace}` are not supported.
-- `text/event-stream` is never compressed.
+- `text/event-stream` is never compressed, nor a response with `Incremental: ?1` (RFC 10036; Caddy
+  compresses it frame by frame). Responses are always streamed as they come.
 - Limits Caddy does not have (docs/operations.md, Limits): `response_header_timeout` 60 s by
   default (`0` restores Caddy's none), 408 for a request body the client stops sending, at most 64
   non-overlapping ranges, redirect targets kept on the site, client identity headers

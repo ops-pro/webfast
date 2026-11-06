@@ -515,6 +515,7 @@ fn storable(status: StatusCode, headers: &HeaderMap, sent: &HeaderMap, settings:
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/event-stream"))
+        || crate::encode::incremental(headers)
     {
         return None;
     }
@@ -1289,6 +1290,7 @@ mod tests {
             &[("vary", "Cookie")],
             &[("vary", "*")],
             &[("content-type", "text/event-stream")],
+            &[("incremental", "?1")],
             &[("content-encoding", "deflate")],
             &[("cache-control", "max-age=0")],
         ] {

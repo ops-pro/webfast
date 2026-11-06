@@ -7,7 +7,8 @@
 //! ties go to the order the directive lists; strong ETags get `-<encoding>` appended (and that
 //! suffix is taken off If-None-Match on the way in); `Cache-Control: no-transform`, an existing
 //! Content-Encoding, 1xx/204/304 and bodies shorter than `minimum_length` are left alone.
-//! Unlike Caddy, `text/event-stream` is never compressed.
+//! Unlike Caddy, `text/event-stream` is never compressed, nor a response with `Incremental: ?1`
+//! (RFC 10036; Caddy compresses it frame by frame).
 
 use crate::body::{Body, BoxError};
 use bytes::Bytes;
@@ -339,7 +340,7 @@ impl Encode {
             return false;
         };
         let content_type = content_type.to_ascii_lowercase();
-        if content_type.starts_with("text/event-stream") {
+        if content_type.starts_with("text/event-stream") || incremental(headers) {
             return false;
         }
         if !self.types.iter().any(|t| type_matches(t, &content_type)) {
@@ -410,6 +411,19 @@ pub fn compress_best(encoding: Encoding, data: &[u8]) -> std::io::Result<Bytes> 
     };
     Ok(Bytes::from(out))
 }
+
+/// Whether a response says each part of it is to reach the client as it comes: `Incremental: ?1`
+/// (RFC 10036, the standard form of NGINX's `X-Accel-Buffering: no`). Neither compressed nor kept
+/// by the cache, as an event stream: both may hold a body back (a known length is compressed
+/// whole). `?0`, or a value that is no Structured Fields boolean, says nothing.
+pub fn incremental(headers: &HeaderMap) -> bool {
+    headers.get_all(INCREMENTAL).iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|v| v.split(';').next().is_some_and(|item| item.trim() == "?1"))
+    })
+}
+
+pub(crate) const INCREMENTAL: http::header::HeaderName = http::header::HeaderName::from_static("incremental");
 
 /// Whether a body of `content_type` is worth compressing: Caddy's list (`DEFAULT_TYPES`), never
 /// an event stream.
@@ -684,6 +698,17 @@ mod tests {
             HeaderValue::from_static("application/json; charset=utf-8"),
         );
         assert!(config.qualifies(&json));
+        // RFC 10036: `?1` (with parameters too) streams as it comes; `?0` or no boolean, no word.
+        for (value, compressed) in [
+            ("?1", false),
+            ("?1;x=1", false),
+            (" ?1 ", false),
+            ("?0", true),
+            ("1", true),
+        ] {
+            json.headers_mut().insert(INCREMENTAL, HeaderValue::from_static(value));
+            assert_eq!(config.qualifies(&json), compressed, "Incremental: {value}");
+        }
     }
 
     #[test]

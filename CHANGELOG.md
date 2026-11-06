@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A response with `Incremental: ?1` (RFC 10036, the standard form of NGINX's
+  `X-Accel-Buffering: no`, as Caddy 2.11.7) is neither compressed by `encode` nor kept by `cache`,
+  as an event stream: a body of known length was compressed whole, so it reached the client only
+  at its end. The proxy already passed every response on as it came.
+
 - A request whose Host names no host is answered 400 before the routes (as Caddy 2.11.8): dots
   only (`..`), a `/` or `\`, user information, a port that is not a number, characters no host
   name has; so are two Host headers, and a Host for another host than HTTP/2's or HTTP/3's
