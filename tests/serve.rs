@@ -749,6 +749,58 @@ async fn headers_over_max_header_size_get_431_on_every_protocol() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+#[tokio::test]
+async fn hosts_that_name_no_host_get_400() {
+    let harness = start().await;
+    let port = harness.running.bound[0].1.port();
+    let raw = |head: String| async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tcp.write_all(head.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut answer))
+            .await
+            .expect("the connection is closed after a refusal")
+            .unwrap();
+        String::from_utf8_lossy(&answer).into_owned()
+    };
+    for host in ["..", "a/b", "a\\b", "user@localhost", "localhost:http"] {
+        let answer = raw(format!("GET /index.html HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{host}: {answer}");
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "{host}: {answer}"
+        );
+    }
+    let answer = raw("GET /index.html HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n".into()).await;
+    assert!(answer.starts_with("HTTP/1.1 400"), "two Hosts: {answer}");
+    let answer =
+        raw("GET http://localhost/index.html HTTP/1.1\r\nHost: admin.test\r\nConnection: close\r\n\r\n".into()).await;
+    assert!(
+        answer.starts_with("HTTP/1.1 400"),
+        "an absolute target for another host: {answer}"
+    );
+    let answer = raw(format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    ))
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+
+    // HTTP/2: `:authority` and a Host for another host.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    for (host, want) in [(format!("127.0.0.1:{port}"), 200), ("admin.test".to_string(), 400)] {
+        let request = Request::get(format!("http://127.0.0.1:{port}/"))
+            .header("host", host.as_str())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(sender.send_request(request).await.unwrap().status(), want, "{host}");
+    }
+}
+
 /// A client whose handshake offers only these signature schemes (it verifies nothing else).
 fn client_offering(roots: &[&rcgen::Certificate], schemes: &[rustls::SignatureScheme]) -> rustls::ClientConfig {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();

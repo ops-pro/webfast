@@ -261,20 +261,20 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let (mut parts, body) = request.into_parts();
     let remote = connection.info.remote;
     let version = parts.version;
+    // A request the server makes of itself (src/apifw: a spec given as a path) passes the Host
+    // checks by.
+    let internal = parts.extensions.get::<InternalRequest>().is_some();
     // HTTP/1.1 heads are only bounded by hyper's buffer (~400 KiB); HTTP/2 and HTTP/3 refused
     // more than this before (431), by the same count.
     if field_section_size(&parts.headers) > connection.state.max_header {
-        let mut response = Response::new(crate::body::empty());
-        *response.status_mut() = StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
-        response
-            .headers_mut()
-            .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
-        common_headers(&connection.state, version, &mut response);
-        return response;
+        return refused(&connection.state, version, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    }
+    // A host that is no name or address, or a Host and an authority that differ: 400 before
+    // anything reads it (Caddy 2.11.8 and 2.11.9).
+    if !internal && crate::handler::bad_host(&parts) {
+        return refused(&connection.state, version, StatusCode::BAD_REQUEST);
     }
     // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
-    // A request the server makes of itself (src/apifw: a spec given as a path) passes both by.
-    let internal = parts.extensions.get::<InternalRequest>().is_some();
     let misdirected = !internal && connection.state.misdirected(&connection.info, &parts);
     // The site, in the connection's routing (WEB_RELOAD=lazy, drain) or in the port's as it is now; what
     // the request needs of it is taken out, so that nothing holds the routing across an await.
@@ -398,6 +398,20 @@ pub fn stall_limited(request: Request<Body>, stall: Duration) -> Request<Body> {
 /// What every response gets: `Date` from the shared clock (a proxied response keeps the upstream's,
 /// as in Caddy; hyper's own date is left for the error responses it writes itself) and, with
 /// HTTP/3 on, `Alt-Svc` over TCP.
+/// A request refused before the routes, for what its head is: empty, and on HTTP/1.x the last
+/// on its connection (what else the client sent cannot be trusted to frame the next one).
+fn refused(state: &ServerState, version: Version, status: StatusCode) -> Response<Body> {
+    let mut response = Response::new(crate::body::empty());
+    *response.status_mut() = status;
+    if version <= Version::HTTP_11 {
+        response
+            .headers_mut()
+            .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    common_headers(state, version, &mut response);
+    response
+}
+
 /// The size of a request's header fields as HTTP/2 and HTTP/3 count it: name, value and 32 bytes
 /// of each (RFC 9113 §6.5.2).
 fn field_section_size(headers: &http::HeaderMap) -> usize {

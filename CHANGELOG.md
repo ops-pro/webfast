@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A request whose Host names no host is answered 400 before the routes (as Caddy 2.11.8): dots
+  only (`..`), a `/` or `\`, user information, a port that is not a number, characters no host
+  name has; so are two Host headers, and a Host for another host than HTTP/2's or HTTP/3's
+  `:authority` (or an HTTP/1.1 absolute target), which a proxy and the app behind it could each
+  read their own way (Caddy 2.11.9). The authority is now the one used where both are sent; it
+  was the Host. HTTP/1.1 closes the connection after a 400 or 431 of this kind.
+
 - Request headers are limited to 16 KiB on every protocol (`servers { max_header_size <size> }`,
   1 KiB to 1 MiB, as Caddy 2.11.6): more is 431. HTTP/2 had hyper's 16 KiB already; HTTP/3 took
   up to 64 KiB, HTTP/1.1 up to hyper's ~400 KiB buffer. Each field counts its name, its value and

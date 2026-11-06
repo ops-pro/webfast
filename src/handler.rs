@@ -433,14 +433,73 @@ pub async fn handle_error(
     page
 }
 
-/// The Host header of a request head, or its URI authority (HTTP/2, HTTP/3).
+/// The authority a request names: HTTP/2's and HTTP/3's `:authority` (or an HTTP/1.1 absolute
+/// target), else its Host header (RFC 9113 §8.3.1, RFC 9112 §3.2.2). The server refuses a request
+/// where the two name different hosts (`bad_host`).
 pub fn hostport_of(parts: &http::request::Parts) -> &str {
     parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| parts.uri.authority().map(|a| a.as_str()))
+        .uri
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| parts.headers.get(http::header::HOST).and_then(|v| v.to_str().ok()))
         .unwrap_or("")
+}
+
+/// Whether a request names its host in a way nothing should act on (answered 400): more than one
+/// Host, a Host and an authority for different hosts (a proxy and the app behind it could each take
+/// another), or a host that is neither a name nor an address — dots only (`..`), a `/` or `\`, user
+/// information, a port that is not a number.
+pub fn bad_host(parts: &http::request::Parts) -> bool {
+    let mut hosts = parts.headers.get_all(http::header::HOST).iter();
+    let header = hosts.next();
+    if hosts.next().is_some() {
+        return true;
+    }
+    let header = match header.map(|v| v.to_str()) {
+        Some(Ok(text)) => Some(text),
+        Some(Err(_)) => return true,
+        None => None,
+    };
+    if let Some(header) = header
+        && !valid_hostport(header)
+    {
+        return true;
+    }
+    match (parts.uri.authority(), header) {
+        (Some(authority), _) if !valid_hostport(authority.as_str()) => true,
+        (Some(authority), Some(header)) => !strip_port(authority.as_str()).eq_ignore_ascii_case(strip_port(header)),
+        _ => false,
+    }
+}
+
+/// A host (a name, an IPv4 address, or an IPv6 one in brackets) with an optional port; empty is
+/// fine (HTTP/1.0 sends no Host). A name may hold what RFC 3986 allows in one, but for `%` escapes
+/// (no browser sends them) and must not be dots only.
+fn valid_hostport(hostport: &str) -> bool {
+    if hostport.is_empty() {
+        return true;
+    }
+    let (host_ok, port) = match hostport.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((ip, after)) => (ip.parse::<std::net::Ipv6Addr>().is_ok(), after),
+            None => return false,
+        },
+        None => {
+            // What follows the name keeps its colon, as after an IPv6 address.
+            let name = hostport.split(':').next().unwrap_or_default();
+            let ok = !name.is_empty()
+                && name.bytes().any(|c| c != b'.')
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&c));
+            (ok, &hostport[name.len()..])
+        }
+    };
+    host_ok
+        && match port.strip_prefix(':') {
+            None => port.is_empty(),
+            Some(digits) => digits.len() <= 5 && digits.bytes().all(|c| c.is_ascii_digit()),
+        }
 }
 
 pub fn strip_port(hostport: &str) -> &str {
@@ -1086,6 +1145,70 @@ mod tests {
         });
         let (parts, body) = http::Request::get(path).body(empty()).unwrap().into_parts();
         Ctx::new(conn, parts, body, "127.0.0.1".parse().unwrap())
+    }
+
+    #[test]
+    fn hosts_are_names_or_addresses() {
+        for good in [
+            "",
+            "example.com",
+            "Example.COM:8443",
+            "a-b_c.example",
+            "127.0.0.1:80",
+            "[::1]",
+            "[2001:db8::1]:443",
+            "xn--caf-dma.test",
+            "localhost.",
+            "host:",
+        ] {
+            assert!(valid_hostport(good), "{good:?}");
+        }
+        for bad in [
+            "..",
+            ".",
+            "...:80",
+            "a/b",
+            "a\\b",
+            "../etc",
+            "user@host",
+            "host:http",
+            "host:1:2",
+            "host:123456",
+            "[::1",
+            "[nope]",
+            "[::1]x",
+            "a%2fb",
+            "café.test",
+            ":80",
+            "a b",
+        ] {
+            assert!(!valid_hostport(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_and_an_authority_must_agree() {
+        let parts = |uri: &str, hosts: &[&str]| {
+            let mut builder = http::Request::get(uri);
+            for host in hosts {
+                builder = builder.header(http::header::HOST, *host);
+            }
+            builder.body(()).unwrap().into_parts().0
+        };
+        // HTTP/1.1 origin form: the Host alone.
+        assert!(!bad_host(&parts("/x", &["example.com"])));
+        assert!(!bad_host(&parts("/x", &[])));
+        assert!(bad_host(&parts("/x", &[".."])));
+        assert!(bad_host(&parts("/x", &["a.test", "b.test"])), "two Hosts");
+        // HTTP/2, HTTP/3 (or an absolute target): the authority wins and the Host must agree.
+        let p = parts("https://a.test/x", &[]);
+        assert!(!bad_host(&p));
+        assert_eq!(hostport_of(&p), "a.test");
+        let p = parts("https://a.test:8443/x", &["A.TEST"]);
+        assert!(!bad_host(&p), "the same host, case and port aside");
+        assert_eq!(hostport_of(&p), "a.test:8443");
+        assert!(bad_host(&parts("https://a.test/x", &["admin.test"])));
+        assert!(bad_host(&parts("https://user@a.test/x", &[])));
     }
 
     #[test]
