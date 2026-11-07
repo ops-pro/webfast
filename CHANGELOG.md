@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- The repository is a Cargo workspace: `crates/webfast-core` (the server as a library,
+  `webfast_core`) and `crates/webfast` (the binary: `main.rs` and `compose.rs`, which names the
+  modules it is built with). The request filter (NGFW) and the browser challenge moved to
+  https://github.com/ops-pro/webfast-modules as the crates `webfast-ngfw` and `webfast-challenge`,
+  with their documentation and changelog; this binary composes none yet. `cargo build --release`
+  at the root still yields `target/release/webfast`; `Cargo.lock` stays at the root; the release
+  profiles and the dependency versions are the workspace's. The checks run on both crates
+  (`scripts/check.sh`, CI).
+- A module API (`webfast_core::module`, docs/modules.md): the core knows no module by name. A
+  module is a crate against the core's public API — a `Module` the binary registers (its
+  directives with their place in the directive order, its environment, its files into
+  `Config::modules`, its lines for `validate`, its reload), route handlers
+  (`Handler::Extension`), request checks (`Check`: the head decides synchronously, a boxed
+  future only for a body) and inspectors of proxied responses (`Inspect`) — composed in the
+  binary's `compose.rs` as tuples the core calls through one `&'static dyn` per kind. A clean
+  request allocates nothing more than before. The request filter and the browser challenge are
+  written on it, with `webfast_core::` paths alone, and their tests on the core's test harness
+  (`webfast_core::harness`, cargo feature `test-harness`). What the modules needed of the core
+  became public: the directive parser's types and helpers (`config::{Cx, Scope, SiteCx, Entry,
+  entry, matcher_token, add_matcher, at_err, token_err}`), `guard::address_key`,
+  `proxy::remove_lookalikes`, `accesslog::json_escape`; `eventlog` and `yaml` are always built,
+  the HTTPS client is the core's `fetch` feature.
+
 ## 0.1.2 — 2026-11-06
 
 Fewer allocations on the request path, buffers sized once where their size is known, and bounds

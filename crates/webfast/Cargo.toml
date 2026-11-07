@@ -1,0 +1,70 @@
+[package]
+name = "webfast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A static-first web server: the site from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a strict subset of the Caddyfile"
+readme = "../../README.md"
+keywords = ["http", "web-server", "static", "caddyfile", "http3"]
+categories = ["web-programming::http-server"]
+
+# The composition of the core with the modules (src/compose.rs): what the binary and the
+# integration tests share. The modules are crates of https://github.com/ops-pro/webfast-modules.
+[lib]
+name = "webfast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webfast"
+path = "src/main.rs"
+
+[features]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme"]
+# The core's features, passed through (crates/webfast-core/Cargo.toml says what each is).
+acme = ["webfast-core/acme"]
+api-firewall = ["webfast-core/api-firewall"]
+compress-files = ["webfast-core/compress-files"]
+jwt = ["webfast-core/jwt"]
+proxy-cache = ["webfast-core/proxy-cache"]
+rate-limit = ["webfast-core/rate-limit"]
+# mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
+mimalloc = ["webfast-core/mimalloc", "dep:mimalloc"]
+
+[dependencies]
+webfast-core.workspace = true
+mimalloc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# clock_gettime through the vDSO for the static musl build (src/vdso.rs); tests/reload.rs sends
+# the binary SIGHUP and SIGTERM.
+libc.workspace = true
+
+[dev-dependencies]
+# The harness: a server from a Caddyfile text, raw HTTP/1.1 to it (crates/webfast-core/src/harness.rs).
+webfast-core = { workspace = true, features = ["test-harness"] }
+anyhow.workspace = true
+# The tests' upstream stubs and HTTP/1.1, HTTP/2 and HTTP/3 clients (tests/, examples/).
+aws-lc-rs.workspace = true
+bytes.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+# tests/reload.rs reads the event log's JSON lines.
+serde_json.workspace = true
+# examples/train.rs writes the sample site's precompressed siblings and its certificate.
+brotli.workspace = true
+flate2.workspace = true
+rcgen.workspace = true
+zstd.workspace = true
+tempfile.workspace = true
+tokio-stream.workspace = true

@@ -66,7 +66,8 @@ with, and no connection is cut by a reload. What the connections already open ge
   `timeouts`, `strict_sni_host`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at
   startup); the request checks (`WEB_JWT_CONFIG`, `WEB_API_FIREWALL_CONFIG`) are read at startup
   and kept, and a Caddyfile whose routes no longer send to an upstream they are bound to is
-  refused. The `debug` option takes effect on a restart.
+  refused. A module's own file (the request filter's, say) is read again by a reload; one that does
+  not load keeps its running state and says so. The `debug` option takes effect on a restart.
 - A reload that fails — a syntax error, a root that is missing, a certificate that cannot be read,
   one of the above — changes nothing: the log says `configuration not reloaded; the running one
   stays` with the reason. A reload that succeeds says `configuration reloaded`.
@@ -337,9 +338,9 @@ request`) or a console line. Request headers are not logged (they carry cookies)
 in batches (`WEB_LOG_FLUSH_MS`); a full queue drops lines instead of slowing requests, and says how
 many.
 
-The request checks (docs/configuration.md, Request checks) write what they refuse, and what
-`log_only` lets through, to event logs of their own: JSON lines in a file, which logrotate may
-move, or on stderr next to the server's log.
+The request checks (docs/configuration.md, Request checks) and the modules that check requests
+write what they refuse, and what `log_only` lets through, to event logs of their own: JSON lines in
+a file, which logrotate may move, or the server's log.
 
 ## Limits
 
@@ -348,6 +349,7 @@ What keeps one client from holding the server:
 | Threat                                                | Limit                                                                                                                                                             |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Many requests from one client (a login form, an API)  | `rate_limit` zones (docs/configuration.md, Rate limits): 429 with `Retry-After`, the zone's count logged once per `sweep_interval`                                |
+| Scanners, probes, injection payloads, bad uploads     | the request filter of [webfast-modules](https://github.com/ops-pro/webfast-modules), when the binary is built with it: refused before the routes (403, 404 or the connection closed), a client that keeps at it banned for a while |
 | One client holding the application with slow requests | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` (256; behind a trusted proxy, per client it names): more requests at the upstreams at once are refused with 429                |
 | Many connections (one address, or many)               | `WEB_MAX_CONNECTIONS_PER_IP` (256; an IPv6 /64 is one address; trusted proxies exempt) and `WEB_MAX_CONNECTIONS` (16 384), TCP and QUIC together: refused at once |
 | Slowloris: headers sent byte by byte                  | `timeouts { read_header }` (30 s) for the whole header block, counted from the connection's start and, on HTTP/1.1, from the end of each response for the next request's; the TLS handshake gets 10 s |

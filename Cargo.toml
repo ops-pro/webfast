@@ -1,71 +1,28 @@
-[package]
-name = "webfast"
+[workspace]
+resolver = "2"
+members = ["crates/webfast-core", "crates/webfast"]
+default-members = ["crates/webfast"]
+
+[workspace.package]
 version = "0.1.2"
 edition = "2024"
 # let chains (`if let … && let …`): 1.88; serde-saphyr: 1.89.
 rust-version = "1.89"
-description = "A static-first web server: the site from memory with content-hash ETags, precompressed and on-the-fly br/zstd/gzip, reverse proxy, HTTP/1.1, HTTP/2 and HTTP/3; configured with a strict subset of the Caddyfile"
 license = "MIT OR Apache-2.0"
-readme = "README.md"
 repository = "https://github.com/ops-pro/webfast"
-keywords = ["http", "web-server", "static", "caddyfile", "http3"]
-categories = ["web-programming::http-server"]
 publish = false
 
-[lib]
-name = "webfast"
-path = "src/lib.rs"
-
-[[bin]]
-name = "webfast"
-path = "src/main.rs"
-
-[features]
-default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme"]
-# Compressed variants of the site files that have no precompressed sibling, made in the background
-# when asked for (src/variants.rs).
-# Automatic certificates from an ACME CA for the sites that have no `tls` files (src/acme,
-# docs/acme.md); without the feature such a site is an error at start.
-acme = ["dep:instant-acme", "dep:rcgen", "dep:hyper-rustls"]
-compress-files = []
-# `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
-rate-limit = []
-# `cache`: proxied responses kept in memory, in the cache-handler plugin's syntax (src/cache.rs).
-proxy-cache = []
-# mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
-# JWT validation at the edge (src/jwt), on when WEB_JWT_CONFIG names its file; without the feature
-# none of its code or dependencies is built.
-jwt = ["dep:hyper-rustls", "dep:serde", "dep:serde-saphyr"]
-# OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
-# file; without the feature none of its code or dependencies is built.
-api-firewall = ["dep:hyper-rustls", "dep:jsonschema", "dep:serde", "dep:serde-saphyr"]
-
-[dependencies]
-anyhow = "1"
-# JWKS over HTTPS (src/jwt), the Mozilla roots built in: the image has no CA store.
-hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "aws-lc-rs", "webpki-roots", "tls12"] }
-# OpenAPI schemas compiled into validators once (src/apifw); no fetching of remote references.
-jsonschema = { version = "0.60", optional = true, default-features = false }
-serde = { version = "1", optional = true, features = ["derive"] }
-# The YAML of the JWT and API firewall files and of OpenAPI specs (src/yaml.rs): pure Rust, with
-# limits on what a document may expand to.
-serde-saphyr = { version = "2.1", optional = true, default-features = false, features = ["deserialize"] }
-# The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
-# requests load them without counting references.
-# Keys of the proxy cache hashed with a per-process random key: safe against made-up collisions
-# like SipHash, at a fraction of its cost (src/cache.rs).
+# The versions every crate of the workspace uses (a crate names what it needs with
+# `workspace = true`); the comments on why a crate is there are in crates/webfast-core/Cargo.toml.
+[workspace.dependencies]
+webfast-core = { path = "crates/webfast-core", default-features = false }
 ahash = "0.8"
+anyhow = "1"
 arc-swap = "1"
-# SHA-256 of the files that may be compression dictionaries (src/files.rs) and JWT signatures
-# with keys parsed once (src/jwt); already the TLS
-# backend, with the same features as rustls asks for.
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 blake3 = "1"
 brotli = "8"
 bytes = "1"
-# gzip on zlib-rs, which rustls already brings for certificate compression: faster than the default
-# miniz_oxide backend, no crate added.
 flate2 = { version = "1", features = ["zlib-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
@@ -74,45 +31,34 @@ http-body = "1"
 http-body-util = "0.1"
 httpdate = "1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs", "webpki-roots", "tls12"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful", "client-legacy", "http1", "http2"] }
-# The ACME client (src/acme): accounts, orders, challenges, through the server's own HTTPS client
-# (its own would bring the platform verifier and a second root store); the CSR and the TLS-ALPN-01 certificate
-# with rcgen; time: the renewal window of ARI (the time crate already comes with rcgen).
-instant-acme = { version = "0.8", optional = true, default-features = false, features = ["aws-lc-rs", "rcgen", "time"] }
+instant-acme = { version = "0.8", default-features = false, features = ["aws-lc-rs", "rcgen", "time"] }
 ipnet = "2"
-# Files kept in memory as LZ4 blocks (src/files.rs): the fast codec, with bounds-checked decoding.
-# mi_collect: threads that worked at startup give their free memory back (src/lib.rs).
-libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
+jsonschema = { version = "0.60", default-features = false }
+libc = "0.2"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "checked-decode"] }
-mimalloc = { version = "0.1", default-features = false, optional = true }
+mimalloc = { version = "0.1", default-features = false }
 percent-encoding = "2"
-rcgen = { version = "0.14", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"
 rustc-hash = "2"
-# brotli, zlib: TLS certificate compression (RFC 8879) for the clients that offer it (src/tls.rs).
 rustls = { version = "0.23", features = ["brotli", "zlib"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 serde_json = "1"
-# Socket options for the listening TCP and UDP sockets (src/sockets.rs).
 socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 walkdir = "2"
 zstd = "0.14"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# TCP_DEFER_ACCEPT, which socket2 does not cover.
-libc = "0.2"
-
-[dev-dependencies]
-# Tests read RSA keys' modulus and exponent back to write JWKS (src/jwt).
-aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "ring-io"] }
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-tempfile = "3"
-tokio-stream = "0.1"
 
 [profile.release]
 # One codegen unit and whole-program LTO: slower builds, faster code (measured in README.md).

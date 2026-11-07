@@ -1,0 +1,118 @@
+[package]
+name = "webfast-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The webfast server as a library: sites from memory, the proxy, HTTP/1.1, HTTP/2 and HTTP/3, the Caddyfile, and the API modules are written against (docs/modules.md)"
+readme = "../../README.md"
+keywords = ["http", "web-server", "static", "caddyfile", "http3"]
+categories = ["web-programming::http-server"]
+
+[lib]
+name = "webfast_core"
+path = "src/lib.rs"
+
+[features]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme"]
+# Automatic certificates from an ACME CA for the sites that have no `tls` files (src/acme,
+# docs/acme.md); without the feature such a site is an error at start.
+acme = ["dep:instant-acme", "dep:rcgen", "dep:hyper-rustls"]
+# Compressed variants of the site files that have no precompressed sibling, made in the background
+# when asked for (src/variants.rs).
+compress-files = []
+# `rate_limit`: requests per key and window, in the caddy-ratelimit plugin's syntax (src/ratelimit.rs).
+rate-limit = []
+# `cache`: proxied responses kept in memory, in the cache-handler plugin's syntax (src/cache.rs).
+proxy-cache = []
+# mimalloc's `mi_collect` after startup (src/lib.rs `release_free_memory`); the binary sets
+# mimalloc as the global allocator under its own feature of the same name.
+mimalloc = ["dep:libmimalloc-sys"]
+# The server's own HTTPS client (src/fetch.rs), with the Mozilla roots built in: the image has no
+# CA store. What the JWT keys, the API specs and a module's feeds are fetched with.
+fetch = ["dep:hyper-rustls"]
+# JWT validation at the edge (src/jwt), on when WEB_JWT_CONFIG names its file; without the feature
+# none of its code or dependencies is built.
+jwt = ["fetch"]
+# OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
+# file; without the feature none of its code or dependencies is built.
+api-firewall = ["fetch", "dep:jsonschema"]
+# The test harness (src/harness.rs): a server booted from a Caddyfile string and raw HTTP/1.1 to
+# it, for the integration tests of the modules.
+test-harness = ["dep:tempfile"]
+
+[dependencies]
+anyhow.workspace = true
+# JWKS over HTTPS (src/jwt), the Mozilla roots built in: the image has no CA store.
+hyper-rustls = { workspace = true, optional = true }
+# OpenAPI schemas compiled into validators once (src/apifw); no fetching of remote references.
+jsonschema = { workspace = true, optional = true }
+# The YAML of the JWT and API firewall files, of OpenAPI specs and of the modules' own files
+# (src/yaml.rs): pure Rust, with limits on what a document may expand to.
+serde.workspace = true
+serde-saphyr.workspace = true
+# The site files and ready answers as snapshots replaced whole when files change (src/watch.rs);
+# requests load them without counting references.
+# Keys of the proxy cache hashed with a per-process random key: safe against made-up collisions
+# like SipHash, at a fraction of its cost (src/cache.rs).
+ahash.workspace = true
+arc-swap.workspace = true
+# SHA-256 of the files that may be compression dictionaries (src/files.rs) and JWT signatures
+# with keys parsed once (src/jwt); already the TLS
+# backend, with the same features as rustls asks for.
+aws-lc-rs.workspace = true
+blake3.workspace = true
+brotli.workspace = true
+bytes.workspace = true
+# gzip on zlib-rs, which rustls already brings for certificate compression: faster than the default
+# miniz_oxide backend, no crate added.
+flate2.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+# The ACME client (src/acme): accounts, orders, challenges, through the server's own HTTPS client
+# (its own would bring the platform verifier and a second root store); the CSR and the TLS-ALPN-01 certificate
+# with rcgen; time: the renewal window of ARI (the time crate already comes with rcgen).
+instant-acme = { workspace = true, optional = true }
+ipnet.workspace = true
+# Files kept in memory as LZ4 blocks (src/files.rs): the fast codec, with bounds-checked decoding.
+# mi_collect: threads that worked at startup give their free memory back (src/lib.rs).
+libmimalloc-sys = { workspace = true, optional = true }
+lz4_flex.workspace = true
+percent-encoding.workspace = true
+rcgen = { workspace = true, optional = true }
+quinn.workspace = true
+regex.workspace = true
+rustc-hash.workspace = true
+# brotli, zlib: TLS certificate compression (RFC 8879) for the clients that offer it (src/tls.rs).
+rustls.workspace = true
+serde_json.workspace = true
+# Socket options for the listening TCP and UDP sockets (src/sockets.rs).
+socket2.workspace = true
+# The harness's site directories (src/harness.rs).
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+walkdir.workspace = true
+zstd.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# TCP_DEFER_ACCEPT, which socket2 does not cover; SIGHUP for `webfast reload` (src/run.rs).
+libc.workspace = true
+
+[dev-dependencies]
+# Tests read RSA keys' modulus and exponent back to write JWKS (src/jwt).
+aws-lc-rs = { workspace = true, features = ["ring-io"] }
+rcgen.workspace = true
+tempfile.workspace = true
+tokio-stream.workspace = true

@@ -1,13 +1,25 @@
 # Development
 
-Rust 1.89 or later (`rust-version` in Cargo.toml; CI checks it). Everything below also runs in
-Docker, so the host needs nothing but Docker and a POSIX shell.
+Rust 1.89 or later (`rust-version` in the workspace's Cargo.toml; CI checks it). Everything below
+also runs in Docker, so the host needs nothing but Docker and a POSIX shell.
 
 ## Layout
 
+A Cargo workspace: `crates/webfast-core` is the server as a library (`webfast_core`), `crates/webfast`
+the binary (`src/main.rs`, `src/compose.rs`: which modules it is built with). The modules are
+crates written against the core's API (docs/modules.md) in
+[webfast-modules](https://github.com/ops-pro/webfast-modules) (`crates/webfast-ngfw`,
+`crates/webfast-challenge`), compiled in through `compose.rs`. `cargo build --release`
+at the root builds the binary (the workspace's default member); `cargo test --workspace` runs every
+test. Paths below are relative to the crate (`src/` of the core unless said otherwise).
+
 | Path                                             | What                                                                                                |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `src/main.rs`                                    | the `webfast` command: `run`, `validate`, `healthcheck`; the environment                            |
+| `src/run.rs`                                     | the `webfast` command: `run`, `validate`, `reload`, `healthcheck`; the environment; the reload loop |
+| `src/module.rs`                                  | the module API: `Module`, directives, `RouteHandler`, `Check`, `Inspect`, the composition, the registry |
+| `src/extensions.rs`                              | the hook traits and the compile-time composition of the core's extensions and the modules' slots |
+| `src/harness.rs`                                 | the test harness (feature `test-harness`): a server from a Caddyfile text, raw HTTP/1.1 to it      |
+| `webfast/src/main.rs`, `webfast/src/compose.rs`  | the binary: the allocator, the vDSO shim, `run::main` with the composition of the modules            |
 | `src/caddyfile.rs`                               | Caddyfile syntax: tokens, `{$ENV}`, snippets, imports, the block tree                               |
 | `src/config.rs`                                  | from the tree to servers, sites and handler chains; the subset and its errors                       |
 | `src/handler.rs`                                 | the handler chain, as Caddy runs it                                                                 |
@@ -34,14 +46,14 @@ Docker, so the host needs nothing but Docker and a POSIX shell.
 | `tests/dictionaries.rs`                          | compression dictionaries: `dcz` deltas to a file or to a replaced version                           |
 | `tests/disk.rs`                                  | files over `WEB_MAX_FILE_IN_MEMORY`, streamed from disk                                             |
 | `tests/early_hints.rs`                           | `respond 103`: Early Hints over HTTP/3, the headers with the final response elsewhere               |
-| `tests/reload.rs`                                | reloading the configuration, in process and with SIGHUP to the binary                               |
+| `webfast/tests/reload.rs`                        | reloading the configuration, in process and with SIGHUP to the binary                               |
 | `tests/ratelimit.rs`                             | `rate_limit`: zones, 429 and `handle_errors`, ready answers, reloads                                |
 | `tests/upstream_limit.rs`                        | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, against an upstream that holds its answers                      |
 | `tests/cache.rs`                                 | `cache`: hits in every encoding, what is not stored, stale answers, the upstream's own encodings    |
 | `recipes/`                                       | configurations for common setups (static site, SPA, app behind, behind a proxy, TLS, systemd)       |
-| `examples/train.rs`                              | the PGO workload, and the sample site (`train site <dir>`)                                          |
-| `examples/bench.rs`                              | the handler chain in process: time, TSC ticks, allocations per request                              |
-| `examples/rtt.rs`                                | the client of `bench/rtt.sh`                                                                        |
+| `webfast/examples/train.rs`                      | the PGO workload, and the sample site (`train site <dir>`)                                          |
+| `webfast/examples/bench.rs`                      | the handler chain in process: time, TSC ticks, allocations per request                              |
+| `webfast/examples/rtt.rs`                        | the client of `bench/rtt.sh`                                                                        |
 | `sample/`                                        | the sample configuration: the image's, the PGO training's, compat's and the benchmarks'             |
 | `pgo/`                                           | the release build with profile-guided optimisation                                                  |
 | `compat/`                                        | the differential check against Caddy                                                                |

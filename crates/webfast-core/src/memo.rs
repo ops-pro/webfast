@@ -1,0 +1,636 @@
+//! Ready answers for the site's files. The files do not change between rescans (src/watch.rs), so
+//! when a site's routes decide by the request path alone (plus Accept-Encoding), the answer for
+//! every path that serves a file — status 200 with all its headers, and the 304 for its ETag — is
+//! worked out at startup, and again after the files changed, by running the real handler chain; a
+//! request for that path is then a table lookup and a copy of a header map.
+//!
+//! Kept are only answers that `file_server` gave from a stored file unchanged (not compressed on
+//! the fly), and the redirects `redir` gave to a target made of the path alone (`{re.html.1}`,
+//! `{path}/`: a site's `.html` and trailing-slash redirects, asked for its files' paths with
+//! `.html` or without the slash). What a request's Accept-Encoding changes is decided by which of
+//! zstd, br and gzip it accepts and how their q-values compare — 26 cases in all — so answers are
+//! prepared for each and any Accept-Encoding finds its own. Everything else goes through the chain
+//! as before: other paths or other spellings of them, ranges, If-Match, an If-None-Match that is
+//! not exactly the answer's ETag (a redirect has none), methods other than GET and HEAD.
+//!
+//! A site whose routes answer every request alike — a `respond` without placeholders, before it
+//! only `root` and fixed `header`s, none behind a matcher (a health or placeholder site) — gets
+//! that one answer, worked out by running its chain once, for any method, path and header.
+
+use crate::body::{Body, empty, full};
+use crate::encode::AcceptEncoding;
+use crate::files::{FileEntry, FileStore};
+use crate::handler::{ConnInfo, Ctx, Handler, HeaderOp, Next, Route, Value, encode_path};
+use crate::matcher::{Matcher, MatcherSet};
+use crate::static_files::AVAILABLE_DICTIONARY;
+use bytes::Bytes;
+use http::header::{ACCEPT_ENCODING, ETAG, IF_MATCH, IF_NONE_MATCH, RANGE};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// One Accept-Encoding value for every signature (src/encode.rs): q-values 0, 0.2, 0.5 or 1 for
+/// each of zstd, br and gzip give every way they can be accepted and ordered.
+fn every_preference() -> Vec<(u16, String)> {
+    const Q: [f32; 4] = [0.0, 0.2, 0.5, 1.0];
+    let mut out: Vec<(u16, String)> = Vec::new();
+    for zstd in Q {
+        for br in Q {
+            for gzip in Q {
+                let value = [("zstd", zstd), ("br", br), ("gzip", gzip)]
+                    .iter()
+                    .filter(|(_, q)| *q > 0.0)
+                    .map(|(name, q)| format!("{name};q={q}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut headers = HeaderMap::new();
+                if let Ok(header) = HeaderValue::from_str(&value) {
+                    headers.insert(ACCEPT_ENCODING, header);
+                }
+                let signature = AcceptEncoding::parse(&headers).signature();
+                if !out.iter().any(|(s, _)| *s == signature) {
+                    out.push((signature, value));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Marks a request sent through the chain to prepare answers: `file_server` then marks its
+/// response with `FromFile`, and `reverse_proxy` answers 502 at once instead of calling the
+/// upstream (such answers are never kept).
+#[derive(Debug, Clone, Copy)]
+pub struct Preparing;
+
+/// Set by a handler that the request would have gone through differently live (a `rate_limit`
+/// zone takes it): the answer is not kept.
+#[derive(Debug, Clone, Copy)]
+pub struct Unkept;
+
+/// The response being made is to be kept as a ready answer.
+pub fn keeps(request: &http::request::Parts) -> bool {
+    request.extensions.get::<Preparing>().is_some() && request.extensions.get::<Unkept>().is_none()
+}
+
+/// Marks a response that `file_server` made from a stored file as it is, and names the file
+/// (`encode` takes the mark off when it compresses the body). Only for `Preparing` requests:
+/// inserting it costs an allocation, which other requests need not pay.
+#[derive(Debug, Clone)]
+pub struct FromFile(pub Arc<FileEntry>);
+
+/// Marks a redirect `redir` made to a target that only the path decides, without a body. Only for
+/// `Preparing` requests, as `FromFile`.
+#[derive(Debug, Clone, Copy)]
+pub struct Redirected;
+
+/// A path's answer for each prepared Accept-Encoding signature.
+type PerSignature = Box<[Option<Arc<Answer>>]>;
+
+pub struct Answers {
+    /// The Accept-Encoding signatures answers were prepared for.
+    signatures: Vec<u16>,
+    /// Request path (as sent) → its answer for each signature, in that order. Looked up first, so a
+    /// request without a ready answer costs one hash lookup.
+    paths: FxHashMap<Box<str>, PerSignature>,
+    /// Bytes of the header values kept for good (interned).
+    strings: usize,
+    /// The site answers every request alike (`constant`): that answer, whatever the request.
+    constant: Option<Constant>,
+}
+
+/// The one answer of a site whose routes answer every request alike: a `respond` without
+/// placeholders, before it only `root` and `header` with fixed values, none of them behind a
+/// matcher or in a `handle` group. Worked out by running the chain once.
+struct Constant {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+struct Answer {
+    /// 200, or a redirect's 3xx.
+    status: StatusCode,
+    headers: HeaderMap,
+    /// The file sent: its bytes are taken (or, kept in LZ4, decompressed) for each response, never
+    /// copied into the answer. `None`: a redirect, without a body.
+    file: Option<Arc<FileEntry>>,
+    etag: Option<HeaderValue>,
+    /// The 304 for an If-None-Match of exactly `etag`.
+    not_modified: Option<HeaderMap>,
+}
+
+impl Answer {
+    /// The same answer (bodies compared by where they are first: a file's body is one buffer).
+    fn same(&self, other: &Answer) -> bool {
+        let same_file = match (&self.file, &other.file) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_file
+            && self.status == other.status
+            && self.headers == other.headers
+            && self.etag == other.etag
+            && self.not_modified == other.not_modified
+    }
+}
+
+impl Answers {
+    /// The ready answer for this request, if there is one.
+    pub fn answer(&self, request: &http::request::Parts) -> Option<Response<Body>> {
+        // Any method, any path, any header: the chain would give this whatever they are.
+        if let Some(constant) = &self.constant {
+            let mut response = Response::new(full(constant.body.clone()));
+            *response.status_mut() = constant.status;
+            *response.headers_mut() = with_room(&constant.headers);
+            return Some(response);
+        }
+        let head = match request.method {
+            Method::GET => false,
+            Method::HEAD => true,
+            _ => return None,
+        };
+        let answers = self.paths.get(request.uri.path())?;
+        let headers = &request.headers;
+        // A client offering a compression dictionary (RFC 9842) may get a delta: the chain decides.
+        if headers.contains_key(RANGE) || headers.contains_key(IF_MATCH) || headers.contains_key(AVAILABLE_DICTIONARY) {
+            return None;
+        }
+        let signature = AcceptEncoding::parse(headers).signature();
+        let variant = self.signatures.iter().position(|s| *s == signature)?;
+        let answer = answers[variant].as_ref()?;
+        // A compressed variant (src/variants.rs) answered from here counts as asked for.
+        if let Some(file) = &answer.file {
+            file.touch();
+        }
+        if let Some(if_none_match) = headers.get(IF_NONE_MATCH) {
+            // What browsers send back is the ETag they got; anything else takes the long way.
+            let (Some(etag), Some(not_modified)) = (&answer.etag, &answer.not_modified) else {
+                return None;
+            };
+            if if_none_match != etag {
+                return None;
+            }
+            let mut response = Response::new(empty());
+            *response.status_mut() = StatusCode::NOT_MODIFIED;
+            *response.headers_mut() = with_room(not_modified);
+            return Some(response);
+        }
+        let body = match &answer.file {
+            Some(file) if !head => full(file.body()),
+            _ => empty(),
+        };
+        let mut response = Response::new(body);
+        *response.status_mut() = answer.status;
+        *response.headers_mut() = with_room(&answer.headers);
+        Some(response)
+    }
+
+    /// Paths with a ready answer for today's browsers ("gzip, deflate, br, zstd").
+    pub fn paths(&self) -> usize {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br, zstd"));
+        let signature = AcceptEncoding::parse(&headers).signature();
+        let Some(variant) = self.signatures.iter().position(|s| *s == signature) else {
+            return 0;
+        };
+        self.paths.values().filter(|answers| answers[variant].is_some()).count()
+    }
+
+    /// Memory the answers hold, counted from their parts: header maps, the path table, the
+    /// header values. Bodies are not counted: they are the files' own bytes.
+    pub fn bytes(&self) -> u64 {
+        use std::mem::size_of;
+        fn map(headers: &HeaderMap) -> usize {
+            let slots = headers.capacity();
+            slots * (size_of::<http::HeaderName>() + size_of::<HeaderValue>() + 16) + slots.next_power_of_two() * 4
+        }
+        let mut seen = FxHashSet::default();
+        let mut total = self.strings;
+        if let Some(constant) = &self.constant {
+            total += size_of::<Constant>() + map(&constant.headers) + constant.body.len();
+        }
+        for (path, answers) in &self.paths {
+            total += path.len() + size_of::<(Box<str>, PerSignature)>() + 8;
+            total += answers.len() * size_of::<Option<Arc<Answer>>>();
+            for answer in answers.iter().flatten() {
+                if seen.insert(Arc::as_ptr(answer)) {
+                    total += size_of::<Answer>() + 16 + map(&answer.headers);
+                    total += answer.not_modified.as_ref().map_or(0, map);
+                }
+            }
+        }
+        total as u64
+    }
+
+    /// Distinct answers held (several signatures often share one).
+    pub fn answers(&self) -> usize {
+        let mut seen = FxHashSet::default();
+        for answer in self.paths.values().flat_map(|answers| answers.iter().flatten()) {
+            seen.insert(Arc::as_ptr(answer));
+        }
+        seen.len() + usize::from(self.constant.is_some())
+    }
+
+    /// Works the answers out by running `routes` for every path that may serve a file, the paths
+    /// shared out over threads, one per CPU, each with its own runtime (it blocks until done);
+    /// `None` when the routes look at more of a request than its path (then nothing can be
+    /// prepared).
+    pub fn prepare(routes: &Arc<[Route]>, tls: bool) -> Option<Answers> {
+        if constant(routes) {
+            return Constant::prepare(routes, tls).map(|constant| Answers {
+                signatures: Vec::new(),
+                paths: FxHashMap::default(),
+                strings: 0,
+                constant: Some(constant),
+            });
+        }
+        if !decided_by_path(routes) {
+            return None;
+        }
+        let mut stores = Vec::new();
+        collect_stores(routes, &mut stores);
+        let candidates = candidate_paths(&stores);
+        let conn = Arc::new(ConnInfo {
+            remote: SocketAddr::from(([127, 0, 0, 1], 0)),
+            tls,
+            trusted: false,
+            sni: None,
+        });
+        let (signatures, accepts): (Vec<u16>, Vec<String>) = every_preference().into_iter().unzip();
+        let accepts: Arc<[String]> = accepts.into();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(candidates.len())
+            .max(1);
+        let mut shares: Vec<Vec<String>> = vec![Vec::new(); workers];
+        for (i, path) in candidates.into_iter().enumerate() {
+            shares[i % workers].push(path);
+        }
+        // The threads only work answers out; what is kept is built here, so their memory (chain
+        // runs, buffers) goes back whole when they end instead of being pinned by a few answers.
+        let drafted = crate::files::on_every_cpu(&shares, |share| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to prepare answers on");
+            runtime.block_on(async {
+                let mut drafts = Vec::new();
+                for path in share {
+                    let (answers, slots) = prepare_path(routes, &conn, path, &accepts).await;
+                    if !answers.is_empty() {
+                        drafts.push((path.clone(), answers, slots));
+                    }
+                }
+                drafts
+            })
+        });
+        let mut strings = FxHashSet::default();
+        let mut paths = FxHashMap::default();
+        for (path, drafts, slots) in drafted.into_iter().flatten() {
+            let kept: Vec<Arc<Answer>> = drafts.iter().map(|draft| Arc::new(draft.kept(&mut strings))).collect();
+            let answers: PerSignature = slots.iter().map(|slot| slot.map(|i| kept[i].clone())).collect();
+            paths.insert(Box::from(path.as_str()), answers);
+        }
+        let strings = strings.iter().map(|s: &&str| s.len()).sum();
+        Some(Answers {
+            signatures,
+            paths,
+            strings,
+            constant: None,
+        })
+    }
+}
+
+impl Constant {
+    /// The answer of the chain to a GET of `/`, the same as to any request (`constant`).
+    fn prepare(routes: &Arc<[Route]>, tls: bool) -> Option<Constant> {
+        let conn = Arc::new(ConnInfo {
+            remote: SocketAddr::from(([127, 0, 0, 1], 0)),
+            tls,
+            trusted: false,
+            sni: None,
+        });
+        // On a thread of its own with its own runtime, as the files' answers: this is called from
+        // the server's start, itself on a runtime.
+        let (parts, body) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    runtime.block_on(async {
+                        let response = run(routes, &conn, "/", "", None).await?;
+                        let (parts, body) = response.into_parts();
+                        let body = body.collect().await.ok()?.to_bytes();
+                        Some((parts, body))
+                    })
+                })
+                .join()
+                .ok()
+                .flatten()
+        })?;
+        let mut strings = FxHashSet::default();
+        Some(Constant {
+            status: parts.status,
+            headers: permanent(&parts.headers, &mut strings),
+            body,
+        })
+    }
+}
+
+/// Whether the routes answer every request alike (`Constant`): reached in order, each route before
+/// the `respond` has no matcher and no `handle` group (a group's run skips the rest of it) and only
+/// sets the root or fixed response headers; the `respond` has no placeholders and is not 103 (Early
+/// Hints go on to the next route).
+fn constant(routes: &[Route]) -> bool {
+    for route in routes {
+        if route.matcher.is_some() || route.group.is_some() {
+            return false;
+        }
+        match &route.handler {
+            Handler::Root(_) => {}
+            Handler::Header {
+                ops, dynamic: false, ..
+            } => {
+                let fixed = ops.iter().all(|op| match op {
+                    HeaderOp::Set(_, value) | HeaderOp::Add(_, value) | HeaderOp::Default(_, value) => {
+                        matches!(value, Value::Static(_))
+                    }
+                    HeaderOp::Delete(_) | HeaderOp::DeletePrefix(_) => true,
+                });
+                if !fixed {
+                    return false;
+                }
+            }
+            Handler::Respond { status, body, .. } => {
+                return *status != Some(StatusCode::EARLY_HINTS) && body.is_ready();
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+impl Answer {
+    /// The answer to keep: its header values made `'static` (interned; `strings` collects those it
+    /// uses), allocated by the calling thread.
+    fn kept(&self, strings: &mut FxHashSet<&'static str>) -> Answer {
+        let headers = permanent(&self.headers, strings);
+        Answer {
+            status: self.status,
+            etag: headers.get(ETAG).cloned(),
+            not_modified: self.not_modified.as_ref().map(|h| permanent(h, strings)),
+            headers,
+            file: self.file.clone(),
+        }
+    }
+}
+
+/// A path's distinct answers, and for each Accept-Encoding preference which of them (the same
+/// sibling chosen: the same answer).
+async fn prepare_path(
+    routes: &Arc<[Route]>,
+    conn: &Arc<ConnInfo>,
+    path: &str,
+    accepts: &[String],
+) -> (Vec<Answer>, Vec<Option<usize>>) {
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut slots = Vec::with_capacity(accepts.len());
+    for accept in accepts {
+        let slot = prepare_one(routes, conn, path, accept).await.map(|answer| {
+            answers.iter().position(|other| other.same(&answer)).unwrap_or_else(|| {
+                answers.push(answer);
+                answers.len() - 1
+            })
+        });
+        slots.push(slot);
+    }
+    (answers, slots)
+}
+
+/// A draft: the chain's own header maps.
+async fn prepare_one(routes: &Arc<[Route]>, conn: &Arc<ConnInfo>, path: &str, accept: &str) -> Option<Answer> {
+    let response = run(routes, conn, path, accept, None).await?;
+    let status = response.status();
+    if status.is_redirection() && response.extensions().get::<Redirected>().is_some() {
+        // Its If-None-Match, Range and If-Match change nothing, but such requests take the chain.
+        return Some(Answer {
+            status,
+            headers: response.into_parts().0.headers,
+            file: None,
+            etag: None,
+            not_modified: None,
+        });
+    }
+    if status != StatusCode::OK {
+        return None;
+    }
+    let file = response.extensions().get::<FromFile>()?.0.clone();
+    let (parts, _) = response.into_parts();
+    let headers = parts.headers;
+    let etag = headers.get(ETAG).cloned();
+    let mut not_modified = None;
+    if let Some(etag) = &etag
+        && let Some(response) = run(routes, conn, path, accept, Some(etag.clone())).await
+        && response.status() == StatusCode::NOT_MODIFIED
+        && response.extensions().get::<FromFile>().is_some()
+    {
+        not_modified = Some(response.into_parts().0.headers);
+    }
+    Some(Answer {
+        status,
+        headers,
+        file: Some(file),
+        etag,
+        not_modified,
+    })
+}
+
+/// One GET through the chain, as a client would send it.
+async fn run(
+    routes: &Arc<[Route]>,
+    conn: &Arc<ConnInfo>,
+    path: &str,
+    accept: &str,
+    if_none_match: Option<HeaderValue>,
+) -> Option<Response<Body>> {
+    let mut request = Request::get(path);
+    if !accept.is_empty() {
+        request = request.header(ACCEPT_ENCODING, accept);
+    }
+    if let Some(etag) = if_none_match {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    let (mut parts, body) = request.body(empty()).ok()?.into_parts();
+    parts.extensions.insert(Preparing);
+    let ctx = Ctx::new(conn.clone(), parts, body, conn.remote.ip());
+    Some(Next::start(routes.clone()).run(ctx).await)
+}
+
+/// A copy of a ready answer's header map with room for what every response gets on its way out
+/// (`Date`, `Alt-Svc`): a clone has none, and would grow at once.
+fn with_room(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len() + 2);
+    out.extend(headers.iter().map(|(name, value)| (name.clone(), value.clone())));
+    out
+}
+
+/// The header map with every value made `'static` (interned for the life of the process, the same
+/// value once however often answers are prepared again), so copying it for a response counts no
+/// references.
+fn permanent(headers: &HeaderMap, strings: &mut FxHashSet<&'static str>) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let value = match value.to_str() {
+            Ok(text) => {
+                let text = crate::files::intern(text);
+                strings.insert(text);
+                HeaderValue::from_static(text)
+            }
+            Err(_) => value.clone(),
+        };
+        out.append(name.clone(), value);
+    }
+    out
+}
+
+/// Request paths that may serve a stored file: the file's own path, without `.html`, and the
+/// directory of an index file — and that may redirect to one: the file's own `.html` path, the
+/// directory without its slash. Precompressed siblings are left out; the chain decides the rest.
+fn candidate_paths(stores: &[Arc<FileStore>]) -> Vec<String> {
+    let mut paths = FxHashSet::default();
+    for store in stores {
+        let files = store.files();
+        for file in files.paths() {
+            let sibling = [".br", ".zst", ".gz"]
+                .iter()
+                .any(|suffix| file.strip_suffix(suffix).is_some_and(|base| files.contains(base)));
+            // Files served from disk have no ready answer: each response opens the file.
+            let on_disk = files.file(file).is_some_and(|entry| entry.on_disk().is_some());
+            if sibling || on_disk {
+                continue;
+            }
+            paths.insert(encode_path(file));
+            if let Some(stem) = file.strip_suffix(".html") {
+                paths.insert(encode_path(stem));
+            }
+            for index in ["index.html", "index.txt"] {
+                if let Some(dir) = file.strip_suffix(index)
+                    && dir.ends_with('/')
+                {
+                    paths.insert(encode_path(dir));
+                    if dir.len() > 1 {
+                        paths.insert(encode_path(&dir[..dir.len() - 1]));
+                    }
+                }
+            }
+        }
+    }
+    let mut paths: Vec<String> = paths.into_iter().collect();
+    paths.sort();
+    paths
+}
+
+/// Every file store the routes read from.
+pub(crate) fn collect_stores(routes: &[Route], out: &mut Vec<Arc<FileStore>>) {
+    fn add(out: &mut Vec<Arc<FileStore>>, store: &Arc<FileStore>) {
+        if !out.iter().any(|s| Arc::ptr_eq(s, store)) {
+            out.push(store.clone());
+        }
+    }
+    fn from_matchers(set: &MatcherSet, out: &mut Vec<Arc<FileStore>>) {
+        for matcher in &set.matchers {
+            match matcher {
+                Matcher::File(file) => {
+                    if let Some(store) = &file.root {
+                        add(out, store);
+                    }
+                }
+                Matcher::Not(sets) => sets.iter().for_each(|s| from_matchers(s, out)),
+                _ => {}
+            }
+        }
+    }
+    for route in routes {
+        if let Some(set) = &route.matcher {
+            from_matchers(set, out);
+        }
+        match &route.handler {
+            Handler::Root(store) => add(out, store),
+            Handler::Files(files) => {
+                if let Some(store) = &files.root {
+                    add(out, store);
+                }
+            }
+            Handler::Subroute(list) => collect_stores(list, out),
+            _ => {}
+        }
+    }
+}
+
+/// The routes reach their decisions and build their responses from the request path alone (and
+/// Accept-Encoding, which the answers are keyed by): no matcher on host, method, headers or
+/// addresses, no `request_header`, no placeholder other than path-derived ones. What a request is
+/// answered with by a handler that ends the chain elsewhere (respond, proxy, a redirect to a target
+/// that is not the path's alone) does not matter: those answers are never kept.
+fn decided_by_path(routes: &[Route]) -> bool {
+    routes.iter().all(|route| {
+        route.matcher.as_ref().is_none_or(MatcherSet::depends_on_path_only)
+            && match &route.handler {
+                Handler::Header { ops, .. } => ops.iter().all(HeaderOp::depends_on_path_only),
+                Handler::RequestHeader(_) => false,
+                Handler::Rewrite(to) => to.depends_on_path_only(),
+                Handler::Subroute(list) => decided_by_path(list),
+                Handler::Root(_)
+                | Handler::RequestBody(_)
+                | Handler::StripPrefix(_)
+                | Handler::Encode(_)
+                | Handler::Files(_)
+                | Handler::Redir { .. }
+                | Handler::Respond { .. }
+                | Handler::Error { .. }
+                | Handler::Proxy(_) => true,
+                // A path that a zone takes gets no ready answer (`Unkept`); the zones must
+                // tell those paths by the path.
+                #[cfg(feature = "rate-limit")]
+                Handler::RateLimit(limit) => limit.decided_by_path(),
+                // A module's handler says so itself: the paths it decides on get no ready answer
+                // (`Unkept`), and it must tell them by the path.
+                Handler::Extension(handler) => handler.decided_by_path(),
+                // It keeps only proxied answers, which are never ready ones.
+                #[cfg(feature = "proxy-cache")]
+                Handler::Cache(_) => true,
+            }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_way_to_accept_and_order_three_encodings() {
+        // Accepted subsets and their weak orders: 1 + 3·1 + 3·3 + 13.
+        let preferences = every_preference();
+        assert_eq!(preferences.len(), 26);
+        let browsers = [
+            "gzip, deflate, br, zstd",
+            "gzip, deflate, br",
+            "gzip, deflate",
+            "",
+            "br",
+            "*",
+        ];
+        for value in browsers {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(value));
+            let signature = AcceptEncoding::parse(&headers).signature();
+            assert!(preferences.iter().any(|(s, _)| *s == signature), "{value:?}");
+        }
+    }
+}

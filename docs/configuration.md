@@ -343,7 +343,10 @@ the default build; without one, none of its code or dependencies is built) and i
 its YAML file is named — the Caddyfile stays Caddy's. A file that does not load stops the server
 at startup with the reason; `webfast validate` loads them too and says what it found. A
 refused request is answered, and logged in the site's access log, like any other. Each module
-also writes what it refused, and what `log_only` let through, to its own event log (below).
+also writes what it refused, and what `log_only` let through, to its own event log (below). The
+modules a binary is built with (the request filter, the browser challenge: crates of
+[webfast-modules](https://github.com/ops-pro/webfast-modules), docs/modules.md) add checks of
+their own before these two; their directives, files and variables are documented there.
 
 **What a check covers** is set in the module's own file, never in the Caddyfile, so an edit there
 cannot switch a check off. A JWT rule or an API covers requests in one of two ways:
@@ -566,7 +569,7 @@ Those an answer shows are checked by `compat/`:
   `insecure_off` turns it off. `WEB_TLS_STRICT_SNI=on` gives no certificate to a handshake without
   SNI or for a name no site names (Caddy: the default certificate).
 - JWT validation and OpenAPI request validation are built in (Request checks) and configured
-  outside the Caddyfile; Caddy needs plugins for either.
+  outside the Caddyfile; Caddy needs plugins for each.
 - Compression dictionaries (`dcz`): Caddy has none; the `Use-As-Dictionary` header is just a
   header to it.
 - Early Hints (`respond 103`) go out over HTTP/3 only (Caddy: over every protocol); a file's ready
@@ -594,6 +597,12 @@ Those an answer shows are checked by `compat/`:
   differ; only memory as storage.
 
 ## Environment
+
+The core's variables; the optional pieces of the core are the cargo features `rate-limit`,
+`proxy-cache`, `jwt`, `api-firewall`, `compress-files`, `acme` and `mimalloc`, on by default. A
+module compiled into the binary (the request filter, the browser challenge: crates of
+[webfast-modules](https://github.com/ops-pro/webfast-modules)) brings variables and directives of
+its own, documented there; a variable of a module the binary was built without stops the start.
 
 | Variable                           | Default     | What it sets                                                                                                                                                                                                                                                       |
 | ---------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

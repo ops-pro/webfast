@@ -2293,6 +2293,35 @@ dependencies = [
 name = "webfast"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "brotli",
+ "bytes",
+ "flate2",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mimalloc",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "webfast-core",
+ "zstd",
+]
+
+[[package]]
+name = "webfast-core"
+version = "0.1.2"
+dependencies = [
  "ahash",
  "anyhow",
  "arc-swap",
@@ -2316,7 +2345,6 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "lz4_flex",
- "mimalloc",
  "percent-encoding",
  "quinn",
  "rcgen",

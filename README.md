@@ -118,6 +118,22 @@ With one worker (`WEB_WORKERS=1`) a request at 1000 requests/s costs 49 µs, les
 - Every optional piece is a cargo feature, on by default, that costs nothing when it is off or
   unused ([docs/extensions.md](docs/extensions.md)).
 
+## Modules
+
+Modules are crates written against the core's public API ([docs/modules.md](docs/modules.md)) and
+compiled into the binary; they live in [webfast-modules](https://github.com/ops-pro/webfast-modules), with their
+documentation:
+
+- **Request filter (NGFW)** (`webfast-ngfw`, [docs/ngfw.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw.md)):
+  rules over the request's head and body and over proxied responses — scanners, probes, path
+  traversal, SQL, command, PHP, template and script injection, bad uploads, leaking error pages —
+  and access by country, ASN and address lists, with a ban list for repeat offenders. On when
+  `WEB_NGFW_CONFIG` names its file.
+- **Browser challenge** (`webfast-challenge`, [docs/challenge.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/challenge.md)):
+  a client proves it is a browser — a cookie, a script, a proof-of-work or a CAPTCHA — before a
+  site answers, for every request or only once a client is over a rate; a signed cookie, no state
+  per client, the same across replicas. On with the `challenge` directive.
+
 ## Quick start
 
 With Docker — the image serves `/srv` with the configuration at `/etc/webfast/Caddyfile` (until
@@ -128,7 +144,9 @@ replaced, [`sample/Caddyfile`](sample/Caddyfile), which sends what is not a file
 docker run --rm -p 8080:8080 -v "$PWD/public:/srv:ro" -v "$PWD/Caddyfile:/etc/webfast/Caddyfile:ro" ghcr.io/ops-pro/webfast:latest
 ```
 
-From source (Rust 1.89 or later):
+From source (Rust 1.89 or later; the repository is a Cargo workspace: `crates/webfast-core` is the
+server as a library, `crates/webfast` the binary with the modules it is built with, so
+`cargo build --release` at the root — or `cargo build --release -p webfast` — builds the binary):
 
 ```bash
 cargo build --release
@@ -155,6 +173,8 @@ HTTPS and HTTP/3 served directly, a hardened systemd service — each checked by
   where each cargo feature takes part.
 - [Extensions](docs/extensions.md): how the optional pieces plug in: hook traits composed at
   compile time, one worker and one memory budget.
+- [Modules](docs/modules.md): writing a module as a crate of its own against the core's API —
+  directives, route handlers, request checks and response inspectors, the test harness.
 - [Automatic certificates](docs/acme.md) and [upstream names](docs/dns.md): the designs.
 - [Performance](docs/performance.md): how it is built for speed, and every measurement.
 - [Development](docs/development.md): layout, checks, tests, the PGO build, the compatibility check

@@ -51,11 +51,19 @@ pub trait Representation: Send + Sync {
     fn choose(&self, file: &Arc<FileEntry>, store: &Arc<FileStore>, accept: Ranked<'_>) -> Chosen;
 }
 
-/// Sees a proxied response on its way to the client; may keep it.
-pub trait ResponseObserver: Send + Sync {
-    fn observe(&self, req: &Head, res: &mut http::response::Parts, body: Body) -> Body;
+/// Sees a proxied response on its way to the client; may keep it (the cache), or look at its
+/// start first and answer in its place (the request filter's response phase).
+pub trait ProxyObserver: Send + Sync {
+    async fn inspect(&self, pending: &mut Self::Pending, ctx: &mut Ctx, res: &mut http::response::Parts, body: Body)
+        -> Result<Body, Response<Body>> { Ok(body) }
+    fn observe(&self, pending: Self::Pending, sent: Sent<'_>, res: &mut http::response::Parts, body: Body) -> Body;
 }
 ```
+
+`inspect` has a default that does nothing; the proxy calls it for every observer, in order,
+before `observe`, and an `Err` is sent in the response's place (through the site's
+`handle_errors` when it carries `ErrorPage`). An observer that reads the start of the body gives
+back a body that yields the same bytes (the request filter's body.rs chains the frames read with the rest).
 
 `Result<Body, Response<Body>>` is the body to go on with, or the answer that refuses: exactly what
 `Checks::check` returns today; the trait only names it. The methods are `async fn` in traits
@@ -120,7 +128,8 @@ type ApiFirewall = Option<Arc<crate::apifw::ApiFirewall>>;
 #[cfg(not(feature = "api-firewall"))]
 type ApiFirewall = ();
 
-/// The checks before the routes, in order; `()` where a feature is off.
+/// The checks before the routes, in order; `()` where a feature is off. Today:
+/// `(Acme, (Modules, (Jwt, (ApiFirewall, ()))))`, and the proxy observers `(ModuleInspectors, (CacheObserver, ()))`.
 pub type RequestChecks = (Jwt, (ApiFirewall, ()));
 
 pub fn request_checks(config: &Config) -> RequestChecks {
@@ -151,11 +160,19 @@ Startup goes through the same file. `extensions::configure_from_env()` reads eac
 extension's `WEB_*` variables and stops the start on a variable of one that is not built (so
 `WEB_PROXY_CACHE_MEMORY` on a build without `proxy-cache` is an error, as a misspelt variable
 would be). `extensions::load_checks(&mut config)` loads the files `WEB_JWT_CONFIG` and
-`WEB_API_FIREWALL_CONFIG` name and gives back one line per extension for the startup log and
-`validate`. `extensions::Started` does what runs once the server does: `begin` before the servers
-take the configuration (the JWT keys start being read), `finish` with the ports' states (API specs
-given as a path are read through the first port's routes; the variants get the callback that redoes
-ready answers). `server.rs` and `main.rs` call these four and name no extension.
+`WEB_API_FIREWALL_CONFIG` name, then each composed module's own (`Module::load`), and gives back
+one line per extension for the startup log and `validate`. `extensions::Started` does what runs
+once the server does: `begin` before the servers take the configuration (the JWT keys start being
+read, the modules' `start`), `finish` with the ports' states (API specs given as a path are read
+through the first port's routes; the variants get the callback that redoes ready answers).
+`extensions::reload_checks()` is the SIGHUP's: each module's `reload` (a file read again, and one
+that does not load keeps the running state). `server.rs` and `run.rs` call these five and name no
+extension.
+
+The hooks are `&'static`, so an extension whose configuration must change on a reload keeps its
+state behind an `ArcSwap` and swaps it in place; the zero-sized proxy observer of such an
+extension finds its state through the composed hooks (`Ctx::hook`, below), as the cache's
+observer finds its store.
 
 When a hook must be chosen at run time — extensions configured per site, say — the same traits
 take a `Vec<Arc<dyn …>>` behind an object-safe wrapper; nothing in the core needs that today, and
@@ -181,11 +198,13 @@ means a new hook point, added to the core deliberately, with its own trait.
 ### Directives stay the parser's
 
 `rate_limit` and `cache` are Caddyfile directives and that is right: they belong in the chain,
-where the user puts them. The `Handler` enum keeps a variant per directive, and the parser keeps
-its `cfg`-gated arms. That is the one place `cfg` stays in the core besides `extensions.rs`, and
-it is where a reader expects to find a directive. A directive that needs a hook elsewhere (the
-cache in the proxy) registers it through `extensions.rs` like any other, instead of being called
-by name from `reverse_proxy`.
+where the user puts them. The `Handler` enum keeps a variant per directive of the core, and the
+parser keeps its `cfg`-gated arms. That is the one place `cfg` stays in the core besides
+`extensions.rs`, and it is where a reader expects to find a directive. A directive that needs a
+hook elsewhere (the cache in the proxy) registers it through `extensions.rs` like any other,
+instead of being called by name from `reverse_proxy`. A module's directive (docs/modules.md) is
+not in the match: the parser asks the registry of the installed modules for a name it does not
+know, and its routes run `Handler::Extension(Arc<dyn RouteHandler>)`.
 
 ### Background work through one worker shape
 
@@ -253,9 +272,28 @@ path but a `try_send` and an atomic mark.
 - **No `cfg` outside `extensions.rs`, the parser and the modules themselves:** the request path
   reads as one thing. A reviewer sees one call per hook point, not five extensions' branches.
 
+## Modules of other crates
+
+The extensions above are the core's own: a slot in `src/extensions.rs` and a `cfg` pair each.
+The request filter and the browser challenge are not: they are modules written against the
+core's public API (`webfast_core::module`, docs/modules.md) as crates of their own
+(`webfast-ngfw`, `webfast-challenge` in [webfast-modules](https://github.com/ops-pro/webfast-modules)),
+composed by the binary (crates/webfast/src/compose.rs), and the core names neither. They take part through two slots of
+the tuples here — `Modules` among the request checks (after the ACME answer, before the JWT) and
+`ModuleInspectors` among the proxy observers (before the cache) — each calling the set the binary
+composed through one `&'static dyn`. The set is still a tuple, written in the binary; the dyn
+call is one vtable call per request for the whole set, and its protocol is synchronous first
+(`Check::head` decides, `Check::body` boxes a future only for a body; `Inspect::covers`, then
+`inspect`), so a clean request allocates nothing for them, as before. `Hooks::get::<T>()` finds a
+module's leaf by its type among the composed sets, which is how a zero-sized observer finds its
+module (`Ctx::hook`). The JWT and API firewall could move out the same way; the upstream checks
+they use would take the same protocol.
+
 ## Writing an extension, then
 
-1. Add the feature in `Cargo.toml` and the gated module in `src/lib.rs`.
+A module of its own crate: docs/modules.md. An extension of the core:
+
+1. Add the feature in `crates/webfast-core/Cargo.toml` and the gated module in its `src/lib.rs`.
 2. Give the module a config type and `configure_from_env` / `load`; its startup line goes in
    `load_checks`, its variables in `configure_from_env`.
 3. Implement the trait of each hook point it needs; put request-scoped state in a type of its own.

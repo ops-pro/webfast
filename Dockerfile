@@ -23,8 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && r
  && rustup component add llvm-tools
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
-COPY src ./src
-COPY examples ./examples
+# The workspace: crates/webfast-core (the library) and crates/webfast (the binary, its composition,
+# the PGO training example).
+COPY crates ./crates
 COPY pgo ./pgo
 COPY sample ./sample
 RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch --locked

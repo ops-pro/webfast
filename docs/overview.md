@@ -48,12 +48,14 @@ flowchart TD
     site -- no --> empty["empty 200, as Caddy"]
     site -- yes --> ip["client IP: the peer, or from<br/>trusted proxies' headers"]
     ip --> ready["ready answer looked up<br/>(path, Accept-Encoding)"]
-    ready --> jwt
+    ready --> modules
     subgraph checks ["request checks, before the routes (skipped for the server's own requests)"]
+        modules["the modules' checks, in the binary's order<br/>(webfast-modules: the request filter, the browser challenge)"]
         jwt["JWT: claim headers taken off,<br/>the first rule without upstreams decides"]
         fw["API firewall: the first API<br/>without upstreams the path is under"]
-        jwt --> fw
+        modules --> jwt --> fw
     end
+    modules -- refused --> refusal0["the module's answer: 403 / 404<br/>through handle_errors, or the<br/>connection closed (444)"]
     jwt -- refused --> refusal["401 / 403"]
     fw -- refused --> refusal2["403 / 413 / 415 / 503"]
     fw --> which{"ready answer?"}
@@ -64,17 +66,23 @@ flowchart TD
     failed -- no --> out
     errors --> out
     answer --> out
+    refusal0 --> out
     refusal --> out
     refusal2 --> out
     r421 --> out
     out["Date, Alt-Svc (TLS ports with HTTP/3);<br/>access log line when the response ends"]
 
     classDef feature stroke-dasharray: 5 5
-    class jwt,fw,refusal,refusal2 feature
+    class modules,jwt,fw,refusal0,refusal,refusal2 feature
 ```
 
 A refusal replaces the answer: it is logged in the site's access log like any other response, and
-the check's event log says why (docs/configuration.md, Request checks).
+the check's event log says why (docs/configuration.md, Request checks). A module's refusal marked
+as an error page goes through the site's `handle_errors` like a handler's failure, so the site
+renders it; a module may also inspect a proxied response before the cache and the client see it,
+and replace it (`reverse_proxy`, below). The modules are crates of
+[webfast-modules](https://github.com/ops-pro/webfast-modules), composed into the binary
+(docs/modules.md).
 
 ## The handler chain
 
@@ -146,11 +154,13 @@ flowchart TD
     send --> up["a server by lb_policy, per address, the down<br/>ones passed by; retries; response_header_timeout"]
     up --> resp{"response"}
     resp -- "502 / 504 / 408 / 413" --> fail["the failure, or a stored answer<br/>within stale-if-error"]
-    resp -- ok --> tee["header_down; a cache miss's body<br/>kept on the side while it streams"]
+    resp -- ok --> leak{"the modules' inspectors (webfast-modules):<br/>does one replace the response?"}
+    leak -- yes --> r500["its answer, through handle_errors<br/>when marked as an error page"]
+    leak -- no --> tee["header_down; a cache miss's body<br/>kept on the side while it streams"]
     tee --> back(["response (encode hook)"])
 
     classDef feature stroke-dasharray: 5 5
-    class bound,refused,slot,r429,tee feature
+    class bound,refused,slot,r429,leak,r500,tee feature
 ```
 
 ## In the background
@@ -173,6 +183,9 @@ flowchart LR
         jwks["JWKS read again every<br/>jwks_cache_duration, sooner for a new key id"]
         spec["API specs looked at again every refresh<br/>(conditional requests), compiled off the request threads"]
     end
+    subgraph modules ["the modules (webfast-modules)"]
+        mstart["Module::start: a module's own background work<br/>(the request filter's feeds and sweeps)"]
+    end
     dns["webfast-dns: upstream names resolved again<br/>at their TTL; requests read a snapshot"]
     acme["webfast-acme (acme): certificates ordered<br/>and renewed at two thirds of their life"]
     certs["certificates: files looked at every minute"]
@@ -187,6 +200,8 @@ flowchart LR
 | `jwt`            | `handle()` before the routes; `reverse_proxy` and `cache` hits for `upstreams` | JWT validation (`WEB_JWT_CONFIG`); claim headers set, the token taken off; `Credentialed` for the cache     |
 | `api-firewall`   | `handle()` before the routes; `reverse_proxy` and `cache` hits for `upstreams` | OpenAPI request validation (`WEB_API_FIREWALL_CONFIG`); the body read once and passed on                   |
 | `rate-limit`     | the `rate_limit` directive; `reverse_proxy` before the upstream               | requests per key and window; a client's requests at the upstreams at once                                  |
+| `webfast-ngfw` (a module: [webfast-modules](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw.md)) | `handle()` among the modules' checks, after the ACME answer and before the JWT; `reverse_proxy` on every response, before the cache | the request filter: rules over requests and proxied responses, country, ASN and address access, a ban list; on when `WEB_NGFW_CONFIG` names its file |
+| `webfast-challenge` (a module: [webfast-modules](https://github.com/ops-pro/webfast-modules/blob/main/docs/challenge.md)) | the `challenge` directive (`Handler::Extension`); `handle()` among the modules' checks (the answer endpoint) | the browser challenge: a cookie, a script, a proof-of-work or a CAPTCHA before a site answers, always or once a client is over a rate |
 | `proxy-cache`    | the `cache` directive; `reverse_proxy` on a miss                              | proxied answers kept in memory, in every encoding, stale answers while revalidating or when the upstream fails |
 | `compress-files` | `file_server` when a file has no precompressed sibling                        | compressed variants made in the background, served like siblings                                           |
 | `acme`           | `handle()` before the routes (HTTP-01); the certificate resolver (TLS-ALPN-01)  | certificates obtained from an ACME CA for the sites without `tls` files, renewed in the background          |
@@ -194,3 +209,5 @@ flowchart LR
 
 The request checks are configured outside the Caddyfile, so an edit there cannot switch them off;
 a check bound to an upstream that no `reverse_proxy` sends to stops the startup and a reload.
+The modules are composed into the binary by `crates/webfast/src/compose.rs` (docs/modules.md);
+this repository composes none yet, and their documentation is webfast-modules'.
