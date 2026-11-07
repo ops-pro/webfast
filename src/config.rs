@@ -1639,7 +1639,15 @@ fn compile_directive(line: &Line, scope: &Scope, cx: &mut Cx, site: &mut SiteCx)
                     bail!(at_err(&line.at, "respond 103 sends headers only: no body, no close"));
                 }
             }
-            Ok(vec![entry(name, matcher, Handler::Respond { status, body, close })])
+            Ok(vec![entry(
+                name,
+                matcher,
+                Handler::Respond {
+                    status,
+                    body: crate::handler::RespondBody::new(body),
+                    close,
+                },
+            )])
         }
         "rate_limit" => parse_rate_limit(line, cx, site),
         "cache" => parse_cache(line, scope, cx),

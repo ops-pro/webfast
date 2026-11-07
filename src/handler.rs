@@ -21,6 +21,7 @@ use crate::matcher::{MatcherSet, clean_path, needs_clean};
 use crate::placeholder::Template;
 use crate::proxy::ReverseProxy;
 use crate::static_files::FileServer;
+use bytes::Bytes;
 use http::header::{CONTENT_TYPE, LOCATION};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, Uri};
@@ -883,6 +884,43 @@ pub struct Route {
     pub handler: Handler,
 }
 
+/// What `respond` answers with: a text with no placeholders is made once, with its type.
+pub struct RespondBody {
+    pub template: Template,
+    ready: Option<(Bytes, &'static str)>,
+}
+
+impl RespondBody {
+    pub fn new(template: Template) -> RespondBody {
+        let ready = template.as_static().map(|text| {
+            let content_type = body_type(&text);
+            let text = Bytes::from(text);
+            // Shared from the start: every response's copy is a reference count.
+            drop(text.clone());
+            (text, content_type)
+        });
+        RespondBody { template, ready }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.template.is_empty()
+    }
+}
+
+/// The type of a `respond` body: JSON when it is an object or an array, else plain text.
+fn body_type(text: &str) -> &'static str {
+    let trimmed = text.trim();
+    let json = trimmed.len() > 2
+        && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+    if json {
+        "application/json"
+    } else {
+        "text/plain; charset=utf-8"
+    }
+}
+
 pub enum Handler {
     Root(Arc<FileStore>),
     Header {
@@ -906,7 +944,7 @@ pub enum Handler {
     Respond {
         /// `None`: 200, or in `handle_errors` routes the failure's status.
         status: Option<StatusCode>,
-        body: Template,
+        body: RespondBody,
         close: bool,
     },
     /// `error`: the request fails with this status (src/handler.rs `HandlerError`).
@@ -1215,22 +1253,22 @@ impl Handler {
                 next.run(ctx).await
             }
             Handler::Respond { status, body, close } => {
-                let text = body.render(&ctx);
-                let mut response = Response::new(if text.is_empty() { empty() } else { full(text.clone()) });
+                let typed = !ctx.pre_headers.contains_key(CONTENT_TYPE);
+                // A text with no placeholders was made once; another is copied from the thread's
+                // buffer once, at its size.
+                let (text, content_type) = match &body.ready {
+                    Some((text, content_type)) => (text.clone(), *content_type),
+                    None => body.template.with_rendered(&ctx, |text| {
+                        let content_type = if typed { body_type(text) } else { "" };
+                        (Bytes::copy_from_slice(text.as_bytes()), content_type)
+                    }),
+                };
+                let filled = !text.is_empty();
+                let mut response = Response::new(if filled { full(text) } else { empty() });
                 *response.status_mut() = status
                     .or(ctx.error.as_ref().map(|e| e.status))
                     .unwrap_or(StatusCode::OK);
-                if !text.is_empty() && !ctx.pre_headers.contains_key(CONTENT_TYPE) {
-                    let trimmed = text.trim();
-                    let json = trimmed.len() > 2
-                        && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
-                            || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-                        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
-                    let content_type = if json {
-                        "application/json"
-                    } else {
-                        "text/plain; charset=utf-8"
-                    };
+                if filled && typed {
                     response
                         .headers_mut()
                         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
