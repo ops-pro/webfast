@@ -128,8 +128,8 @@ impl Matcher {
             Matcher::Not(sets) => !sets.iter().any(|s| s.matches(ctx)),
             Matcher::File(file) => file.matches(ctx),
             Matcher::Host(hosts) => {
-                let host = ctx.host();
-                hosts.iter().any(|h| host_matches(h, &host))
+                let host = crate::handler::strip_port(ctx.hostport());
+                hosts.iter().any(|h| host_matches(h, host))
             }
             Matcher::Method(methods) => methods.contains(&ctx.req.method),
             Matcher::Header(fields) => fields.iter().all(|(name, negate, values)| {
@@ -329,13 +329,18 @@ pub fn clean_path(path: &str, merge_slashes: bool) -> String {
     cleaned
 }
 
-/// Host patterns are lowercase; `*.example.com` matches one label.
+/// Host patterns are lowercase; `*.example.com` matches one label. The host is compared without
+/// regard to ASCII case, as sent (no lowercase copy of it is made).
 pub fn host_matches(pattern: &str, host: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return host
-            .strip_suffix(suffix)
-            .and_then(|rest| rest.strip_suffix('.'))
-            .is_some_and(|label| !label.is_empty() && !label.contains('.'));
+        let (host, suffix) = (host.as_bytes(), suffix.as_bytes());
+        let Some(label) = host.len().checked_sub(suffix.len() + 1) else {
+            return false;
+        };
+        return host[label + 1..].eq_ignore_ascii_case(suffix)
+            && host[label] == b'.'
+            && label > 0
+            && !host[..label].contains(&b'.');
     }
     pattern.eq_ignore_ascii_case(host)
 }
@@ -539,6 +544,15 @@ mod tests {
         assert!(!host_matches("*.example.com", "a.b.example.com"));
         assert!(!host_matches("*.example.com", "example.com"));
         assert!(host_matches("example.com", "EXAMPLE.com"));
+        assert!(host_matches("*.example.com", "WWW.Example.COM"), "any case, as sent");
+        assert!(!host_matches("*.example.com", ".example.com"), "an empty label");
+        assert!(
+            !host_matches("*.example.com", "wwwexample.com"),
+            "no dot before the suffix"
+        );
+        assert!(!host_matches("*.example.com", "xample.com"));
+        assert!(!host_matches("*.example.com", ""));
+        assert!(!host_matches("*.example.com", "www.example.co"));
         assert!(glob(b"/x/[a-c]?", b"/x/bz"));
         assert!(!glob(b"/x/[^a-c]", b"/x/b"));
     }

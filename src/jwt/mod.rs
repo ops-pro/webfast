@@ -483,7 +483,7 @@ impl JwtAuth {
     /// upstreams, at a proxy among those bound to one of its upstreams.
     fn rule_for(&self, parts: &http::request::Parts, at: Option<&[Authority]>) -> Option<&Rule> {
         let mut path: Option<String> = None;
-        let mut host: Option<String> = None;
+        let mut host: Option<&str> = None;
         self.rules.iter().find(|rule| {
             let bound = match at {
                 None => rule.upstreams.is_empty(),
@@ -496,7 +496,7 @@ impl JwtAuth {
                 return false;
             }
             if !rule.hosts.is_empty() {
-                let host = host.get_or_insert_with(|| strip_port(hostport_of(parts)).to_ascii_lowercase());
+                let host = *host.get_or_insert_with(|| strip_port(hostport_of(parts)));
                 if !rule.hosts.iter().any(|h| host_matches(h, host)) {
                     return false;
                 }

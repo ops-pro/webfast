@@ -378,7 +378,7 @@ impl ApiFirewall {
         } else {
             decoded
         };
-        let mut host: Option<String> = None;
+        let mut host: Option<&str> = None;
         self.apis
             .iter()
             .find(|api| {
@@ -393,7 +393,7 @@ impl ApiFirewall {
                 if api.hosts.is_empty() {
                     return true;
                 }
-                let host = host.get_or_insert_with(|| strip_port(hostport_of(parts)).to_ascii_lowercase());
+                let host = *host.get_or_insert_with(|| strip_port(hostport_of(parts)));
                 api.hosts.iter().any(|h| host_matches(h, host))
             })
             .map(|api| &**api)

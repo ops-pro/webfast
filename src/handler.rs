@@ -222,11 +222,6 @@ impl Ctx {
         hostport_of(&self.req)
     }
 
-    /// The host name: lowercase, without the port.
-    pub fn host(&self) -> String {
-        strip_port(self.hostport()).to_ascii_lowercase()
-    }
-
     /// Accept-Encoding, parsed on first use.
     pub fn accept_encoding(&mut self) -> AcceptEncoding {
         *self

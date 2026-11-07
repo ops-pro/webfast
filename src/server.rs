@@ -186,12 +186,12 @@ impl Routing {
 
     /// The site for the request's host; the host is looked at only when a site names hosts.
     fn select(&self, parts: &http::request::Parts) -> Option<&Site> {
-        let mut host: Option<String> = None;
+        let mut host: Option<&str> = None;
         for site in &self.sites {
             if site.hosts.is_empty() {
                 return Some(site);
             }
-            let host = host.get_or_insert_with(|| strip_port(hostport_of(parts)).to_ascii_lowercase());
+            let host = *host.get_or_insert_with(|| strip_port(hostport_of(parts)));
             if site.hosts.iter().any(|h| host_matches(h, host)) {
                 return Some(site);
             }
