@@ -578,15 +578,110 @@ pub fn encode_path(decoded: &str) -> String {
 /// `//evil.example`: they count as part of that run. Anything else — an absolute URL, a plain
 /// path — is kept as it is.
 pub fn same_site_location(location: String) -> String {
+    match off_site_rest(&location) {
+        Some(rest) => format!("/{rest}"),
+        None => location,
+    }
+}
+
+/// What follows the run of slashes that would take `location` off the site (it is to follow one
+/// `/`); `None`: it stays as it is (`same_site_location`).
+fn off_site_rest(location: &str) -> Option<&str> {
     if !location.starts_with('/') {
-        return location;
+        return None;
     }
     let rest = location.trim_start_matches(['/', '\\', '\t', '\n', '\r']);
     let run = &location[..location.len() - rest.len()];
-    if run.bytes().filter(|b| matches!(b, b'/' | b'\\')).count() > 1 {
-        return format!("/{rest}");
+    (run.bytes().filter(|b| matches!(b, b'/' | b'\\')).count() > 1).then_some(rest)
+}
+
+/// The `Location` value of a redirect target: `same_site_location`, then `escape_controls`, written
+/// straight into the value (one allocation, the value's own).
+fn location_value(location: &str) -> Option<HeaderValue> {
+    let mut out = HeaderText::new();
+    let text = match off_site_rest(location) {
+        Some(rest) => {
+            out.push_str("/");
+            rest
+        }
+        None => location,
+    };
+    let mut from = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if b.is_ascii_control() {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push_str(&text[from..i]);
+            out.push_bytes(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 0xF)]]);
+            from = i + 1;
+        }
     }
-    location
+    out.push_str(&text[from..]);
+    out.value()
+}
+
+/// A header value written piece by piece into a buffer on the stack (on the heap past 256 bytes)
+/// and made once: one allocation, the value's own, where a `String` and `HeaderValue::from_str`
+/// made two and a copy.
+pub(crate) struct HeaderText {
+    stack: [u8; 256],
+    len: usize,
+    heap: Vec<u8>,
+}
+
+impl HeaderText {
+    pub(crate) fn new() -> HeaderText {
+        HeaderText {
+            stack: [0; 256],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_str(&mut self, text: &str) {
+        self.push_bytes(text.as_bytes());
+    }
+
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+        if self.heap.is_empty() && self.len + bytes.len() <= self.stack.len() {
+            self.stack[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            return;
+        }
+        if self.heap.is_empty() {
+            self.heap.reserve(2 * (self.len + bytes.len()));
+            self.heap.extend_from_slice(&self.stack[..self.len]);
+        }
+        self.heap.extend_from_slice(bytes);
+    }
+
+    fn bytes(&self) -> &[u8] {
+        if self.heap.is_empty() {
+            &self.stack[..self.len]
+        } else {
+            &self.heap
+        }
+    }
+
+    /// The value; `None` when the text has bytes a header value may not.
+    pub(crate) fn value(&self) -> Option<HeaderValue> {
+        HeaderValue::from_bytes(self.bytes()).ok()
+    }
+}
+
+impl std::fmt::Write for HeaderText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.push_str(text);
+        Ok(())
+    }
+}
+
+/// A number as a header value (`Content-Length`, `Age`): one allocation (`HeaderValue::from`
+/// makes two, a buffer and its conversion).
+pub(crate) fn header_number(n: u64) -> HeaderValue {
+    use std::fmt::Write as _;
+    let mut text = HeaderText::new();
+    let _ = write!(text, "{n}");
+    text.value().expect("digits")
 }
 
 /// A `Location` value with control characters percent-encoded: a raw tab or newline would be
@@ -1071,8 +1166,8 @@ impl Handler {
                 response
             }
             Handler::Redir { to, status, html } => {
-                let location = escape_controls(same_site_location(to.render(&ctx)));
                 if *html {
+                    let location = escape_controls(same_site_location(to.render(&ctx)));
                     let escaped = crate::static_files::html_escape(&location);
                     let body = format!(
                         "<!DOCTYPE html>\n<html>\n\t<head>\n\t\t<title>Redirecting...</title>\n\t\t<script>window.location.replace(\"{escaped}\");</script>\n\t\t<meta http-equiv=\"refresh\" content=\"0; URL='{escaped}'\">\n\t</head>\n\t<body>Redirecting to <a href=\"{escaped}\">{escaped}</a>...</body>\n</html>\n"
@@ -1085,7 +1180,7 @@ impl Handler {
                 }
                 let mut response = Response::new(empty());
                 *response.status_mut() = *status;
-                if let Ok(value) = HeaderValue::from_str(&location) {
+                if let Some(value) = to.with_rendered(&ctx, location_value) {
                     response.headers_mut().insert(LOCATION, value);
                 }
                 // The same redirect for every request with this path: a ready answer (src/memo.rs).
@@ -1275,6 +1370,25 @@ mod tests {
         assert_eq!(escape_controls("/\tpage".into()), "/%09page");
         assert_eq!(escape_controls("/a b".into()), "/a b");
         assert_eq!(escape_controls("/\x7f\r\n\0д".into()), "/%7F%0D%0A%00д");
+        // The value a redirect sends: the two, written at once.
+        for to in [
+            "/en/",
+            "//evil.example/x",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "https://example.com/a b",
+            "/\x7f\r\n\0д?q=1",
+            "relative/path",
+            "/",
+            "",
+        ] {
+            let want = escape_controls(same_site_location(to.to_string()));
+            assert_eq!(location_value(to).unwrap(), want.as_str(), "{to:?}");
+        }
+        let long = format!("/{}", "a".repeat(1000));
+        assert_eq!(location_value(&long).unwrap(), long.as_str(), "past the stack buffer");
+        assert_eq!(header_number(0), "0");
+        assert_eq!(header_number(u64::MAX), "18446744073709551615");
         assert_eq!(
             same("https://example.com/"),
             "https://example.com/",

@@ -359,7 +359,7 @@ impl FileServer {
         let length = if ranges.is_empty() {
             length
         } else {
-            HeaderValue::from(body.len() as u64)
+            crate::handler::header_number(body.len() as u64)
         };
         response.headers_mut().insert(CONTENT_LENGTH, length);
         if method != Method::HEAD {
@@ -499,7 +499,7 @@ async fn serve_disk(
     };
     let headers = response.headers_mut();
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    headers.insert(CONTENT_LENGTH, crate::handler::header_number(length));
     *response.status_mut() = status;
     if method != Method::HEAD && length > 0 {
         if start > 0 {
@@ -770,7 +770,7 @@ fn serve_delta(
     {
         headers.insert(CONTENT_TYPE, kind);
     }
-    headers.insert(CONTENT_LENGTH, HeaderValue::from(delta.len() as u64));
+    headers.insert(CONTENT_LENGTH, crate::handler::header_number(delta.len() as u64));
     if ctx.req.method != Method::HEAD {
         *response.body_mut() = full(delta);
     }
@@ -928,7 +928,7 @@ fn serve_error(ctx: &mut Ctx, mut response: Response<Body>, message: &str) -> Re
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(CONTENT_LENGTH, HeaderValue::from(text.len() as u64));
+    headers.insert(CONTENT_LENGTH, crate::handler::header_number(text.len() as u64));
     *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
     if ctx.req.method != Method::HEAD {
         *response.body_mut() = full(text);

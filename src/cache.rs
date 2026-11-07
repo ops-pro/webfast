@@ -844,7 +844,7 @@ impl Entry {
         if !self.offer.is_empty() && !has_vary(&headers, "accept-encoding") {
             headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
-        headers.insert(AGE, HeaderValue::from(age.as_secs()));
+        headers.insert(AGE, crate::handler::header_number(age.as_secs()));
         let ttl = self.freshness.fresh.as_secs() as i64 - age.as_secs() as i64;
         let status = match stale {
             None => format!("{}; hit; ttl={ttl}", self.settings.name),
@@ -879,7 +879,7 @@ impl Entry {
             *response.status_mut() = StatusCode::NOT_MODIFIED;
             response
         } else {
-            headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+            headers.insert(CONTENT_LENGTH, crate::handler::header_number(body.len() as u64));
             if let Some(encoding) = encoding {
                 headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
             }

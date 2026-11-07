@@ -293,7 +293,7 @@ impl Encode {
                 Ok(bytes) => {
                     parts
                         .headers
-                        .insert(CONTENT_LENGTH, HeaderValue::from(bytes.len() as u64));
+                        .insert(CONTENT_LENGTH, crate::handler::header_number(bytes.len() as u64));
                     Response::from_parts(parts, crate::body::full(bytes))
                 }
                 Err(e) => {

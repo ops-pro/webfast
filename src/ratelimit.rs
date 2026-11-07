@@ -287,7 +287,7 @@ impl RateLimit {
 /// `Retry-After` for a wait: whole seconds, rounded up, at least one (the plugin means the same
 /// with `wait + 0.5` rounded).
 pub fn retry_after(wait: Duration) -> HeaderValue {
-    HeaderValue::from(wait.as_secs_f64().ceil().max(1.0) as u64)
+    crate::handler::header_number(wait.as_secs_f64().ceil().max(1.0) as u64)
 }
 
 /// A zone's matcher set leaves ready answers right: it never takes a GET or HEAD, or it decides
