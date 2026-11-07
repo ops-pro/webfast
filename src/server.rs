@@ -206,8 +206,8 @@ impl Routing {
                 continue;
             }
             if self.strict {
-                let values: Vec<&str> = values.collect();
-                for value in values.iter().rev() {
+                // From the last value back (the nearest proxy's), with no list of them made.
+                for value in headers.get_all(field).iter().rev().filter_map(|v| v.to_str().ok()) {
                     for part in value.rsplit(',') {
                         if let Some(ip) = parse_ip(part)
                             && !self.trusted.iter().any(|n| n.contains(&ip))
@@ -1137,6 +1137,19 @@ mod tests {
         // Every entry a proxy: the peer.
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.9"));
         assert_eq!(routing(true).client_ip(&headers, peer), peer);
+        // Several field lines: the last line's entries first, then the line before.
+        headers.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 198.51.100.4"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.7"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("172.16.1.1, 10.0.0.5"));
+        assert_eq!(
+            routing(true).client_ip(&headers, peer),
+            "198.51.100.4".parse::<IpAddr>().unwrap()
+        );
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.8"));
+        assert_eq!(
+            routing(true).client_ip(&headers, peer),
+            "203.0.113.8".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[cfg(unix)]
