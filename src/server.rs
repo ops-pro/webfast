@@ -6,12 +6,12 @@
 //! Client IP as in Caddy: for a peer in `trusted_proxies`, the left-most valid address of the
 //! `client_ip_headers` (right-most untrusted with `trusted_proxies_strict`); otherwise the peer.
 
-use crate::accesslog::{LoggedBody, RequestInfo};
+use crate::accesslog::{Logged, RequestInfo};
 use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
 use crate::extensions::{At, Client, Hooks, RequestCheck};
 use crate::guard::{Activity, Admission, Place, Tracked};
-use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, SentRequest, hostport_of, strip_port};
+use crate::handler::{ConnInfo, Ctx, Failed, Handler, Next, Route, SentRequest, hostport_of, strip_port};
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -44,7 +44,9 @@ pub struct ServerState {
     /// connections serve the files as they are now.
     retired: Mutex<Vec<Weak<Routing>>>,
     tls: bool,
-    alt_svc: Option<HeaderValue>,
+    /// The `Alt-Svc` value with HTTP/3 on; a static string, so that a response's copy of it counts
+    /// no reference every core shares.
+    alt_svc: Option<&'static str>,
     /// TLS with the Host check on (`strict_sni_host`, on unless `insecure_off`): the certificates,
     /// to tell whether a request's Host is served with the connection's one.
     host_check: Option<Arc<CertResolver>>,
@@ -66,6 +68,9 @@ pub struct Routing {
     /// Counts the reloads: a connection that outlives the routing it was accepted with works out
     /// again whether its peer is trusted.
     generation: u64,
+    /// A site's routes may send Early Hints (`respond 103`): HTTP/3 then gives each request the
+    /// channel they go through (src/h3.rs), and not otherwise.
+    early_hints: bool,
 }
 
 /// What the requests of one connection share: the port, the connection's facts, and — with
@@ -100,14 +105,12 @@ impl ConnState {
         })
     }
 
-    /// The same connection once its TLS handshake named `sni` (for the Host check).
-    pub fn with_sni(&self, sni: Option<&str>) -> Arc<ConnState> {
-        Arc::new(ConnState {
-            state: self.state.clone(),
-            info: Arc::new(self.info.with_sni(sni)),
-            pinned: self.pinned.clone(),
-            generation: self.generation,
-        })
+    /// Whether a route of the routing this connection's requests take may send Early Hints.
+    pub(crate) fn may_hint(&self) -> bool {
+        match &self.pinned {
+            Some(pinned) => pinned.early_hints,
+            None => self.state.routing.load().early_hints,
+        }
     }
 }
 
@@ -143,16 +146,31 @@ impl ServerState {
         self.tls
     }
 
-    /// A new connection: its facts, worked out with the routing in use now — which it keeps with
-    /// WEB_RELOAD=lazy or drain.
+    /// Whether `peer` is a trusted proxy under the routing in use now (what admission needs of a
+    /// connection before anything else is known of it).
+    pub(crate) fn trusts(&self, peer: IpAddr) -> bool {
+        self.routing.load().trusts(peer)
+    }
+
+    /// A new connection with no TLS name: `connection_named` without one.
     pub fn connection(self: &Arc<Self>, remote: SocketAddr) -> Arc<ConnState> {
+        self.connection_named(remote, None)
+    }
+
+    /// A new connection, once its TLS handshake named `sni` (for the Host check; `None`: none, or
+    /// plain HTTP): its facts, worked out with the routing in use now — which it keeps with
+    /// WEB_RELOAD=lazy or drain. Made once per connection, after the handshake.
+    pub fn connection_named(self: &Arc<Self>, remote: SocketAddr, sni: Option<&str>) -> Arc<ConnState> {
         let current = self.routing.load();
-        let info = Arc::new(ConnInfo {
-            remote,
-            tls: self.tls,
-            trusted: current.trusts(remote.ip()),
-            sni: None,
-        });
+        let info = Arc::new(
+            ConnInfo {
+                remote,
+                tls: self.tls,
+                trusted: current.trusts(remote.ip()),
+                sni: None,
+            }
+            .with_sni(sni),
+        );
         let generation = current.generation;
         let pinned = self.mode.pins().then(|| arc_swap::Guard::into_inner(current));
         Arc::new(ConnState {
@@ -185,6 +203,9 @@ impl Routing {
         generation: u64,
     ) -> Routing {
         let index = crate::matcher::HostIndex::new(sites.iter().map(|site| site.hosts.as_slice()));
+        let early_hints = sites
+            .iter()
+            .any(|site| emits_hints(&site.routes) || site.errors.as_deref().is_some_and(emits_hints));
         Routing {
             sites,
             index,
@@ -192,6 +213,7 @@ impl Routing {
             strict,
             client_ip_headers,
             generation,
+            early_hints,
         }
     }
 
@@ -243,6 +265,18 @@ impl Routing {
     }
 }
 
+/// A `respond 103` among `routes`, subroutes included.
+fn emits_hints(routes: &[Route]) -> bool {
+    routes.iter().any(|route| match &route.handler {
+        Handler::Respond {
+            status: Some(StatusCode::EARLY_HINTS),
+            ..
+        } => true,
+        Handler::Subroute(routes) => emits_hints(routes),
+        _ => false,
+    })
+}
+
 /// An address from a client IP header: bare, with a port, bracketed IPv6, with a zone.
 fn parse_ip(part: &str) -> Option<IpAddr> {
     let part = part.trim();
@@ -274,8 +308,20 @@ enum Way {
 #[derive(Debug, Clone, Copy)]
 pub struct InternalRequest;
 
-/// Handles one request on any protocol.
+/// Handles one request on any protocol, with its log line bound to the response body (for a
+/// request the server makes of itself, src/extensions.rs; the protocols take `handle_with_log`).
 pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Response<Body> {
+    let (response, log) = handle_with_log(connection, request).await;
+    match log {
+        Some(log) => response.map(|body| boxed(Tracked::new(body, None, Some(log)))),
+        None => response,
+    }
+}
+
+/// Handles one request on any protocol. With it, when the site logs, what writes the access log
+/// line once the response body has been sent: the caller puts it in the body's wrapper it makes
+/// anyway (src/guard.rs `Tracked`), so no body is boxed for logging.
+pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>) -> (Response<Body>, Option<Logged>) {
     let started = Instant::now();
     let (mut parts, body) = request.into_parts();
     let remote = connection.info.remote;
@@ -286,12 +332,15 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     // HTTP/1.1 heads are only bounded by hyper's buffer (~400 KiB); HTTP/2 and HTTP/3 refused
     // more than this before (431), by the same count.
     if field_section_size(&parts.headers) > connection.state.max_header {
-        return refused(&connection.state, version, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+        return (
+            refused(&connection.state, version, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            None,
+        );
     }
     // A host that is no name or address, or a Host and an authority that differ: 400 before
     // anything reads it (Caddy 2.11.8 and 2.11.9).
     if !internal && crate::handler::bad_host(&parts) {
-        return refused(&connection.state, version, StatusCode::BAD_REQUEST);
+        return (refused(&connection.state, version, StatusCode::BAD_REQUEST), None);
     }
     // A Host served with another certificate than the connection's gets 421 (RFC 9110 §15.5.20).
     let misdirected = !internal && connection.state.misdirected(&connection.info, &parts);
@@ -321,7 +370,8 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
                 Some(response) => Way::Ready(response),
                 None => Way::Chain(site.routes.clone(), site.errors.clone()),
             };
-            (conn, client_ip, site.log.clone(), way)
+            // The log's two enums by value: no count on the site touched.
+            (conn, client_ip, site.log.as_deref().copied(), way)
         })
     };
     let state = &connection.state;
@@ -332,7 +382,7 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
             *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
         }
         common_headers(state, version, &mut response);
-        return response;
+        return (response, None);
     };
     // What the access log needs, as cheap copies, and only when the site logs.
     let info = log.as_ref().map(|_| RequestInfo {
@@ -385,13 +435,12 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         }
     };
     common_headers(state, version, &mut response);
-    match (log, info) {
-        (Some(log), Some(info)) => {
-            let status = response.status().as_u16();
-            response.map(|b| boxed(LoggedBody::new(b, log, info, status)))
-        }
-        _ => response,
-    }
+    let status = response.status().as_u16();
+    let log = match (log, info) {
+        (Some(log), Some(info)) => Some(Logged::new(log, info, status)),
+        _ => None,
+    };
+    (response, log)
 }
 
 /// The request with its body under the stall limit: a client that stops sending it for `stall`
@@ -439,9 +488,9 @@ fn common_headers(state: &ServerState, version: Version, response: &mut Response
     let headers = response.headers_mut();
     headers.entry(http::header::DATE).or_insert_with(crate::date::now);
     if version != Version::HTTP_3
-        && let Some(alt_svc) = &state.alt_svc
+        && let Some(alt_svc) = state.alt_svc
     {
-        headers.insert(http::header::ALT_SVC, alt_svc.clone());
+        headers.insert(http::header::ALT_SVC, HeaderValue::from_static(alt_svc));
     }
 }
 
@@ -844,7 +893,10 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         #[cfg(feature = "acme")]
         alpn.push(crate::acme::challenge::ALPN);
         let config = tls::server_config(resolver.clone(), &alpn, false, ticket_keys.clone())?;
-        acceptor = Some(TlsAcceptor::from(Arc::new(config)));
+        // For the life of the process (a reload changes the certificates through the resolver, not
+        // this): borrowed by every connection, cloned by none.
+        let leaked: &'static TlsAcceptor = Box::leak(Box::new(TlsAcceptor::from(Arc::new(config))));
+        acceptor = Some(leaked);
         if protocols.h3 {
             quic_resolver = Some(resolver);
         }
@@ -880,7 +932,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
             transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("small duration")));
         }
         let endpoint = bind_quic(bound_port, quic_config)?;
-        state.alt_svc = HeaderValue::from_str(&format!("h3=\":{bound_port}\"; ma=2592000")).ok();
+        state.alt_svc = Some(String::leak(format!("h3=\":{bound_port}\"; ma=2592000")));
         quic_endpoint = Some(endpoint);
     }
     let state = Arc::new(state);
@@ -913,12 +965,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         "listening"
     );
     for listener in listeners {
-        let (state, acceptor, admission, stop) = (
-            state.clone(),
-            acceptor.clone(),
-            admission.clone(),
-            running.stop.subscribe(),
-        );
+        let (state, admission, stop) = (state.clone(), admission.clone(), running.stop.subscribe());
         if !per_core {
             let task = tokio::spawn(accept_loop(
                 listener, state, acceptor, protocols, limits, admission, stop,
@@ -972,26 +1019,56 @@ enum Mode {
     Auto,
 }
 
+/// hyper's connection builders, one set per listener for the life of the process: each connection
+/// borrows the one for its protocol, none is cloned per connection.
+struct Builders {
+    auto: auto::Builder<TokioExecutor>,
+    h1: auto::Builder<TokioExecutor>,
+    h2: auto::Builder<TokioExecutor>,
+}
+
+impl Builders {
+    fn new(limits: &Limits) -> Builders {
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        // No header read timeout of hyper's own (it would make a timer per request; with none set
+        // hyper needs no timer for HTTP/1 at all): the connection's `Activity` bounds the heads
+        // instead, with one timer per connection (src/guard.rs).
+        builder.http1().header_read_timeout(None);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .max_header_list_size(u32::try_from(limits.max_header).unwrap_or(u32::MAX))
+            .max_concurrent_streams(250)
+            .keep_alive_interval(Some(Duration::from_secs(60)));
+        Builders {
+            h1: builder.clone().http1_only(),
+            h2: builder.clone().http2_only(),
+            auto: builder,
+        }
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     state: Arc<ServerState>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<&'static TlsAcceptor>,
     protocols: Protocols,
     limits: Limits,
     admission: Arc<Admission>,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) {
-    let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(limits.read_header);
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .max_header_list_size(u32::try_from(limits.max_header).unwrap_or(u32::MAX))
-        .max_concurrent_streams(250)
-        .keep_alive_interval(Some(Duration::from_secs(60)));
+    let builders: &'static Builders = Box::leak(Box::new(Builders::new(&limits)));
+    // The server's stop is watched once here, and passed on to this listener's connections through
+    // a channel of their own: what every core shares is touched once per stop, not per connection.
+    let (local_stop, _) = watch::channel(false);
+    let mut stopped = std::pin::pin!(async move {
+        let mut stop = stop;
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+    });
     loop {
         let (stream, remote) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -1002,25 +1079,26 @@ async fn accept_loop(
                     continue;
                 }
             },
-            _ = stop.changed() => break,
+            () = &mut stopped => {
+                local_stop.send_replace(true);
+                break;
+            }
         };
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
-        let conn = state.connection(remote);
-        let retire = state.retire(&conn);
-        let Some(permit) = admission.admit(remote.ip(), conn.info.trusted) else {
+        let Some(permit) = admission.admit(remote.ip(), state.trusts(remote.ip())) else {
             tracing::debug!(%remote, "connection refused: too many open");
             continue;
         };
+        // Linux: inherited from the listening socket (src/sockets.rs); elsewhere set here.
+        #[cfg(not(target_os = "linux"))]
         let _ = stream.set_nodelay(true);
         let activity = Activity::new();
         let stream = crate::guard::Io::new(stream, activity.clone());
-        let acceptor = acceptor.clone();
-        let builder = builder.clone();
-        let stop = stop.clone();
+        let stop = local_stop.subscribe();
+        let state = state.clone();
         tokio::spawn(async move {
             // The connection's place: its requests carry it, and a WebSocket tunnel keeps it.
             let place = Place::new(permit, stop.clone());
-            let ends = crate::guard::Ends { stop, retire };
             // The connection's requests, once what the connection is (its SNI) is known.
             let service = |conn: Arc<ConnState>| {
                 let activity = activity.clone();
@@ -1028,7 +1106,7 @@ async fn accept_loop(
                 // Per request only this connection's own reference counts change.
                 service_fn(move |mut request: Request<Incoming>| {
                     // The request counts as in progress until its response body ends.
-                    let flight = activity.begin();
+                    let flight = activity.begin(request.version());
                     let conn = conn.clone();
                     // Only a request that can switch protocols (hyper's `OnUpgrade`) can become a
                     // tunnel, the one that keeps the place: no extension map made for the others.
@@ -1036,21 +1114,26 @@ async fn accept_loop(
                         request.extensions_mut().insert(place.clone());
                     }
                     async move {
-                        // A complete HTTP/1 body (none) is replaced by the empty one, which takes no
-                        // allocation; an HTTP/2 stream's is kept, as its stream state goes with it.
-                        let request = if request.version() <= Version::HTTP_11
-                            && http_body::Body::is_end_stream(request.body())
-                        {
+                        // A body already complete (none: most requests) is replaced by the empty one,
+                        // which takes no allocation — on HTTP/2 too: the stream's state stays with
+                        // hyper's sender, not with the `Incoming` it hands over.
+                        let request = if http_body::Body::is_end_stream(request.body()) {
                             request.map(|_| crate::body::empty())
                         } else {
                             request.map(boxed)
                         };
                         let request = stall_limited(request, limits.stall);
-                        let response = handle(conn, request).await;
+                        let (response, log) = handle_with_log(conn, request).await;
                         // Not boxed again: hyper takes the tracking body as it is.
-                        Ok::<_, Infallible>(response.map(|body| Tracked::new(body, flight)))
+                        Ok::<_, Infallible>(response.map(|body| Tracked::new(body, Some(flight), log)))
                     }
                 })
+            };
+            // What may end the connection besides itself, once its facts are known (made once, after
+            // the handshake: admission needed only its address).
+            let ends = |conn: &ConnState| crate::guard::Ends {
+                stop,
+                retire: state.retire(conn),
             };
             match acceptor {
                 Some(acceptor) => {
@@ -1063,9 +1146,10 @@ async fn accept_loop(
                         _ if protocols.h1 => Mode::Http1,
                         _ => return,
                     };
-                    let conn = conn.with_sni(stream.get_ref().1.server_name());
+                    let conn = state.connection_named(remote, stream.get_ref().1.server_name());
+                    let ends = ends(&conn);
                     serve_connection(
-                        builder,
+                        builders,
                         TokioIo::new(stream),
                         service(conn),
                         mode,
@@ -1081,8 +1165,10 @@ async fn accept_loop(
                         (false, true) => Mode::Http2,
                         _ => Mode::Http1,
                     };
+                    let conn = state.connection(remote);
+                    let ends = ends(&conn);
                     serve_connection(
-                        builder,
+                        builders,
                         TokioIo::new(stream),
                         service(conn),
                         mode,
@@ -1098,7 +1184,7 @@ async fn accept_loop(
 }
 
 async fn serve_connection<I, S>(
-    builder: auto::Builder<TokioExecutor>,
+    builders: &'static Builders,
     io: I,
     service: S,
     mode: Mode,
@@ -1114,12 +1200,13 @@ async fn serve_connection<I, S>(
     S::Future: Send + 'static,
 {
     let builder = match mode {
-        Mode::Http1 => builder.http1_only(),
-        Mode::Http2 => builder.http2_only(),
-        Mode::Auto => builder,
+        Mode::Http1 => &builders.h1,
+        Mode::Http2 => &builders.h2,
+        Mode::Auto => &builders.auto,
     };
-    // With upgrades: a request that switches protocols (WebSocket) hands the connection over.
-    let connection = builder.serve_connection_with_upgrades(io, service).into_owned();
+    // With upgrades: a request that switches protocols (WebSocket) hands the connection over. The
+    // builder is borrowed: the connection is driven here, in place.
+    let connection = builder.serve_connection_with_upgrades(io, service);
     crate::guard::drive(connection, |c| c.graceful_shutdown(), activity, limits, ends).await;
 }
 

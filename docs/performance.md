@@ -33,6 +33,15 @@ measured in one sitting, in alternating order.
   Workers).
 - **Three system calls per request** on a keep-alive connection: `epoll_wait`, `recvfrom`, `writev`
   (headers and body in one) — strace, 1000 requests/s.
+- **Nothing shared touched per request, little per connection.** A request's response body is
+  wrapped once (unboxed) with what counts it as in progress and what writes its access log line;
+  the log's settings and the `Alt-Svc` value are copied by value, not reference-counted. A request
+  with no body (nearly all) gets the empty body on every protocol, no allocation. The timeouts run
+  on one timer per connection, set only when a deadline changes — hyper's own per-request header
+  timer is off (src/guard.rs). Per connection: one set of hyper builders and one TLS acceptor per
+  listener, borrowed; the server's stop signal fanned out through a channel per listener; the
+  connection limits in 64 locks by address; the connection's facts made once, after the TLS
+  handshake; `TCP_NODELAY` inherited from the listening socket (Linux).
 - **Compression off the request threads**: an on-the-fly body over 64 KiB is compressed on the
   blocking pool, so a worker does not spend milliseconds of Brotli while other requests wait;
   bodies of known length up to 1 MiB are compressed whole and sent with `Content-Length`, streams
@@ -150,7 +159,8 @@ Reloading): with `WEB_RELOAD=immediate` one atomic read of the port's current co
 `ArcSwap` load: a slot of the thread's own, no shared reference count); with `lazy` nothing, the
 connection holds its configuration. A request's other reference counts are its connection's own:
 the port's state and the WebSocket bookkeeping are held once per connection (before, every
-request cloned the port's state and the server's stop signal, counts that all connections share).
+request cloned the port's state and the server's stop signal, counts that all connections share);
+the site's route list is the one count on the site a request still takes (`Next::start` owns it).
 
 Plain release builds (no PGO), the sample site, 2026-10-16, two passes in opposite order; at 1000
 requests/s server CPU per request, median of 12 runs; as fast as it goes over 128 connections,

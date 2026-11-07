@@ -4,8 +4,10 @@
 //!   counts as one address); trusted proxies are not limited per address, as many clients come
 //!   through them. A connection over a limit is closed at once.
 //! - **Activity**: a connection that has no request in progress — none yet within `read_header`,
-//!   or none for `idle` since the last one — is closed gracefully (HTTP/2: GOAWAY, then the open
-//!   streams finish); a graceful close that does not end within `grace` is cut.
+//!   or none for `idle` since the last one (HTTP/1.1: the next request's head within `read_header`
+//!   of the last response, as hyper's own header timeout did, but with one timer per connection
+//!   rather than one per request) — is closed gracefully (HTTP/2: GOAWAY, then the open streams
+//!   finish); a graceful close that does not end within `grace` is cut.
 //! - **Stall**: a response the client stops taking (the socket accepts nothing, a slow reader)
 //!   for `stall` cuts the connection. A slow but moving download resets the clock with every write.
 //! - **Stalled request body** (`StalledBody`): a request body the client stops sending for `stall`
@@ -13,20 +15,24 @@
 //!   as long as the client likes) fails, and the proxy answers 408.
 //!
 //! The connection's own future checks this after each time it runs, so the timer always follows
-//! the latest state; its streams' tasks (HTTP/2) wake it whenever they send.
+//! the latest state; the end of its last request in progress wakes it (`Activity::quiet`), as its
+//! streams' tasks (HTTP/2) end their bodies on their own.
 
+use crate::accesslog::Logged;
 use crate::body::{Body, BoxError};
 use crate::config::Limits;
 use bytes::Bytes;
+use http::Version;
 use http_body::{Frame, SizeHint};
 use rustc_hash::FxHashMap;
 use std::future::Future;
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::IoSlice;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
@@ -36,10 +42,17 @@ pub struct Admission {
     max: usize,
     max_per_ip: usize,
     open: AtomicUsize,
-    per_ip: Mutex<FxHashMap<IpAddr, usize>>,
+    /// The counts per address, in shards by the address's hash: every accept and close on every
+    /// core takes one of these locks, so they are many, each on its own cache line.
+    per_ip: Box<[Shard]>,
     /// Signalled when the last connection closes (for shutdown).
     closed: Notify,
 }
+
+const SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct Shard(Mutex<FxHashMap<IpAddr, usize>>);
 
 impl Admission {
     pub fn new(limits: &Limits) -> Arc<Admission> {
@@ -47,14 +60,21 @@ impl Admission {
             max: limits.max_connections,
             max_per_ip: limits.max_per_ip,
             open: AtomicUsize::new(0),
-            per_ip: Mutex::new(FxHashMap::default()),
+            per_ip: (0..SHARDS).map(|_| Shard(Mutex::new(FxHashMap::default()))).collect(),
             closed: Notify::new(),
         })
     }
 
+    fn shard(&self, address: IpAddr) -> &Mutex<FxHashMap<IpAddr, usize>> {
+        let hash = BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(address);
+        &self.per_ip[(hash as usize) % SHARDS].0
+    }
+
     /// A place for a connection from `ip`, or `None` when a limit is reached.
     pub fn admit(self: &Arc<Self>, ip: IpAddr, trusted: bool) -> Option<Permit> {
-        let open = self.open.fetch_add(1, Ordering::AcqRel) + 1;
+        // Relaxed: the count orders nothing else; `all_closed` reads it with Acquire after the
+        // Release of the close that may have made it zero.
+        let open = self.open.fetch_add(1, Ordering::Relaxed) + 1;
         let mut permit = Permit {
             admission: self.clone(),
             address: None,
@@ -64,7 +84,7 @@ impl Admission {
         }
         if self.max_per_ip > 0 && !trusted {
             let address = address_key(ip);
-            let mut per_ip = self.per_ip.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut per_ip = self.shard(address).lock().unwrap_or_else(PoisonError::into_inner);
             let count = per_ip.entry(address).or_insert(0);
             if *count >= self.max_per_ip {
                 return None;
@@ -121,6 +141,8 @@ pub struct Permit {
 /// it closes, so tunnels count against the limits as the connections they came from; and the
 /// server's stop, on which a tunnel closes (as Caddy closes them when it stops). One reference
 /// count per connection: cloning it for a request touches nothing that other connections share.
+/// The stop is the listener's own copy of the server's (src/server.rs `accept_loop`), so that a
+/// connection's start and end touch nothing every core shares either.
 #[derive(Clone)]
 pub struct Place(Arc<Held>);
 
@@ -149,7 +171,11 @@ impl Place {
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(address) = self.address {
-            let mut per_ip = self.admission.per_ip.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut per_ip = self
+                .admission
+                .shard(address)
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(count) = per_ip.get_mut(&address) {
                 *count -= 1;
                 if *count == 0 {
@@ -157,7 +183,7 @@ impl Drop for Permit {
                 }
             }
         }
-        if self.admission.open.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.admission.open.fetch_sub(1, Ordering::Release) == 1 {
             self.admission.closed.notify_waiters();
         }
     }
@@ -169,6 +195,10 @@ pub struct Activity {
     /// Requests whose response has not ended.
     active: AtomicUsize,
     seen_request: AtomicBool,
+    /// The connection speaks HTTP/1.x (known with its first request): between requests the next
+    /// head is due within `read_header`, as on a new connection; HTTP/2 and HTTP/3 frame their
+    /// heads, and only `idle` applies.
+    h1: AtomicBool,
     /// Milliseconds after `started` when the last request began or ended.
     last: AtomicU64,
     /// Milliseconds after `started`, plus one, since when a write has been waiting for the socket;
@@ -184,6 +214,7 @@ impl Activity {
             started: Instant::now(),
             active: AtomicUsize::new(0),
             seen_request: AtomicBool::new(false),
+            h1: AtomicBool::new(false),
             last: AtomicU64::new(0),
             blocked: AtomicU64::new(0),
             quiet: Notify::new(),
@@ -194,10 +225,14 @@ impl Activity {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// A request begins; it ends when the returned value is dropped (with its response body).
-    pub fn begin(self: &Arc<Self>) -> InFlight {
+    /// A request (on `version`) begins; it ends when the returned value is dropped (with its
+    /// response body).
+    pub fn begin(self: &Arc<Self>, version: Version) -> InFlight {
         self.active.fetch_add(1, Ordering::AcqRel);
-        self.seen_request.store(true, Ordering::Release);
+        if !self.seen_request.load(Ordering::Relaxed) {
+            self.h1.store(version <= Version::HTTP_11, Ordering::Relaxed);
+            self.seen_request.store(true, Ordering::Release);
+        }
         self.last.store(self.now_ms(), Ordering::Release);
         InFlight(self.clone())
     }
@@ -218,35 +253,45 @@ impl Activity {
         self.quiet.notified().await
     }
 
+    /// The same, to poll in place: made before the active count is looked at, it resolves even
+    /// when the last request ends between that look and its first poll.
+    pub fn quiet_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.quiet.notified()
+    }
+
     /// No request is in progress.
     pub fn is_quiet(&self) -> bool {
         self.active.load(Ordering::Acquire) == 0
     }
 
-    /// When the connection is next due for something, and what.
-    pub fn next(&self, limits: &Limits) -> (Instant, Due) {
+    /// When the connection is next due for something, and what; `None` with requests in progress
+    /// and writes moving (the end of the last request wakes the driver: `quiet_notified`).
+    pub fn next(&self, limits: &Limits) -> Option<(Instant, Due)> {
         let blocked = self.blocked.load(Ordering::Acquire);
         if blocked != 0 {
-            return (
+            return Some((
                 self.started + Duration::from_millis(blocked - 1) + limits.stall,
                 Due::Cut,
-            );
+            ));
         }
         if self.active.load(Ordering::Acquire) == 0 {
             if !self.seen_request.load(Ordering::Acquire) {
-                return (self.started + limits.read_header, Due::Close);
+                return Some((self.started + limits.read_header, Due::Close));
             }
             let last = Duration::from_millis(self.last.load(Ordering::Acquire));
-            return (self.started + last + limits.idle, Due::Close);
+            let gap = if self.h1.load(Ordering::Relaxed) {
+                limits.idle.min(limits.read_header)
+            } else {
+                limits.idle
+            };
+            return Some((self.started + last + gap, Due::Close));
         }
-        // Requests in progress and writes moving: nothing due; look again later.
-        (Instant::now() + limits.idle, Due::Nothing)
+        None
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Due {
-    Nothing,
     /// Close gracefully.
     Close,
     /// Cut now.
@@ -266,15 +311,22 @@ impl Drop for InFlight {
     }
 }
 
-/// A response body that keeps its request counted as in progress until it ends.
+/// A response body that keeps its request counted as in progress until it ends, and writes its
+/// access log line then (`Logged`, when the site logs). One wrapper, not boxed: hyper takes it as
+/// it is.
 pub struct Tracked {
     inner: Body,
-    _flight: InFlight,
+    _flight: Option<InFlight>,
+    log: Option<Logged>,
 }
 
 impl Tracked {
-    pub fn new(inner: Body, flight: InFlight) -> Tracked {
-        Tracked { inner, _flight: flight }
+    pub fn new(inner: Body, flight: Option<InFlight>, log: Option<Logged>) -> Tracked {
+        Tracked {
+            inner,
+            _flight: flight,
+            log,
+        }
     }
 }
 
@@ -283,7 +335,14 @@ impl http_body::Body for Tracked {
     type Error = BoxError;
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        Pin::new(&mut self.inner).poll_frame(cx)
+        let polled = ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        if let Some(log) = &mut self.log {
+            match &polled {
+                Some(Ok(frame)) => log.count(frame),
+                Some(Err(_)) | None => log.finish(),
+            }
+        }
+        Poll::Ready(polled)
     }
 
     fn is_end_stream(&self) -> bool {
@@ -320,11 +379,14 @@ impl std::error::Error for StalledError {}
 
 /// A request body that must keep moving: with no frame for `stall` it ends with an error and
 /// marks `BodyStalled`. A body that is already complete (no body, or one hyper has buffered) never
-/// arms the timer.
+/// arms the timer. The timer lives in the body (pinned once boxed) and is set again at each wait,
+/// not made anew.
 pub struct StalledBody {
     inner: Body,
     stall: Duration,
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    timer: tokio::time::Sleep,
+    /// The timer is set for the wait under way.
+    armed: bool,
     stalled: BodyStalled,
 }
 
@@ -333,27 +395,41 @@ impl StalledBody {
         StalledBody {
             inner,
             stall,
-            timer: None,
+            // Not registered with the runtime until it is set and polled.
+            timer: tokio::time::sleep_until(far_future()),
+            armed: false,
             stalled,
         }
     }
+}
+
+/// A deadline that never comes (as tokio's own `far_future`: 30 years, within every clock's range).
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(86400 * 365 * 30)
 }
 
 impl http_body::Body for StalledBody {
     type Data = Bytes;
     type Error = BoxError;
 
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        match Pin::new(&mut self.inner).poll_frame(cx) {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        // SAFETY: `timer` is never moved out of or replaced while pinned (only `reset` and `poll`,
+        // both through the pin below); the other fields are `Unpin` and used by plain reference.
+        let this = unsafe { self.get_unchecked_mut() };
+        match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(frame) => {
-                self.timer = None;
+                this.armed = false;
                 Poll::Ready(frame)
             }
             Poll::Pending => {
-                let stall = self.stall;
-                let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
-                if timer.as_mut().poll(cx).is_ready() {
-                    self.stalled.0.store(true, Ordering::Release);
+                // SAFETY: a projection of the pinned `self` to its `timer` field (see above).
+                let mut timer = unsafe { Pin::new_unchecked(&mut this.timer) };
+                if !this.armed {
+                    timer.as_mut().reset(tokio::time::Instant::now() + this.stall);
+                    this.armed = true;
+                }
+                if timer.poll(cx).is_ready() {
+                    this.stalled.0.store(true, Ordering::Release);
                     return Poll::Ready(Some(Err(Box::new(StalledError))));
                 }
                 Poll::Pending
@@ -552,6 +628,9 @@ pub struct Ends {
 /// `graceful_shutdown`); when `stop` turns true (server shutdown) that is asked too and the
 /// connection is then waited for — the server bounds that wait itself. With `retire`, a reload
 /// asks it to finish too, at its moment (WEB_RELOAD=drain); a close of our own is cut after `grace`.
+///
+/// The timer is set only when a deadline is due and only when it changes: with requests in
+/// progress it is left alone, and the end of the last one wakes this future to set it.
 pub async fn drive<C: Future>(
     connection: C,
     graceful: impl Fn(Pin<&mut C>),
@@ -576,8 +655,10 @@ pub async fn drive<C: Future>(
         }
     });
     let mut retired = false;
-    let mut timer = std::pin::pin!(tokio::time::sleep(limits.idle));
+    let mut timer = std::pin::pin!(tokio::time::sleep_until(far_future()));
     let mut armed: Option<Instant> = None;
+    // The end of the last request in progress (its body ends in a stream's own task on HTTP/2).
+    let mut quiet = std::pin::pin!(activity.quiet_notified());
     // Since when a graceful close of our own (idle) is under way.
     let mut closing: Option<Instant> = None;
     let mut stopping = false;
@@ -598,9 +679,18 @@ pub async fn drive<C: Future>(
             if stopping {
                 return Poll::Pending;
             }
-            let (when, due) = match closing {
-                Some(since) => (since + limits.grace, Due::Cut),
+            // Made anew before the active count is read: an end after that read still wakes us.
+            if quiet.as_mut().poll(cx).is_ready() {
+                quiet.set(activity.quiet_notified());
+            }
+            let due = match closing {
+                Some(since) => Some((since + limits.grace, Due::Cut)),
                 None => activity.next(limits),
+            };
+            let Some((when, due)) = due else {
+                // Requests in progress and writes moving: whatever is set may fire, and is then
+                // looked at again here.
+                return Poll::Pending;
             };
             if armed != Some(when) {
                 timer.as_mut().reset(when.into());
@@ -611,7 +701,6 @@ pub async fn drive<C: Future>(
             }
             armed = None;
             match due {
-                Due::Nothing => {}
                 Due::Cut => return Poll::Ready(()),
                 Due::Close => {
                     closing = Some(Instant::now());
@@ -687,19 +776,74 @@ mod tests {
     fn idle_and_stalled_connections_fall_due() {
         let limits = Limits::default();
         let activity = Activity::new();
-        let (when, due) = activity.next(&limits);
+        let (when, due) = activity.next(&limits).unwrap();
         assert_eq!(due, Due::Close, "no first request yet");
         assert!(when <= activity.started + limits.read_header);
-        let flight = activity.begin();
-        assert_eq!(activity.next(&limits).1, Due::Nothing);
+        let flight = activity.begin(Version::HTTP_2);
+        assert_eq!(activity.next(&limits), None, "a request in progress");
         activity.write_waits();
-        let (when, due) = activity.next(&limits);
+        let (when, due) = activity.next(&limits).unwrap();
         assert_eq!(due, Due::Cut);
         assert!(when <= Instant::now() + limits.stall);
         activity.write_moved();
         drop(flight);
-        let (when, due) = activity.next(&limits);
+        let (when, due) = activity.next(&limits).unwrap();
         assert_eq!(due, Due::Close);
         assert!(when > Instant::now() + limits.idle - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn between_requests_http1_heads_are_due_within_read_header() {
+        let limits = Limits {
+            read_header: Duration::from_secs(30),
+            idle: Duration::from_secs(300),
+            ..Limits::default()
+        };
+        // HTTP/1.1: the next head within `read_header` of the last response (hyper's semantics).
+        let activity = Activity::new();
+        drop(activity.begin(Version::HTTP_11));
+        let (when, due) = activity.next(&limits).unwrap();
+        assert_eq!(due, Due::Close);
+        assert!(when <= Instant::now() + limits.read_header);
+        // HTTP/2 frames its heads: `idle`.
+        let activity = Activity::new();
+        drop(activity.begin(Version::HTTP_2));
+        let (when, _) = activity.next(&limits).unwrap();
+        assert!(when > Instant::now() + limits.idle - Duration::from_secs(1));
+        // The shorter of the two when `idle` is the shorter.
+        let short = Limits {
+            idle: Duration::from_secs(5),
+            ..limits
+        };
+        let activity = Activity::new();
+        drop(activity.begin(Version::HTTP_11));
+        let (when, _) = activity.next(&short).unwrap();
+        assert!(when <= Instant::now() + short.idle);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_body_fails_with_one_timer() {
+        use http_body_util::BodyExt;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(4);
+        tx.send(Ok(Frame::data(Bytes::from_static(b"first")))).await.unwrap();
+        let stream = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let stalled = BodyStalled::default();
+        let mut body = crate::body::boxed(StalledBody::new(
+            crate::body::boxed(stream),
+            Duration::from_millis(200),
+            stalled.clone(),
+        ));
+        assert!(body.frame().await.unwrap().is_ok());
+        // Moving within the limit: the timer is set again, not run out.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        tx.send(Ok(Frame::data(Bytes::from_static(b"second")))).await.unwrap();
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(!stalled.happened());
+        // Then nothing: the body ends with the stall error.
+        let started = Instant::now();
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(stalled.happened());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        drop(tx);
     }
 }

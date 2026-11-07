@@ -10,8 +10,8 @@
 
 use crate::body::{Body, BoxError, boxed};
 use crate::config::Limits;
-use crate::guard::{Activity, Admission, Due, Permit};
-use crate::server::{ConnState, ServerState, handle};
+use crate::guard::{Activity, Admission, Due, Permit, Tracked};
+use crate::server::{ConnState, ServerState, handle_with_log};
 use bytes::{Buf, Bytes};
 use h3::server::{RequestResolver, RequestStream};
 use http::header::{CONNECTION, DATE, HOST, TRANSFER_ENCODING, UPGRADE};
@@ -23,7 +23,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::sync::watch;
@@ -35,20 +35,32 @@ const RETRY_ABOVE: usize = 64;
 pub async fn serve(
     endpoint: quinn::Endpoint,
     state: Arc<ServerState>,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
     limits: Limits,
     admission: Arc<Admission>,
 ) {
     let handshakes = Arc::new(AtomicUsize::new(0));
+    // The server's stop, watched once here and passed on to the connections through a channel of
+    // their own (as src/server.rs `accept_loop` does).
+    let (local_stop, _) = watch::channel(false);
+    let mut stopped = std::pin::pin!(async move {
+        let mut stop = stop;
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+    });
     loop {
         let incoming = tokio::select! {
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => incoming,
                 None => break,
             },
-            _ = stop.changed() => {
+            () = &mut stopped => {
                 // No new connections; open ones are told to finish (GOAWAY) below.
                 endpoint.set_server_config(None);
+                local_stop.send_replace(true);
                 break;
             }
         };
@@ -61,18 +73,17 @@ pub async fn serve(
         }
         let remote = incoming.remote_address();
         let remote = SocketAddr::new(remote.ip().to_canonical(), remote.port());
-        let conn = state.connection(remote);
-        let retire = state.retire(&conn);
-        let Some(permit) = admission.admit(remote.ip(), conn.info().trusted) else {
+        let Some(permit) = admission.admit(remote.ip(), state.trusts(remote.ip())) else {
             tracing::debug!(%remote, "QUIC connection refused: too many open");
             incoming.refuse();
             continue;
         };
-        let stop = stop.clone();
+        let stop = local_stop.subscribe();
         let handshakes = handshakes.clone();
+        let state = state.clone();
         tokio::spawn(async move {
             let _permit: Permit = permit;
-            if let Err(e) = connection(incoming, conn, stop, retire, limits, handshakes).await {
+            if let Err(e) = connection(incoming, remote, state, stop, limits, handshakes).await {
                 tracing::debug!(error = %e, "HTTP/3 connection ended with an error");
             }
         });
@@ -90,38 +101,38 @@ impl Drop for Handshake {
 
 async fn connection(
     incoming: quinn::Incoming,
-    served: Arc<ConnState>,
+    remote: SocketAddr,
+    state: Arc<ServerState>,
     mut stop: watch::Receiver<bool>,
-    retire: Option<crate::guard::Retire>,
     limits: Limits,
     handshakes: Arc<AtomicUsize>,
 ) -> Result<(), BoxError> {
     handshakes.fetch_add(1, Ordering::AcqRel);
     let handshake = Handshake(handshakes);
-    // `confirmed`: the handshake has completed; until then requests are early data.
-    let confirmed = Arc::new(AtomicBool::new(false));
-    let conn = match incoming.accept()?.into_0rtt() {
-        Ok((conn, accepted)) => {
-            let confirmed = confirmed.clone();
-            tokio::spawn(async move {
-                accepted.await;
-                confirmed.store(true, Ordering::Release);
-            });
-            conn
-        }
-        Err(connecting) => {
-            let conn = tokio::time::timeout(limits.read_header, connecting).await??;
-            confirmed.store(true, Ordering::Release);
-            conn
-        }
+    // `confirmed`: the handshake has completed; until then requests are early data. With 0-RTT the
+    // completion is awaited in the connection's own loop below, no task of its own.
+    let (conn, accepted) = match incoming.accept()?.into_0rtt() {
+        Ok((conn, accepted)) => (conn, Some(accepted)),
+        Err(connecting) => (tokio::time::timeout(limits.read_header, connecting).await??, None),
     };
+    let mut confirmed = accepted.is_none();
+    let mut accepted = std::pin::pin!(async move {
+        match accepted {
+            Some(accepted) => {
+                accepted.await;
+            }
+            None => std::future::pending().await,
+        }
+    });
     drop(handshake);
     // The name the handshake asked for, for the Host check (src/server.rs `misdirected`).
     let sni = conn
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         .and_then(|data| data.server_name);
-    let served = served.with_sni(sni.as_deref());
+    let served = state.connection_named(remote, sni.as_deref());
+    let retire = state.retire(&served);
+    let hints = served.may_hint();
     let quic = conn.clone();
     let activity = Activity::new();
     // Headers past `max_header_size` get 431 from h3; a frame may still hold them encoded.
@@ -145,21 +156,30 @@ async fn connection(
         }
     });
     let mut retired = false;
+    // One timer, set when a deadline is due and only when it changes (as src/guard.rs `drive`).
+    let mut timer = std::pin::pin!(tokio::time::sleep_until(Instant::now().into()));
+    let mut armed: Option<Instant> = None;
     loop {
-        let (when, due) = match closing {
-            Some(since) => (since + limits.grace, Due::Cut),
-            None if stopping => (Instant::now() + limits.idle, Due::Nothing),
+        let due = match closing {
+            Some(since) => Some((since + limits.grace, Due::Cut)),
+            None if stopping => None,
             None => activity.next(&limits),
         };
+        if let Some((when, _)) = due
+            && armed != Some(when)
+        {
+            timer.as_mut().reset(when.into());
+            armed = Some(when);
+        }
         tokio::select! {
             accepted = h3.accept() => match accepted {
                 Ok(Some(resolver)) => {
                     let served = served.clone();
-                    let early = !confirmed.load(Ordering::Acquire);
-                    let flight = activity.begin();
+                    let early = !confirmed;
+                    let flight = activity.begin(Version::HTTP_3);
                     tokio::spawn(async move {
                         let _flight = flight;
-                        if let Err(e) = request(resolver, served, early, limits).await {
+                        if let Err(e) = request(resolver, served, early, hints, limits).await {
                             tracing::debug!(error = %e, "HTTP/3 request failed");
                         }
                     });
@@ -172,6 +192,8 @@ async fn connection(
                     break;
                 }
             },
+            // 0-RTT: the handshake completed; requests from here on are not early data.
+            () = &mut accepted, if !confirmed => confirmed = true,
             changed = stop.changed(), if !stopping => {
                 stopping = true;
                 if changed.is_ok() {
@@ -186,16 +208,18 @@ async fn connection(
             }
             // The last request ended: the idle clock starts; look again.
             () = activity.quiet() => {}
-            () = tokio::time::sleep_until(when.into()) => match due {
-                Due::Nothing => {}
-                Due::Close if closing.is_none() => {
-                    closing = Some(Instant::now());
-                    h3.shutdown(0).await?;
-                }
-                Due::Close => {}
-                Due::Cut => {
-                    quic.close(0u32.into(), b"idle");
-                    break;
+            () = &mut timer, if due.is_some() => {
+                armed = None;
+                match due {
+                    Some((_, Due::Close)) if closing.is_none() => {
+                        closing = Some(Instant::now());
+                        h3.shutdown(0).await?;
+                    }
+                    Some((_, Due::Cut)) => {
+                        quic.close(0u32.into(), b"idle");
+                        break;
+                    }
+                    _ => {}
                 }
             },
         }
@@ -224,10 +248,13 @@ async fn within<T, E: Into<BoxError>>(
     }
 }
 
+/// One request: `hints` when a route of the connection's routing may send Early Hints (the channel
+/// they take is made only then).
 async fn request(
     resolver: RequestResolver<crate::h3limit::Connection, Bytes>,
     conn: Arc<ConnState>,
     early: bool,
+    hints: bool,
     limits: Limits,
 ) -> Result<(), BoxError> {
     let (request, stream) = tokio::time::timeout(limits.read_header, resolver.resolve_request()).await??;
@@ -254,34 +281,40 @@ async fn request(
     {
         parts.headers.insert(HOST, value);
     }
-    let body = boxed(RecvBody {
-        stream: recv,
-        done: false,
-    });
-    // Early Hints (`respond 103`) go out as they come, while the final response is worked out.
-    let (hints, mut hinted) = tokio::sync::mpsc::channel(4);
-    parts.extensions.insert(crate::handler::EarlyHints(hints));
+    let body = RecvBody::body(recv);
     let request = crate::server::stall_limited(Request::from_parts(parts, body), limits.stall);
-    let handling = handle(conn, request);
-    let mut handling = std::pin::pin!(handling);
-    let early = |headers: http::HeaderMap| {
-        let mut early = Response::new(());
-        *early.status_mut() = StatusCode::EARLY_HINTS;
-        *early.headers_mut() = headers;
-        early
-    };
-    let response = loop {
-        tokio::select! {
-            biased;
-            Some(headers) = hinted.recv() => within(&limits, send.send_response(early(headers))).await?,
-            response = &mut handling => break response,
+    let (response, log) = if hints {
+        // Early Hints (`respond 103`) go out as they come, while the final response is worked out.
+        let (hints, mut hinted) = tokio::sync::mpsc::channel(4);
+        let mut request = request;
+        request.extensions_mut().insert(crate::handler::EarlyHints(hints));
+        let handling = handle_with_log(conn, request);
+        let mut handling = std::pin::pin!(handling);
+        let early = |headers: http::HeaderMap| {
+            let mut early = Response::new(());
+            *early.status_mut() = StatusCode::EARLY_HINTS;
+            *early.headers_mut() = headers;
+            early
+        };
+        let response = loop {
+            tokio::select! {
+                biased;
+                Some(headers) = hinted.recv() => within(&limits, send.send_response(early(headers))).await?,
+                response = &mut handling => break response,
+            }
+        };
+        // Hints given in the same step as the answer still go first.
+        while let Ok(headers) = hinted.try_recv() {
+            within(&limits, send.send_response(early(headers))).await?;
         }
+        response
+    } else {
+        handle_with_log(conn, request).await
     };
-    // Hints given in the same step as the answer still go first.
-    while let Ok(headers) = hinted.try_recv() {
-        within(&limits, send.send_response(early(headers))).await?;
-    }
-    let (mut head_parts, mut body) = response.into_parts();
+    // The log line is written when the body has been sent (or given up): with the body here, as
+    // the TCP protocols carry it in theirs.
+    let (mut head_parts, body) = response.into_parts();
+    let mut body = Tracked::new(body, None, log);
     for name in [CONNECTION, TRANSFER_ENCODING, UPGRADE] {
         head_parts.headers.remove(name);
     }
@@ -303,7 +336,7 @@ async fn request(
 
 async fn send_body(
     send: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    body: &mut Body,
+    body: &mut Tracked,
     limits: &Limits,
 ) -> Result<(), BoxError> {
     while let Some(frame) = body.frame().await {
@@ -331,7 +364,24 @@ fn safe_early(method: &Method) -> bool {
 /// The request body as it arrives on the QUIC stream (trailers are not passed on).
 struct RecvBody {
     stream: RequestStream<crate::h3limit::RecvStream, Bytes>,
+    /// Data the look at the stream's end (`new`) found already there.
+    first: Option<Bytes>,
     done: bool,
+}
+
+impl RecvBody {
+    /// The body of a request stream: the empty body, with no allocation, when the stream has
+    /// already ended (a GET's does, with its headers); otherwise the stream as it arrives.
+    fn body(mut stream: RequestStream<crate::h3limit::RecvStream, Bytes>) -> Body {
+        // One look without waiting (nothing is woken): what is there is kept for the first poll.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (first, done) = match stream.poll_recv_data(&mut cx) {
+            Poll::Ready(Ok(None)) => return crate::body::empty(),
+            Poll::Ready(Ok(Some(mut buf))) => (Some(buf.copy_to_bytes(buf.remaining())), false),
+            Poll::Ready(Err(_)) | Poll::Pending => (None, false),
+        };
+        boxed(RecvBody { stream, first, done })
+    }
 }
 
 impl http_body::Body for RecvBody {
@@ -341,6 +391,9 @@ impl http_body::Body for RecvBody {
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         if self.done {
             return Poll::Ready(None);
+        }
+        if let Some(first) = self.first.take() {
+            return Poll::Ready(Some(Ok(Frame::data(first))));
         }
         match ready!(self.stream.poll_recv_data(cx)) {
             Ok(Some(mut buf)) => {

@@ -7,19 +7,16 @@
 //! what has queued up and writes it with one call. A request never waits for the terminal or the log collector; if the
 //! queue is full (the output is stuck), lines are dropped and counted rather than slowing requests.
 
-use crate::body::{Body, BoxError};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Uri};
-use http_body::{Frame, SizeHint};
+use http_body::Frame;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll, ready};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +47,8 @@ pub enum Format {
     Console,
 }
 
-#[derive(Debug)]
+/// Two small enums: copied into each request that logs, so that no count on the site is touched.
+#[derive(Debug, Clone, Copy)]
 pub struct AccessLog {
     pub output: Output,
     pub format: Format,
@@ -354,19 +352,19 @@ pub(crate) fn json_escape(out: &mut String, text: &str) {
     }
 }
 
-/// Counts the bytes of a response body and writes the log line when the body ends or is dropped.
-pub struct LoggedBody {
-    inner: Body,
-    log: Arc<AccessLog>,
+/// A request's log line in waiting: counts the bytes of the response body's frames as they are
+/// shown to it, and writes the line when told the body ended, or when dropped. Carried by the
+/// response body's own wrapper (src/guard.rs `Tracked`), not a body of its own.
+pub struct Logged {
+    log: AccessLog,
     info: Option<RequestInfo>,
     status: u16,
     size: u64,
 }
 
-impl LoggedBody {
-    pub fn new(inner: Body, log: Arc<AccessLog>, info: RequestInfo, status: u16) -> LoggedBody {
-        LoggedBody {
-            inner,
+impl Logged {
+    pub fn new(log: AccessLog, info: RequestInfo, status: u16) -> Logged {
+        Logged {
             log,
             info: Some(info),
             status,
@@ -374,40 +372,22 @@ impl LoggedBody {
         }
     }
 
-    fn finish(&mut self) {
+    /// A frame of the response body went out.
+    pub fn count(&mut self, frame: &Frame<Bytes>) {
+        if let Some(data) = frame.data_ref() {
+            self.size += data.len() as u64;
+        }
+    }
+
+    /// The body ended: the line is written (once).
+    pub fn finish(&mut self) {
         if let Some(info) = self.info.take() {
             self.log.write(&info, self.status, self.size);
         }
     }
 }
 
-impl http_body::Body for LoggedBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        let polled = ready!(Pin::new(&mut self.inner).poll_frame(cx));
-        match &polled {
-            Some(Ok(frame)) => {
-                if let Some(data) = frame.data_ref() {
-                    self.size += data.len() as u64;
-                }
-            }
-            Some(Err(_)) | None => self.finish(),
-        }
-        Poll::Ready(polled)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl Drop for LoggedBody {
+impl Drop for Logged {
     fn drop(&mut self) {
         self.finish();
     }
