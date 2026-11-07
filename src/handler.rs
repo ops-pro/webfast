@@ -342,6 +342,10 @@ impl Ctx {
 
     /// A proxied response: the headers `header` set earlier come first, the upstream's are added.
     pub fn respond_appending(&mut self, mut response: Response<Body>) -> Response<Body> {
+        // Nothing set earlier (most often): the response's own map, not one made anew.
+        if self.pre_headers.is_empty() {
+            return response;
+        }
         let mut headers = std::mem::take(&mut self.pre_headers);
         let mut current: Option<HeaderName> = None;
         for (name, value) in std::mem::take(response.headers_mut()) {
