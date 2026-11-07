@@ -1,30 +1,118 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-11-07
 
-- The repository is a Cargo workspace: `crates/webfast-core` (the server as a library,
-  `webfast_core`) and `crates/webfast` (the binary: `main.rs` and `compose.rs`, which names the
-  modules it is built with). The request filter (NGFW) and the browser challenge moved to
-  https://github.com/ops-pro/webfast-modules as the crates `webfast-ngfw` and `webfast-challenge`,
-  with their documentation and changelog; the binary compiles them in through its features `ngfw`
-  and `challenge` (on by default), as git dependencies pinned by `Cargo.lock`. `cargo build --release`
-  at the root still yields `target/release/webfast`; `Cargo.lock` stays at the root; the release
-  profiles and the dependency versions are the workspace's. The checks run on both crates
-  (`scripts/check.sh`, CI).
-- A module API (`webfast_core::module`, docs/modules.md): the core knows no module by name. A
-  module is a crate against the core's public API — a `Module` the binary registers (its
-  directives with their place in the directive order, its environment, its files into
-  `Config::modules`, its lines for `validate`, its reload), route handlers
-  (`Handler::Extension`), request checks (`Check`: the head decides synchronously, a boxed
-  future only for a body) and inspectors of proxied responses (`Inspect`) — composed in the
-  binary's `compose.rs` as tuples the core calls through one `&'static dyn` per kind. A clean
-  request allocates nothing more than before. The request filter and the browser challenge are
-  written on it, with `webfast_core::` paths alone, and their tests on the core's test harness
-  (`webfast_core::harness`, cargo feature `test-harness`). What the modules needed of the core
-  became public: the directive parser's types and helpers (`config::{Cx, Scope, SiteCx, Entry,
-  entry, matcher_token, add_matcher, at_err, token_err}`), `guard::address_key`,
-  `proxy::remove_lookalikes`, `accesslog::json_escape`; `eventlog` and `yaml` are always built,
-  the HTTPS client is the core's `fetch` feature.
+Less CPU and fewer allocations wherever a response is compressed, proxied, cached or goes through
+the chain; the repository as a workspace with a module API; and the first modules, compiled into
+the binary: the NGFW request filter and the browser challenge
+([webfast-modules 0.1.0](https://github.com/ops-pro/webfast-modules/releases/tag/v0.1.0)).
+
+Worth knowing when upgrading from 0.1.2:
+
+- The modules are in the binary and off until configured: the request filter when
+  `WEB_NGFW_CONFIG` names its file, the browser challenge where a site has the `challenge`
+  directive. A binary built without one of them (`--no-default-features`) refuses to start when
+  that module's variable is set, instead of ignoring it.
+- A refusal of the JWT or the API firewall without `log.output` is written by the batching
+  stderr writer in the event log's own JSON shape, no longer through `tracing`'s unbuffered
+  writer.
+- The shared runtime has at most four workers when every server runs per core and HTTP/3 is off;
+  the per-core threads already number the CPUs.
+- `rewrite * ?q=1` keeps the path's percent-encoding, as Caddy does.
+- Building from source: the repository is a Cargo workspace; `cargo build --release` at the root
+  still yields `target/release/webfast` (`-p webfast`), and the modules are git dependencies on
+  webfast-modules pinned by `Cargo.lock`.
+
+### Faster
+
+- Compression: a compressor's state is kept per thread and reset between responses (gzip drives
+  deflate and writes its own header and trailer, zstd a reused context; Brotli's window fits the
+  body); gzip runs on zlib-rs, already in the tree for rustls; a body known at once is not
+  collected again; `compressible` checks the common types first.
+- Static files: a file's `.br`/`.gz`/`.zst` siblings are found once at load; a direct hit is
+  looked up without copying the path; `hide` patterns are normalized once.
+- Cache: Cache-Control directives compared in place; a miss's Cache-Status values made once; an
+  entry's ETag, Content-Length and Age as ready header values; a storable miss builds its fetch on
+  the worker, not before the first byte.
+- The chain: its future is not boxed per request; two deferred hooks inline; a failure's reason is
+  a static string and marked only where `handle_errors` reads it; `rewrite` and `handle_path`
+  build the new URI in one string; `path_regexp` groups in one allocation.
+- Proxy: the upstream's headers copied in one pass with room for all of them, Connection tokens
+  removed by their text, the response's hop-by-hop fields in one pass, the body boxed once;
+  `header_down` without placeholders applied as it is; a body's stall or excess size told by its
+  error instead of shared flags (a proxied POST: 37 → 30 allocations).
+- Connections: hyper's per-request header timer is off (the connection's own timer bounds the
+  heads, with the same limits); the idle timer is not re-armed on every poll; the access log line
+  is written by the tracking body, not a second wrapper; the stop signal, the per-address
+  admission counts (64 shards) and hyper's builders are no longer shared or rebuilt per
+  connection; HTTP/2 and HTTP/3 requests without a body get the empty body without an allocation.
+- Logs and limits: timestamps and durations written from integers, the event log's writer
+  resolved once, ahash for rate-limit keys and upstream slots, shards on cache lines of their own.
+
+Measured as for 0.1.2 (in process, a single-threaded runtime pinned to one core, Linux, the
+release profile, mimalloc with a counting allocator; "through a connection" is a keep-alive
+HTTP/1.1 connection over loopback), the mean of two runs of each build, per request or call:
+
+| Case                                                   | 0.1.2    | 0.1.3    | Allocations | Allocated          |
+| ------------------------------------------------------ | -------- | -------- | ----------- | ------------------ |
+| Through a connection: a ready answer                   | 10.6 µs  | 10.5 µs  | 5 → 4       | 8.7 → 8.6 KB       |
+| Through a connection: `respond {path}` (not ready)     | 11.3 µs  | 11.2 µs  | 7 → 5       | 15.8 → 8.9 KB      |
+| Through a connection: a 404 through the chain          | 12.1 µs  | 11.6 µs  | 16 → 8      | 17.1 → 9.6 KB      |
+| Through a connection: a file, 8 KiB, chain and log     | 13.2 µs  | 13.0 µs  | 12 → 7      | 18.8 → 11.5 KB     |
+| Through a connection: a file, 8 KiB, gzip on the fly   | 95.3 µs  | 76.9 µs  | 26 → 11     | 375 → 15.7 KB      |
+| Through a connection: a cache hit, 8 KiB               | 13.1 µs  | 12.8 µs  | 9 → 5       | 16.5 → 9.6 KB      |
+| Through a connection: proxy, 8 KiB, identity           | 31.2 µs  | 29.2 µs  | 29 → 26     | 51.7 → 44.2 KB     |
+| Through a connection: proxy, `Connection: keep-alive`  | 31.3 µs  | 29.6 µs  | 31 → 26     | 51.3 → 44.9 KB     |
+| Through a connection: proxy, POST of 1 KiB             | 33.0 µs  | 30.7 µs  | 37 → 30     | 52.0 → 45.5 KB     |
+| Through a connection: proxy, 8 KiB, zstd               | 83.1 µs  | 48.3 µs  | 35 → 30     | 88.4 → 53.3 KB     |
+| Through a connection: proxy, 8 KiB, br                 | 122 µs   | 122 µs   | 62 → 58     | 736 → 730 KB       |
+| Proxy, 8 KiB, gzip, ETag                               | 101 µs   | 81.4 µs  | 51 → 41     | 402 → 49.2 KB      |
+| Proxy, chunked 16 × 4 KiB, gzip                        | 672 µs   | 554 µs   | 65 → 55     | 399 → 46.3 KB      |
+| Proxy, chunked 16 × 4 KiB, zstd                        | 116 µs   | 81.8 µs  | 58 → 71 ¹   | 65.5 → 66.9 KB     |
+| `compressible("text/html; charset=utf-8")`             | 88 ns    | 17 ns    | 0 → 0       | 0                  |
+| `compress_best`, gzip, 256 KiB                         | 43.5 ms  | 20.4 ms  | 10 → 5      | 442 → 503 KB       |
+| A TLS handshake (full or resumed)                      | =        | =        | 262 → 259   | +5.5 KB ²          |
+
+¹ zstd's stream calls take more, smaller allocations than the crate's writer did; the context
+itself, several MB, is no longer made per response.
+
+² The connection's task holds hyper's builders by reference and its timers inline: a few KB
+more for each connection's future, allocated once, not per request.
+
+### Modules
+
+The repository is a Cargo workspace: `crates/webfast-core`, the server as a library
+(`webfast_core`), and `crates/webfast`, the binary, whose `compose.rs` names the modules it is
+built with. The module API (`webfast_core::module`, docs/modules.md): a module is a crate against
+the core's public API — a `Module` the binary registers (its directives and their place in the
+directive order, its environment, its files into `Config::modules`, its lines for `validate`, its
+reload), route handlers (`Handler::Extension`), request checks (`Check`: the head decides
+synchronously, a future is boxed only for a body) and inspectors of proxied responses (`Inspect`),
+composed as tuples the core calls through one `&'static dyn` per kind; the core names no module.
+A clean request allocates nothing more than before. Modules are tested on the core's harness
+(`webfast_core::harness`, cargo feature `test-harness`). What a module needs became public: the
+directive parser's types and helpers, the event log, `Activity::cut` (a connection closed without
+an answer, the 444), the inspection step of every proxied response, `fetch` (the HTTPS client, a
+cargo feature of the core). A request check's refusal marked `ErrorPage` goes through the site's
+`handle_errors`, like a handler's failure.
+
+The two modules of this release, from
+[webfast-modules](https://github.com/ops-pro/webfast-modules) (documentation and changelog
+there):
+
+- **The NGFW request filter** (`webfast-ngfw`): rules with anomaly scoring over the request's
+  head and body and over proxied responses — eleven built-in sets of seventy rules: protocol
+  anomalies, scanners and probes, path traversal, remote inclusion, command, PHP, SQL, template
+  and script injection, file uploads, leaking error pages — which a site's own file extends,
+  replaces, overrides or disables; access by address lists and feeds, country and ASN, honeypot
+  paths and a ban list. A clean GET costs it 2–3 µs and no allocation; a refusal is cheaper than
+  an answer.
+- **The browser challenge** (`webfast-challenge`): a client proves it is a browser — a cookie, a
+  script, a proof-of-work or a CAPTCHA (Turnstile, hCaptcha, reCAPTCHA) — before a site answers,
+  for every request or only once it is over a rate (`defer`), asked by the `challenge` directive
+  or by the request filter (`action: challenge`). A signed cookie bound to the client's address
+  block and browser, keys from the TLS ticket seed so replicas accept each other's cookies, no
+  state per client; a request with a good cookie costs no more than one without the directive.
 
 ## 0.1.2 — 2026-11-06
 

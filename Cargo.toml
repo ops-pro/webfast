@@ -4,7 +4,7 @@ members = ["crates/webfast-core", "crates/webfast"]
 default-members = ["crates/webfast"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # let chains (`if let … && let …`): 1.88; serde-saphyr: 1.89.
 rust-version = "1.89"
