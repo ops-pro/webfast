@@ -182,6 +182,28 @@ impl Template {
         self.parts.is_empty()
     }
 
+    /// `f` of the filled-in text, rendered into a buffer the thread keeps (let go of past 1 KiB):
+    /// for text that is only looked at, hashed or copied into a header value, no string of its own.
+    pub fn with_rendered<R>(&self, ctx: &Ctx, f: impl FnOnce(&str) -> R) -> R {
+        const KEPT: usize = 1024;
+        thread_local! {
+            static TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        TEXT.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut text) => {
+                text.clear();
+                self.render_into(ctx, &mut text);
+                let out = f(&text);
+                if text.capacity() > KEPT {
+                    *text = String::new();
+                }
+                out
+            }
+            // `f` renders a template too: that one gets a string of its own.
+            Err(_) => f(&self.render(ctx)),
+        })
+    }
+
     pub fn render(&self, ctx: &Ctx) -> String {
         let mut out = String::with_capacity(self.reserve);
         self.render_into(ctx, &mut out);

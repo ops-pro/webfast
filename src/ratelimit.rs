@@ -348,26 +348,13 @@ impl Zone {
     /// The request's key hash. A template is rendered into a buffer kept by the thread: the key
     /// is made a string of its own only when it is logged (a refused request, with `log_key`).
     fn key_of(&self, ctx: &Ctx) -> u64 {
-        /// A key longer than this (a long header) is not kept in the buffer after it is hashed.
-        const KEPT: usize = 1024;
-        thread_local! {
-            static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-        }
         let state = &self.state;
         match &self.key {
             Key::Static => 0,
             Key::Address(sole) => state.hash_address(address(sole, ctx)),
-            Key::Template(template) => KEY.with_borrow_mut(|text| {
-                text.clear();
-                template.render_into(ctx, text);
-                let hash = match text.parse::<IpAddr>() {
-                    Ok(ip) if state.ipv4_prefix > 0 || state.ipv6_prefix > 0 => state.hash_address(ip),
-                    _ => state.hasher.hash_one(text.as_bytes()),
-                };
-                if text.capacity() > KEPT {
-                    *text = String::new();
-                }
-                hash
+            Key::Template(template) => template.with_rendered(ctx, |text| match text.parse::<IpAddr>() {
+                Ok(ip) if state.ipv4_prefix > 0 || state.ipv6_prefix > 0 => state.hash_address(ip),
+                _ => state.hasher.hash_one(text.as_bytes()),
             }),
         }
     }

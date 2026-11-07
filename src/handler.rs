@@ -641,7 +641,7 @@ impl Value {
     fn get(&self, ctx: Option<&Ctx>) -> Option<HeaderValue> {
         match self {
             Value::Static(value) => Some(value.clone()),
-            Value::Dynamic(template) => HeaderValue::from_str(&template.render(ctx?)).ok(),
+            Value::Dynamic(template) => template.with_rendered(ctx?, |text| HeaderValue::from_str(text).ok()),
         }
     }
 }
