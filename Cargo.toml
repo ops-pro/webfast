@@ -64,7 +64,9 @@ aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys",
 blake3 = "1"
 brotli = "8"
 bytes = "1"
-flate2 = "1"
+# gzip on zlib-rs, which rustls already brings for certificate compression: faster than the default
+# miniz_oxide backend, no crate added.
+flate2 = { version = "1", features = ["zlib-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1"
