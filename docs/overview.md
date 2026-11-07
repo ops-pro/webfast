@@ -209,5 +209,6 @@ flowchart LR
 
 The request checks are configured outside the Caddyfile, so an edit there cannot switch them off;
 a check bound to an upstream that no `reverse_proxy` sends to stops the startup and a reload.
-The modules are composed into the binary by `crates/webfast/src/compose.rs` (docs/modules.md);
-this repository composes none yet, and their documentation is webfast-modules'.
+The modules are composed into the binary by `crates/webfast/src/compose.rs` (docs/modules.md), as
+git dependencies on webfast-modules behind the features `ngfw` and `challenge`; their
+documentation is webfast-modules'.

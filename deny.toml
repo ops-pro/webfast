@@ -34,8 +34,12 @@ exceptions = [{ crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] }]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace's own crates depend on each other by path, without a version.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The modules (crates/webfast/src/compose.rs) come from this repository, pinned by Cargo.lock.
+allow-git = ["https://github.com/ops-pro/webfast-modules"]

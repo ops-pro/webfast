@@ -22,7 +22,7 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme"]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme", "ngfw", "challenge"]
 # The core's features, passed through (crates/webfast-core/Cargo.toml says what each is).
 acme = ["webfast-core/acme"]
 api-firewall = ["webfast-core/api-firewall"]
@@ -32,9 +32,16 @@ proxy-cache = ["webfast-core/proxy-cache"]
 rate-limit = ["webfast-core/rate-limit"]
 # mimalloc as the global allocator of the binary (and of examples/bench.rs) instead of the system's.
 mimalloc = ["webfast-core/mimalloc", "dep:mimalloc"]
+# The modules, crates of https://github.com/ops-pro/webfast-modules (src/compose.rs): the request
+# filter, on when WEB_NGFW_CONFIG names its file, and the browser challenge (the `challenge`
+# directive). The filter's own `challenge` feature follows this crate's.
+ngfw = ["dep:webfast-ngfw"]
+challenge = ["dep:webfast-challenge", "webfast-ngfw?/challenge"]
 
 [dependencies]
 webfast-core.workspace = true
+webfast-ngfw = { git = "https://github.com/ops-pro/webfast-modules", branch = "main", version = "0.1", default-features = false, optional = true }
+webfast-challenge = { git = "https://github.com/ops-pro/webfast-modules", branch = "main", version = "0.1", optional = true }
 mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

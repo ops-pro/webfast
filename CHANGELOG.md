@@ -6,7 +6,8 @@
   `webfast_core`) and `crates/webfast` (the binary: `main.rs` and `compose.rs`, which names the
   modules it is built with). The request filter (NGFW) and the browser challenge moved to
   https://github.com/ops-pro/webfast-modules as the crates `webfast-ngfw` and `webfast-challenge`,
-  with their documentation and changelog; this binary composes none yet. `cargo build --release`
+  with their documentation and changelog; the binary compiles them in through its features `ngfw`
+  and `challenge` (on by default), as git dependencies pinned by `Cargo.lock`. `cargo build --release`
   at the root still yields `target/release/webfast`; `Cargo.lock` stays at the root; the release
   profiles and the dependency versions are the workspace's. The checks run on both crates
   (`scripts/check.sh`, CI).

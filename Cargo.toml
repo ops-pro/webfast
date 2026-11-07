@@ -65,3 +65,9 @@ zstd = "0.14"
 codegen-units = 1
 lto = "fat"
 strip = "symbols"
+
+# The modules (webfast-modules) depend on webfast-core by git; in this workspace that is the crate
+# next to them, so there is one core, not two: the trait the modules implement is the one the
+# binary composes. Cargo.lock keeps the modules' commit.
+[patch."https://github.com/ops-pro/webfast"]
+webfast-core = { path = "crates/webfast-core" }

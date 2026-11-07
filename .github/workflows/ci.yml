@@ -47,9 +47,9 @@ jobs:
             cargo clippy --locked -p webfast-core --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
           done
-      - name: each of the binary's modules alone (none composed yet: webfast-modules' crates come next)
+      - name: each of the binary's modules alone
         run: |
-          for feature in; do
+          for feature in ngfw challenge; do
             echo "::group::$feature"
             cargo clippy --locked -p webfast --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
