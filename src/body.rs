@@ -45,6 +45,18 @@ pub fn empty() -> Body {
     Body(Kind::Empty)
 }
 
+impl Body {
+    /// The bytes of a body known at once (`full`, `empty`), with nothing collected or allocated;
+    /// a stream comes back as it is, to be collected.
+    pub fn into_bytes_if_ready(self) -> Result<Bytes, Body> {
+        match self.0 {
+            Kind::Empty => Ok(Bytes::new()),
+            Kind::Full(bytes) => Ok(bytes.unwrap_or_default()),
+            Kind::Stream(_) => Err(self),
+        }
+    }
+}
+
 /// Any body whose errors convert into `BoxError` (hyper's `Incoming`, encoders…).
 pub fn boxed<B>(body: B) -> Body
 where
@@ -100,6 +112,17 @@ mod tests {
         assert!(empty().is_end_stream());
         let stream = boxed(http_body_util::Full::new(Bytes::from_static(b"abc")));
         assert_eq!(stream.size_hint().exact(), Some(3));
+        assert_eq!(&stream.collect().await.unwrap().to_bytes()[..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn ready_bytes_are_taken_as_they_are_and_a_stream_is_given_back() {
+        assert_eq!(full("hello").into_bytes_if_ready().ok().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(empty().into_bytes_if_ready().ok().as_deref(), Some(&b""[..]));
+        let stream = boxed(http_body_util::Full::new(Bytes::from_static(b"abc")));
+        let Err(stream) = stream.into_bytes_if_ready() else {
+            panic!("a stream is not ready");
+        };
         assert_eq!(&stream.collect().await.unwrap().to_bytes()[..], b"abc");
     }
 }

@@ -34,7 +34,10 @@ measured in one sitting, in alternating order.
 - **Compression off the request threads**: an on-the-fly body over 64 KiB is compressed on the
   blocking pool, so a worker does not spend milliseconds of Brotli while other requests wait;
   bodies of known length up to 1 MiB are compressed whole and sent with `Content-Length`, streams
-  frame by frame.
+  frame by frame. A compressor's state is many times the body it is for (deflate's tables run to
+  hundreds of KB, zstd's workspace to megabytes), so each thread keeps one gzip state and one zstd
+  context and resets them between bodies instead of making them per response; Brotli's encoder
+  cannot be reset and gets a window and size hint fitted to the body instead.
 - **Build**: one codegen unit, fat LTO, mimalloc, and profile-guided optimisation (below).
 
 ## Against other servers

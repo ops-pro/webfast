@@ -163,16 +163,22 @@ impl AcceptEncoding {
     }
 }
 
-/// Caddy's default list of compressible types (`*` at the end: any parameters or subtype tail).
+/// Caddy's default list of compressible types (`*` at the end: any parameters or subtype tail),
+/// the common ones first: `types_match` stops at the first that fits, and nearly every response
+/// is text, JSON, a script, XML, an SVG or a font.
 pub const DEFAULT_TYPES: &[&str] = &[
+    "text/*",
+    "application/json*",
+    "application/javascript*",
+    "application/xml*",
+    "image/svg+xml*",
+    "font/*",
     "application/atom+xml*",
     "application/eot*",
     "application/font*",
     "application/geo+json*",
     "application/graphql+json*",
     "application/graphql-response+json*",
-    "application/javascript*",
-    "application/json*",
     "application/ld+json*",
     "application/manifest+json*",
     "application/opentype*",
@@ -191,14 +197,10 @@ pub const DEFAULT_TYPES: &[&str] = &[
     "application/x-protobuf*",
     "application/x-ttf*",
     "application/xhtml+xml*",
-    "application/xml*",
-    "font/*",
-    "image/svg+xml*",
     "image/vnd.microsoft.icon*",
     "image/x-icon*",
     "multipart/bag*",
     "multipart/mixed*",
-    "text/*",
 ];
 
 /// Bodies up to this size (by Content-Length) are compressed whole.
@@ -274,20 +276,26 @@ impl Encode {
         {
             headers.insert(ETAG, value);
         }
-        let mut encoder = Encoder::new(encoding, self);
+        let levels = Levels::of(self);
         if known_length.is_some() {
-            let compressed = match http_body_util::BodyExt::collect(body).await {
-                Ok(collected) => {
-                    let data = collected.to_bytes();
-                    if data.len() > INLINE_LIMIT {
-                        tokio::task::spawn_blocking(move || encoder.compress_all(&data))
-                            .await
-                            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-                    } else {
-                        encoder.compress_all(&data)
-                    }
-                }
-                Err(e) => Err(std::io::Error::other(e.to_string())),
+            // A body known at once (a file, a ready answer) is taken as it is; only a stream is
+            // collected.
+            let data = match body.into_bytes_if_ready() {
+                Ok(bytes) => Ok(bytes),
+                Err(body) => http_body_util::BodyExt::collect(body)
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .map_err(|e| std::io::Error::other(e.to_string())),
+            };
+            let compressed = match data {
+                // The encoder is taken where it is used: a blocking thread keeps its own pool.
+                Ok(data) if data.len() > INLINE_LIMIT => tokio::task::spawn_blocking(move || {
+                    Encoder::new(encoding, levels, Some(data.len())).compress_all(&data)
+                })
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string()))),
+                Ok(data) => Encoder::new(encoding, levels, Some(data.len())).compress_all(&data),
+                Err(e) => Err(e),
             };
             return match compressed {
                 Ok(bytes) => {
@@ -308,7 +316,7 @@ impl Encode {
             parts,
             crate::body::boxed(EncodedBody {
                 inner: body,
-                encoder: Some(encoder),
+                encoder: Some(Encoder::new(encoding, levels, None)),
             }),
         )
     }
@@ -531,61 +539,230 @@ pub fn has_vary(headers: &HeaderMap, field: &str) -> bool {
         .any(|v| v.trim().eq_ignore_ascii_case(field) || v.trim() == "*")
 }
 
-/// A streaming compressor: each `write` returns what the input produced, flushed.
+/// The directive's levels, copied for an encoder made on the blocking pool.
+#[derive(Clone, Copy)]
+struct Levels {
+    gzip: u32,
+    zstd: i32,
+    br: u32,
+}
+
+impl Levels {
+    fn of(config: &Encode) -> Levels {
+        Levels {
+            gzip: config.gzip_level,
+            zstd: config.zstd_level,
+            br: config.br_level,
+        }
+    }
+}
+
+/// A compressor's state is far larger than the body it is for — deflate's tables run to hundreds
+/// of KB, zstd's workspace to megabytes — and making one per response cost more than the
+/// compressing (measured on an 8 KiB body). So each thread keeps one gzip state and one zstd
+/// context, reset between uses: `Encoder::new` takes it, `finish` gives it back. More than one at
+/// a time on a thread (streams in flight) are made as before and freed when done; one dropped
+/// mid-stream (the client went) is freed too. A blocking thread has a pool of its own, which goes
+/// when the thread ends. Brotli's encoder cannot be reset: it is made per response, its window
+/// and size hint fitted to the body (`brotli_params`).
+struct Pool {
+    gzip: Option<Gzip>,
+    zstd: Option<zstd::zstd_safe::CCtx<'static>>,
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Pool> = const { std::cell::RefCell::new(Pool { gzip: None, zstd: None }) };
+}
+
+/// A streaming compressor: each `write` returns what the input produced, flushed; `finish` what
+/// is left, and returns the state to the thread's `Pool`. `None` inside once finished.
 enum Encoder {
-    Gzip(flate2::write::GzEncoder<Vec<u8>>),
-    Zstd(Option<zstd::stream::write::Encoder<'static, Vec<u8>>>),
+    Gzip(Option<Gzip>),
+    Zstd(Option<Zstd>),
     Br(Option<Box<brotli::CompressorWriter<Vec<u8>>>>),
 }
 
+/// gzip as a raw deflate stream with the member's header and trailer written here: flate2's
+/// `GzEncoder` cannot be reset, its `DeflateEncoder` can, and the trailer is only a CRC-32 and
+/// the length.
+struct Gzip {
+    deflate: flate2::write::DeflateEncoder<Vec<u8>>,
+    crc: flate2::Crc,
+    level: u32,
+}
+
+impl Gzip {
+    fn new(level: u32) -> Gzip {
+        Gzip {
+            deflate: flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level)),
+            crc: flate2::Crc::new(),
+            level,
+        }
+    }
+
+    /// The member's header into the (empty) buffer: no modification time, no name, unknown OS, the
+    /// XFL flag for the fastest and best levels, as flate2 writes it.
+    fn start(&mut self) {
+        let xfl = match self.level {
+            9.. => 2,
+            0..=1 => 4,
+            _ => 0,
+        };
+        self.deflate
+            .get_mut()
+            .extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 255]);
+    }
+
+    fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.crc.update(data);
+        self.deflate.write_all(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<Bytes> {
+        self.deflate.flush()?;
+        Ok(Bytes::from(std::mem::take(self.deflate.get_mut())))
+    }
+
+    /// The rest of the member with its trailer; the state is reset for the next.
+    fn finish(&mut self) -> std::io::Result<Bytes> {
+        let mut out = self.deflate.reset(Vec::new())?;
+        out.extend_from_slice(&self.crc.sum().to_le_bytes());
+        out.extend_from_slice(&self.crc.amount().to_le_bytes());
+        self.crc.reset();
+        Ok(Bytes::from(out))
+    }
+}
+
+/// zstd on its context directly (the crate's writer cannot be reused after a frame): a whole body
+/// in one call, which sizes the workspace to it; a stream frame by frame.
+struct Zstd {
+    cctx: zstd::zstd_safe::CCtx<'static>,
+    out: Vec<u8>,
+}
+
+fn zstd_error(code: usize) -> std::io::Error {
+    std::io::Error::other(zstd::zstd_safe::get_error_name(code))
+}
+
+/// `out` after what it holds, with room for the next call (zstd writes into the capacity only).
+fn room(out: &mut Vec<u8>) -> zstd::zstd_safe::OutBuffer<'_, Vec<u8>> {
+    let len = out.len();
+    if len == out.capacity() {
+        out.reserve(len.max(1024));
+    }
+    zstd::zstd_safe::OutBuffer::around_pos(out, len)
+}
+
+/// A context whose frame is complete, back to the thread's pool (when it has none).
+fn pool_zstd(cctx: zstd::zstd_safe::CCtx<'static>) {
+    POOL.with_borrow_mut(|pool| {
+        if pool.zstd.is_none() {
+            pool.zstd = Some(cctx);
+        }
+    });
+}
+
+impl Zstd {
+    /// The thread's context, or a new one; at `level`, its session reset.
+    fn new(level: i32) -> Option<Zstd> {
+        use zstd::zstd_safe::{CCtx, CParameter, ResetDirective};
+        let mut cctx = POOL
+            .with_borrow_mut(|pool| pool.zstd.take())
+            .unwrap_or_else(CCtx::create);
+        cctx.reset(ResetDirective::SessionOnly).ok()?;
+        cctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
+        Some(Zstd { cctx, out: Vec::new() })
+    }
+
+    /// `data` through the stream, then flushed: what came out is in `out`.
+    fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use zstd::zstd_safe::InBuffer;
+        self.out.reserve(room_for(data.len()));
+        let mut input = InBuffer::around(data);
+        while input.pos() < data.len() {
+            let mut output = room(&mut self.out);
+            self.cctx.compress_stream(&mut output, &mut input).map_err(zstd_error)?;
+        }
+        loop {
+            let mut output = room(&mut self.out);
+            if self.cctx.flush_stream(&mut output).map_err(zstd_error)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Ends the frame: what is left in `out`.
+    fn finish(&mut self) -> std::io::Result<()> {
+        loop {
+            let mut output = room(&mut self.out);
+            if self.cctx.end_stream(&mut output).map_err(zstd_error)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// A whole body in one call, the frame with its size: zstd fits the window and the workspace
+    /// to it. The output has `compress_bound` of room, which the call needs.
+    fn compress_all(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
+        let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()));
+        self.cctx.compress2(&mut out, data).map_err(zstd_error)?;
+        Ok(Bytes::from(out))
+    }
+}
+
+/// Brotli at `level` for a body of `len` bytes when known: a window no larger than it needs (16 to
+/// 22 bits; the default is 22, 4 MiB, for every body) and the size hint, by which the encoder
+/// picks its hasher.
+fn brotli_params(level: u32, len: Option<usize>) -> brotli::enc::BrotliEncoderParams {
+    let mut params = brotli::enc::BrotliEncoderInitParams();
+    params.quality = level as i32;
+    if let Some(len) = len {
+        // The least number of bits that spans the body (16 for one of 65 536 bytes).
+        let bits = (usize::BITS - len.saturating_sub(1).leading_zeros()) as i32;
+        params.lgwin = bits.clamp(16, 22);
+        params.size_hint = len;
+    }
+    params
+}
+
 impl Encoder {
-    fn new(encoding: Encoding, config: &Encode) -> Encoder {
+    /// For a body of `len` bytes, or a stream (`None`).
+    fn new(encoding: Encoding, levels: Levels, len: Option<usize>) -> Encoder {
         match encoding {
-            Encoding::Gzip => Encoder::Gzip(flate2::write::GzEncoder::new(
-                Vec::new(),
-                flate2::Compression::new(config.gzip_level),
-            )),
-            Encoding::Zstd => Encoder::Zstd(zstd::stream::write::Encoder::new(Vec::new(), config.zstd_level).ok()),
-            Encoding::Br => Encoder::Br(Some(Box::new(brotli::CompressorWriter::new(
+            Encoding::Gzip => {
+                let mut gzip = POOL
+                    .with_borrow_mut(|pool| pool.gzip.take())
+                    .filter(|gzip| gzip.level == levels.gzip)
+                    .unwrap_or_else(|| Gzip::new(levels.gzip));
+                gzip.start();
+                Encoder::Gzip(Some(gzip))
+            }
+            Encoding::Zstd => Encoder::Zstd(Zstd::new(levels.zstd)),
+            Encoding::Br => Encoder::Br(Some(Box::new(brotli::CompressorWriter::with_params(
                 Vec::new(),
                 4096,
-                config.br_level,
-                22,
+                &brotli_params(levels.br, len),
             )))),
         }
     }
 
-    /// The buffer the compressed bytes go to; `None` once finished.
-    fn buffer(&mut self) -> Option<&mut Vec<u8>> {
-        match self {
-            Encoder::Gzip(e) => Some(e.get_mut()),
-            Encoder::Zstd(e) => e.as_mut().map(|e| e.get_mut()),
-            Encoder::Br(e) => e.as_mut().map(|e| e.get_mut()),
-        }
-    }
-
     fn write(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
-        // No room made ahead here (measured): the compressors hand a flushed part over in one write
-        // of its size, so the empty buffer takes exactly that, and `Bytes` of a full vector needs
-        // no allocation of its own — spare room would cost both.
-        fn out(buffer: &mut Vec<u8>) -> Bytes {
-            Bytes::from(std::mem::take(buffer))
-        }
+        // No room made ahead for gzip and Brotli (measured): they hand a flushed part over in one
+        // write of its size, so the empty buffer takes exactly that, and `Bytes` of a full vector
+        // needs no allocation of its own — spare room would cost both.
         match self {
-            Encoder::Gzip(e) => {
-                e.write_all(data)?;
-                e.flush()?;
-                Ok(out(e.get_mut()))
+            Encoder::Gzip(Some(e)) => {
+                e.write(data)?;
+                e.flush()
             }
             Encoder::Zstd(Some(e)) => {
-                e.write_all(data)?;
-                e.flush()?;
-                Ok(out(e.get_mut()))
+                e.write(data)?;
+                Ok(Bytes::from(std::mem::take(&mut e.out)))
             }
             Encoder::Br(Some(e)) => {
                 e.write_all(data)?;
                 e.flush()?;
-                Ok(out(e.get_mut()))
+                Ok(Bytes::from(std::mem::take(e.get_mut())))
             }
             _ => Err(std::io::Error::other("encoder already finished")),
         }
@@ -593,26 +770,50 @@ impl Encoder {
 
     /// A whole body: no intermediate flushes.
     fn compress_all(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
-        if let Some(buffer) = self.buffer() {
-            buffer.reserve(room_for(data.len()));
-        }
         match self {
-            Encoder::Gzip(e) => e.write_all(data)?,
-            Encoder::Zstd(Some(e)) => e.write_all(data)?,
-            Encoder::Br(Some(e)) => e.write_all(data)?,
+            Encoder::Gzip(Some(e)) => {
+                e.deflate.get_mut().reserve(room_for(data.len()));
+                e.write(data)?;
+            }
+            // One call, the frame complete: nothing to end, the context goes back as it is.
+            Encoder::Zstd(e) => {
+                let Some(mut zstd) = e.take() else {
+                    return Err(std::io::Error::other("encoder already finished"));
+                };
+                let out = zstd.compress_all(data)?;
+                pool_zstd(zstd.cctx);
+                return Ok(out);
+            }
+            Encoder::Br(Some(e)) => {
+                e.get_mut().reserve(room_for(data.len()));
+                e.write_all(data)?;
+            }
             _ => return Err(std::io::Error::other("encoder already finished")),
         }
         self.finish()
     }
 
+    /// What is left; the state goes back to the thread's pool.
     fn finish(&mut self) -> std::io::Result<Bytes> {
         match self {
-            Encoder::Gzip(e) => {
-                e.try_finish()?;
-                Ok(Bytes::from(std::mem::take(e.get_mut())))
-            }
+            Encoder::Gzip(e) => match e.take() {
+                Some(mut gzip) => {
+                    let out = gzip.finish()?;
+                    POOL.with_borrow_mut(|pool| {
+                        if pool.gzip.is_none() {
+                            pool.gzip = Some(gzip);
+                        }
+                    });
+                    Ok(out)
+                }
+                None => Ok(Bytes::new()),
+            },
             Encoder::Zstd(e) => match e.take() {
-                Some(e) => Ok(Bytes::from(e.finish()?)),
+                Some(mut zstd) => {
+                    zstd.finish()?;
+                    pool_zstd(zstd.cctx);
+                    Ok(Bytes::from(zstd.out))
+                }
                 None => Ok(Bytes::new()),
             },
             Encoder::Br(e) => match e.take() {
@@ -728,6 +929,26 @@ mod tests {
         assert!(accepted(&HeaderMap::new(), &offered).is_empty());
     }
 
+    /// `compressed` decoded (gzip: the whole member, trailer checked).
+    fn decode(encoding: Encoding, compressed: &[u8]) -> Vec<u8> {
+        let mut plain = Vec::new();
+        match encoding {
+            Encoding::Gzip => {
+                flate2::read::GzDecoder::new(compressed)
+                    .read_to_end(&mut plain)
+                    .unwrap();
+            }
+            Encoding::Zstd => plain = zstd::stream::decode_all(compressed).unwrap(),
+            Encoding::Br => {
+                brotli::Decompressor::new(compressed, 4096)
+                    .read_to_end(&mut plain)
+                    .unwrap();
+            }
+        }
+        plain
+    }
+
+    /// A stream (no Content-Length) compressed frame by frame.
     async fn roundtrip(encoding: Encoding) -> Vec<u8> {
         let config = Encode {
             formats: vec![encoding],
@@ -746,22 +967,26 @@ mod tests {
             format!("\"abc.{}\"", encoding.letter()).as_str()
         );
         let compressed = response.into_body().collect().await.unwrap().to_bytes();
-        let mut plain = Vec::new();
-        match encoding {
-            Encoding::Gzip => {
-                flate2::read::GzDecoder::new(&compressed[..])
-                    .read_to_end(&mut plain)
-                    .unwrap();
-            }
-            Encoding::Zstd => plain = zstd::stream::decode_all(&compressed[..]).unwrap(),
-            Encoding::Br => {
-                brotli::Decompressor::new(&compressed[..], 4096)
-                    .read_to_end(&mut plain)
-                    .unwrap();
-            }
-        }
-        assert_eq!(plain, text.as_bytes());
+        assert_eq!(decode(encoding, &compressed), text.as_bytes());
         compressed.to_vec()
+    }
+
+    /// A body of `len` bytes with its Content-Length, compressed whole with `config`.
+    async fn whole(config: &Encode, encoding: Encoding, len: usize) -> usize {
+        let text: Vec<u8> = b"abc ".iter().copied().cycle().take(len).collect();
+        let mut response = Response::new(crate::body::full(text.clone()));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from(text.len()));
+        let response = config.apply(encoding, false, response).await;
+        let length: usize = response.headers()[CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(length, body.len());
+        assert_eq!(decode(encoding, &body), text);
+        body.len()
     }
 
     #[tokio::test]
@@ -770,6 +995,42 @@ mod tests {
             let compressed = roundtrip(encoding).await;
             assert!(compressed.len() < 200, "{encoding:?}: {}", compressed.len());
         }
+    }
+
+    #[tokio::test]
+    async fn pooled_encoders_give_whole_members_use_after_use() {
+        // All on one thread: from the second body on, the gzip state and the zstd context come
+        // from the pool, reset — a stream after a whole body and the other way round.
+        let config = Encode::default();
+        for encoding in [Encoding::Gzip, Encoding::Zstd, Encoding::Br] {
+            for len in [600, 3000, 600] {
+                whole(&config, encoding, len).await;
+                roundtrip(encoding).await;
+            }
+            // Over INLINE_LIMIT: on the blocking pool, with a pool of its own.
+            let compressed = whole(&config, encoding, INLINE_LIMIT + 1000).await;
+            assert!(compressed < INLINE_LIMIT / 10, "{encoding:?}: {compressed}");
+        }
+        // Another gzip level: the pooled state is not at it, and a new one is made.
+        let louder = Encode {
+            gzip_level: 9,
+            ..Encode::default()
+        };
+        whole(&louder, Encoding::Gzip, 3000).await;
+        whole(&config, Encoding::Gzip, 3000).await;
+    }
+
+    #[test]
+    fn default_types_start_with_the_common_ones() {
+        assert_eq!(
+            DEFAULT_TYPES[..3],
+            ["text/*", "application/json*", "application/javascript*"]
+        );
+        assert_eq!(DEFAULT_TYPES.len(), 34, "Caddy's list, whole");
+        let mut sorted = DEFAULT_TYPES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), DEFAULT_TYPES.len(), "no type twice");
     }
 
     #[tokio::test]
