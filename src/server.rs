@@ -379,6 +379,10 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
 /// ends the body with an error, and the handler reading it (the proxy) answers 408
 /// (src/guard.rs `StalledBody`).
 pub fn stall_limited(request: Request<Body>, stall: Duration) -> Request<Body> {
+    // A body already complete (none: most requests) never stalls: left as it is, nothing marked.
+    if http_body::Body::is_end_stream(request.body()) {
+        return request;
+    }
     let (mut parts, body) = request.into_parts();
     let stalled = crate::guard::BodyStalled::default();
     parts.extensions.insert(stalled.clone());
@@ -1006,9 +1010,22 @@ async fn accept_loop(
                     // The request counts as in progress until its response body ends.
                     let flight = activity.begin();
                     let conn = conn.clone();
-                    request.extensions_mut().insert(place.clone());
+                    // Only a request that can switch protocols (hyper's `OnUpgrade`) can become a
+                    // tunnel, the one that keeps the place: no extension map made for the others.
+                    if request.extensions().get::<hyper::upgrade::OnUpgrade>().is_some() {
+                        request.extensions_mut().insert(place.clone());
+                    }
                     async move {
-                        let request = stall_limited(request.map(boxed), limits.stall);
+                        // A complete HTTP/1 body (none) is replaced by the empty one, which takes no
+                        // allocation; an HTTP/2 stream's is kept, as its stream state goes with it.
+                        let request = if request.version() <= Version::HTTP_11
+                            && http_body::Body::is_end_stream(request.body())
+                        {
+                            request.map(|_| crate::body::empty())
+                        } else {
+                            request.map(boxed)
+                        };
+                        let request = stall_limited(request, limits.stall);
                         let response = handle(conn, request).await;
                         Ok::<_, Infallible>(response.map(|body| boxed(Tracked::new(body, flight))))
                     }
