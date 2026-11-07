@@ -86,6 +86,8 @@ pub struct Server {
     down_until: AtomicU64,
     /// `lb_policy cookie`: the value that names this server, made once.
     cookie: std::sync::OnceLock<String>,
+    /// Its Set-Cookie, over plain HTTP and over TLS, made once (a set names its cookie once).
+    set_cookie: std::sync::OnceLock<Option<[http::HeaderValue; 2]>>,
 }
 
 impl Server {
@@ -105,6 +107,7 @@ impl Server {
             last_fail: AtomicU64::new(0),
             down_until: AtomicU64::new(0),
             cookie: std::sync::OnceLock::new(),
+            set_cookie: std::sync::OnceLock::new(),
         }
     }
 
@@ -364,9 +367,17 @@ impl Upstreams {
         let Policy::Cookie { name, secret } = &set.policy else {
             return None;
         };
-        let value = server.cookie_value(secret);
-        let flags = if secure { "; Secure" } else { "" };
-        http::HeaderValue::from_str(&format!("{name}={value}; Path=/; HttpOnly{flags}")).ok()
+        let made = server.set_cookie.get_or_init(|| {
+            let value = server.cookie_value(secret);
+            let field = |flags: &str| {
+                let field = http::HeaderValue::from_str(&format!("{name}={value}; Path=/; HttpOnly{flags}")).ok()?;
+                // Shared from the start: each response's copy is a reference count.
+                drop(field.clone());
+                Some(field)
+            };
+            Some([field("")?, field("; Secure")?])
+        });
+        made.as_ref().map(|fields| fields[usize::from(secure)].clone())
     }
 }
 
