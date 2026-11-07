@@ -148,7 +148,20 @@ pub struct Ctx {
     /// The extensions' checks bound to upstreams (src/extensions.rs), for the proxy to run before it
     /// sends the request on; `None`: there are none, or the server asks itself.
     pub(crate) upstream_hooks: Option<&'static crate::extensions::UpstreamChecks>,
+    /// The site has `handle_errors`: a failure carries the request as sent (`SentRequest`).
+    pub(crate) for_errors: bool,
+    /// The request's headers as sent, kept before the routes first change them (`request_header`,
+    /// `encode`'s If-None-Match), only when `for_errors`; unchanged, they are `req.headers`.
+    /// Boxed: the `Ctx` is in every future of the chain, the map is rarely there.
+    sent_headers: Option<Box<HeaderMap>>,
 }
+
+/// On a failed response, when the site has `handle_errors`: the request as the client sent it (its
+/// method and URI before any rewrite, its headers before any route changed them, no extensions: no
+/// upgrade, no ready answer's marks), which the error routes run on. Made only when a request
+/// fails, so that the others copy nothing.
+#[derive(Clone)]
+pub(crate) struct SentRequest(pub(crate) Box<http::request::Parts>);
 
 /// A change to the response recorded on the way down the chain.
 enum Hook {
@@ -209,6 +222,8 @@ impl Ctx {
             encode: None,
             error: None,
             upstream_hooks: None,
+            for_errors: false,
+            sent_headers: None,
         }
     }
 
@@ -354,9 +369,30 @@ impl Ctx {
         self.failed(response, message)
     }
 
+    /// Before the routes change a request header: keeps them as sent, for `handle_errors`.
+    fn keep_sent_headers(&mut self) {
+        if self.for_errors && self.sent_headers.is_none() {
+            self.sent_headers = Some(Box::new(self.req.headers.clone()));
+        }
+    }
+
+    /// The request as sent, for the error routes (see `SentRequest`).
+    fn sent_request(&self, response: &mut Response<Body>) {
+        if !self.for_errors {
+            return;
+        }
+        let (mut head, ()) = http::Request::new(()).into_parts();
+        head.method = self.req.method.clone();
+        head.uri = self.orig_uri.clone();
+        head.version = self.req.version;
+        head.headers = self.sent_headers.as_deref().unwrap_or(&self.req.headers).clone();
+        response.extensions_mut().insert(SentRequest(Box::new(head)));
+    }
+
     /// Marks a response as a handler's failure with its own status (and headers, such as a 405's
     /// `Allow`, which an error page keeps).
     pub fn failed(&self, mut response: Response<Body>, message: Option<String>) -> Response<Body> {
+        self.sent_request(&mut response);
         let status = response.status();
         let message = message.unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
         let root = self.root.clone();
@@ -376,6 +412,7 @@ impl Ctx {
         self.pre_headers
             .insert(http::header::RETRY_AFTER, crate::ratelimit::retry_after(wait));
         let mut response = self.status(StatusCode::TOO_MANY_REQUESTS);
+        self.sent_request(&mut response);
         let status = StatusCode::TOO_MANY_REQUESTS;
         let message = status.canonical_reason().unwrap_or("").to_string();
         response.extensions_mut().insert(Failed(Arc::new(HandlerError {
@@ -870,6 +907,9 @@ impl Next {
                     // The site's `encode`, for a proxied answer kept by `cache` (src/proxy.rs).
                     ctx.encode = Some(encode.clone());
                     let accept = ctx.accept_encoding();
+                    if ctx.req.headers.contains_key(http::header::IF_NONE_MATCH) {
+                        ctx.keep_sent_headers();
+                    }
                     if let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) {
                         let head = ctx.req.method == http::Method::HEAD;
                         ctx.hooks.push(Hook::Encode {
@@ -979,6 +1019,7 @@ impl Handler {
                 ctx.pre_headers = pre;
             }
             Handler::RequestHeader(ops) => {
+                ctx.keep_sent_headers();
                 let mut headers = std::mem::take(&mut ctx.req.headers);
                 apply_ops(ops, ctx, &mut headers);
                 ctx.req.headers = headers;
@@ -1056,6 +1097,9 @@ impl Handler {
             Handler::Encode(encode) => {
                 ctx.encode = Some(encode.clone());
                 let accept = ctx.accept_encoding();
+                if ctx.req.headers.contains_key(http::header::IF_NONE_MATCH) {
+                    ctx.keep_sent_headers();
+                }
                 let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) else {
                     return next.run(ctx).await;
                 };

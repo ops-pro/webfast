@@ -245,3 +245,37 @@ async fn error_pages_can_be_compressed_and_failures_without_handle_errors_are_ba
     assert_eq!((got.status, got.body.as_str()), (StatusCode::NOT_FOUND, ""));
     running.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test]
+async fn error_routes_see_the_request_headers_as_sent() {
+    let site = site();
+    let root = site.path().display();
+    let running = start(&format!(
+        ":0 {{
+	root * {root}
+	request_header X-Who changed
+	request_header -X-Gone
+	file_server
+	handle_errors 404 {{
+		respond \"who={{header.X-Who}} gone={{header.X-Gone}} {{method}} {{uri}}\"
+	}}
+}}
+"
+    ))
+    .await;
+    let got = send(
+        &running,
+        Method::GET,
+        "/missing?a=1",
+        &[("x-who", "client"), ("x-gone", "here")],
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.body.as_str()),
+        (StatusCode::NOT_FOUND, "who=client gone=here GET /missing?a=1")
+    );
+    // Nothing changed: the headers are the request's own.
+    let got = send(&running, Method::GET, "/missing", &[]).await;
+    assert_eq!(got.body, "who= gone= GET /missing");
+    running.shutdown(Duration::from_secs(1)).await;
+}

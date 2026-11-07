@@ -11,7 +11,7 @@ use crate::body::{Body, boxed};
 use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
 use crate::extensions::{At, Client, Hooks, RequestCheck};
 use crate::guard::{Activity, Admission, Place, Tracked};
-use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, hostport_of, strip_port};
+use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, SentRequest, hostport_of, strip_port};
 use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
@@ -347,17 +347,19 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
     let mut response = match way {
         Way::Ready(response) => response,
         Way::Chain(routes, errors) => {
-            // With `handle_errors`, the request as sent is kept for them.
-            let kept = errors.map(|errors| (errors, request_head(&parts), conn.clone()));
+            // With `handle_errors`, a failure brings the request as sent back with it.
+            let kept = errors.map(|errors| (errors, conn.clone()));
             let mut ctx = Ctx::new(conn, parts, body, client_ip);
+            ctx.for_errors = kept.is_some();
             if !internal {
                 ctx.upstream_hooks = state.hooks.upstream.as_ref();
             }
-            let response = Next::start(routes).run(ctx).await;
-            match (kept, response.extensions().get::<Failed>()) {
-                (Some((errors, original, conn)), Some(Failed(error))) => {
+            let mut response = Next::start(routes).run(ctx).await;
+            let sent = response.extensions_mut().remove::<SentRequest>();
+            match (kept, response.extensions().get::<Failed>(), sent) {
+                (Some((errors, conn)), Some(Failed(error)), Some(SentRequest(original))) => {
                     let error = error.clone();
-                    crate::handler::handle_error(&errors, conn, original, client_ip, error, response).await
+                    crate::handler::handle_error(&errors, conn, *original, client_ip, error, response).await
                 }
                 _ => response,
             }
@@ -371,17 +373,6 @@ pub async fn handle(connection: Arc<ConnState>, request: Request<Body>) -> Respo
         }
         _ => response,
     }
-}
-
-/// A copy of a request head without its extensions (the error routes get no upgrade, no ready
-/// answer's marks).
-fn request_head(parts: &http::request::Parts) -> http::request::Parts {
-    let (mut head, ()) = Request::new(()).into_parts();
-    head.method = parts.method.clone();
-    head.uri = parts.uri.clone();
-    head.version = parts.version;
-    head.headers = parts.headers.clone();
-    head
 }
 
 /// The request with its body under the stall limit: a client that stops sending it for `stall`
