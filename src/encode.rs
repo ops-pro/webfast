@@ -240,8 +240,8 @@ impl Encode {
         // The If-None-Match our ETag for this encoding was made from (`etag_with`); nothing is
         // built unless it is one.
         if let Some(inm) = headers.get(http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
-            && let Some(base) = etag_without(inm, encoding.letter())
-            && let Ok(value) = HeaderValue::from_str(&base)
+            && let Some(base) = etag_base(inm, encoding.letter())
+            && let Some(value) = quoted(base)
         {
             headers.insert(http::header::IF_NONE_MATCH, value);
         }
@@ -362,26 +362,40 @@ impl Encode {
 /// character on an ETag of ours (src/files.rs), `.` and the letter on any other (an upstream's).
 pub fn etag_with(etag: &str, letter: char) -> Option<HeaderValue> {
     let inner = etag.strip_prefix('"')?.strip_suffix('"')?;
-    let mut out = String::with_capacity(inner.len() + 4);
-    out.push('"');
+    let mut out = crate::handler::HeaderText::new();
+    out.push_str("\"");
     out.push_str(inner);
     if !crate::files::is_own_etag(inner) {
-        out.push('.');
+        out.push_str(".");
     }
-    out.push(letter);
-    out.push('"');
-    HeaderValue::from_str(&out).ok()
+    out.push_str(letter.encode_utf8(&mut [0; 4]));
+    out.push_str("\"");
+    out.value()
+}
+
+/// `"<text>"` as a header value, written at once.
+fn quoted(text: &str) -> Option<HeaderValue> {
+    let mut out = crate::handler::HeaderText::new();
+    out.push_str("\"");
+    out.push_str(text);
+    out.push_str("\"");
+    out.value()
 }
 
 /// The ETag `etag_with` made `tagged` from, when it is one in the encoding `letter` names;
 /// `None` for any other (a client holding another representation, or none of ours).
 pub fn etag_without(tagged: &str, letter: char) -> Option<String> {
+    etag_base(tagged, letter).map(|base| format!("\"{base}\""))
+}
+
+/// The inside of the ETag `etag_without` gives, without its quotes.
+fn etag_base(tagged: &str, letter: char) -> Option<&str> {
     let inner = tagged.strip_prefix('"')?.strip_suffix('"')?;
     let base = inner.strip_suffix(letter)?;
     if let Some(base) = base.strip_suffix('.') {
-        return Some(format!("\"{base}\""));
+        return Some(base);
     }
-    crate::files::is_own_etag(base).then(|| format!("\"{base}\""))
+    crate::files::is_own_etag(base).then_some(base)
 }
 /// Whether `content_type` is of one of `patterns` (lowercase, `*` at the end for any rest), in any
 /// ASCII case, with no lowercase copy of it made: a type without capitals (most are sent so) is

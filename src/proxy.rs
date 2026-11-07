@@ -104,6 +104,11 @@ pub const CLIENT_IDENTITY_HEADERS: &[&str] = &[
 /// The headers the proxy writes itself (`forwarded_headers`).
 const FORWARDED_HEADERS: &[&str] = &["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"];
 
+// Inserted by a name of its own: one given as text is copied into a new name on every insert.
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+
 /// Whether CGI, PHP, WSGI and Rack read the two (lowercase) field names as one variable: they turn
 /// `-` into `_`, so `X_User`, `X.User` and `X-User` are all `HTTP_X_USER` there.
 fn same_cgi_name(a: &str, b: &str) -> bool {
@@ -553,19 +558,11 @@ fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
             headers.remove(*name);
         }
     }
-    // The trusted proxy's entries, then the peer: one string of its final size (an address is at
-    // most 39 characters).
-    let prior = || {
-        ctx.req
-            .headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-    };
-    let prior_len: usize = if trusted { prior().map(|v| v.len() + 2).sum() } else { 0 };
-    let mut xff = String::with_capacity(prior_len + 39);
+    // The trusted proxy's entries, then the peer, written into the value at once.
+    let mut xff = crate::handler::HeaderText::new();
     if trusted {
-        for value in prior() {
+        let prior = ctx.req.headers.get_all("x-forwarded-for");
+        for value in prior.iter().filter_map(|v| v.to_str().ok()) {
             xff.push_str(value);
             xff.push_str(", ");
         }
@@ -574,8 +571,8 @@ fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
         use std::fmt::Write as _;
         let _ = write!(xff, "{peer}");
     }
-    if let Ok(value) = HeaderValue::from_str(&xff) {
-        headers.insert("x-forwarded-for", value);
+    if let Some(value) = xff.value() {
+        headers.insert(X_FORWARDED_FOR, value);
     }
     // A trusted proxy's last value as it came (the same bytes: no string made of it).
     let last = |name: &str| {
@@ -590,13 +587,18 @@ fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
         Some(prior) if trusted => prior.clone(),
         _ => HeaderValue::from_static(if ctx.conn.tls { "https" } else { "http" }),
     };
-    headers.insert("x-forwarded-proto", proto);
+    headers.insert(X_FORWARDED_PROTO, proto);
+    // The Host field itself when it is the host (a reference count, no copy); the HTTP/2 and
+    // HTTP/3 authority is copied.
     let host = match last("x-forwarded-host") {
         Some(prior) if trusted => Some(prior.clone()),
-        _ => HeaderValue::from_str(ctx.hostport()).ok(),
+        _ => match ctx.req.headers.get(http::header::HOST) {
+            Some(field) if field.as_bytes() == ctx.hostport().as_bytes() => Some(field.clone()),
+            _ => HeaderValue::from_str(ctx.hostport()).ok(),
+        },
     };
     if let Some(host) = host {
-        headers.insert("x-forwarded-host", host);
+        headers.insert(X_FORWARDED_HOST, host);
     }
 }
 

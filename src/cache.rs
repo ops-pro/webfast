@@ -846,16 +846,25 @@ impl Entry {
         }
         headers.insert(AGE, crate::handler::header_number(age.as_secs()));
         let ttl = self.freshness.fresh.as_secs() as i64 - age.as_secs() as i64;
-        let status = match stale {
-            None => format!("{}; hit; ttl={ttl}", self.settings.name),
-            Some(None) => format!("{}; hit; ttl={ttl}; fwd=stale", self.settings.name),
-            Some(Some(upstream)) => format!(
-                "{}; hit; ttl={ttl}; fwd=stale; fwd-status={}",
-                self.settings.name,
-                upstream.as_u16()
-            ),
-        };
-        add_status(&mut headers, &status);
+        let mut status = crate::handler::HeaderText::new();
+        {
+            use std::fmt::Write as _;
+            let name = &self.settings.name;
+            let _ = match stale {
+                None => write!(status, "{name}; hit; ttl={ttl}"),
+                Some(None) => write!(status, "{name}; hit; ttl={ttl}; fwd=stale"),
+                Some(Some(upstream)) => {
+                    write!(
+                        status,
+                        "{name}; hit; ttl={ttl}; fwd=stale; fwd-status={}",
+                        upstream.as_u16()
+                    )
+                }
+            };
+        }
+        if let Some(value) = status.value() {
+            headers.append(CACHE_STATUS.clone(), value);
+        }
         let request = &ctx.req.headers;
         let not_modified = match request.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
             Some(list) => etag
