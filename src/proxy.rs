@@ -42,6 +42,9 @@ pub fn client(dial_timeout: Duration, keepalive: Option<Duration>) -> HttpClient
     connector.set_nodelay(true);
     connector.enforce_http(true);
     let mut builder = Client::builder(TokioExecutor::new());
+    // Host is always in the headers sent (`ReverseProxy::upstream_headers`, and the cache's
+    // requests reuse those): the client need not look for it and make one.
+    builder.set_host(false);
     builder.pool_idle_timeout(keepalive.unwrap_or(Duration::from_secs(120)));
     if keepalive.is_none() {
         builder.pool_max_idle_per_host(0);
@@ -68,19 +71,33 @@ pub struct ReverseProxy {
     pub client: HttpClient,
 }
 
-/// Hop-by-hop fields (Caddy's list) never forwarded in either direction.
-const HOP_HEADERS: &[&str] = &[
-    "alt-svc",
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
+/// Whether a (lowercase) field name is hop-by-hop (Caddy's list): never forwarded in either
+/// direction. A match on the text: a length check and a compare, no name parsed or hashed.
+fn is_hop(name: &str) -> bool {
+    matches!(
+        name,
+        "alt-svc"
+            | "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Whether the Connection field(s) list `name` (a lowercase field name): such a field is this
+/// hop's too (RFC 9110 §7.6.1). Tokens are compared where they are: no name made of them.
+fn connection_lists(connection: &http::header::GetAll<'_, HeaderValue>, name: &str) -> bool {
+    connection
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name))
+}
 
 /// Headers that name the client or where it comes from, which proxies and CDNs set and upstreams
 /// trust; from a peer that is not a trusted proxy they are the client's own invention.
@@ -104,6 +121,46 @@ pub const CLIENT_IDENTITY_HEADERS: &[&str] = &[
 /// The headers the proxy writes itself (`forwarded_headers`).
 const FORWARDED_HEADERS: &[&str] = &["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"];
 
+/// Whether a (lowercase) request field is not copied to the upstream: hop-by-hop, listed by the
+/// Connection field, one the proxy writes itself (`FORWARDED_HEADERS`), a client-identity header
+/// from a peer that is no trusted proxy, or a look-alike of one of those from anyone (no proxy
+/// writes `X_Real_IP`).
+fn is_withheld(name: &str, connection: &http::header::GetAll<'_, HeaderValue>, trusted: bool) -> bool {
+    if is_hop(name) || FORWARDED_HEADERS.contains(&name) {
+        return true;
+    }
+    if !trusted && CLIENT_IDENTITY_HEADERS.contains(&name) {
+        return true;
+    }
+    if name.bytes().any(|c| c == b'_' || c == b'.')
+        && CLIENT_IDENTITY_HEADERS
+            .iter()
+            .chain(FORWARDED_HEADERS)
+            .any(|real| same_cgi_name(name, real))
+    {
+        return true;
+    }
+    connection_lists(connection, name)
+}
+
+/// The request's fields as they go to the upstream, without those `is_withheld` names, in one
+/// pass: no copy of the map pruned afterwards, no probe for each name that could be there. The
+/// map has room for `spare` more fields (X-Forwarded-*, Host, `header_up`) without growing; hyper
+/// reuses the sent map for the response's headers, so spare room serves there too.
+fn forwardable_headers(ctx: &Ctx, spare: usize) -> HeaderMap {
+    let from = &ctx.req.headers;
+    let connection = from.get_all(CONNECTION);
+    let trusted = ctx.conn.trusted;
+    let mut headers = HeaderMap::with_capacity(from.len() + spare);
+    // `iter` gives a multi-valued field one value at a time: `append` keeps them all.
+    for (name, value) in from.iter() {
+        if !is_withheld(name.as_str(), &connection, trusted) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
 // Inserted by a name of its own: one given as text is copied into a new name on every insert.
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -119,6 +176,8 @@ fn same_cgi_name(a: &str, b: &str) -> bool {
 /// Takes off the fields spelled as one of `names` with `_` or `.` for a `-` (the names themselves
 /// stay): an upstream that reads headers as CGI variables would take such a field for the real one,
 /// one the server sets or only a trusted proxy may (Caddy drops every field with `_` or `.`).
+/// The proxy's own look-alikes go in `is_withheld`; this is for the JWT claim headers.
+#[cfg(any(feature = "jwt", test))]
 pub(crate) fn remove_lookalikes<S: AsRef<str>>(headers: &mut HeaderMap, names: &[S]) {
     let lookalikes: Vec<HeaderName> = headers
         .keys()
@@ -136,32 +195,46 @@ pub(crate) fn remove_lookalikes<S: AsRef<str>>(headers: &mut HeaderMap, names: &
     }
 }
 
+/// Takes the hop-by-hop fields and those the Connection field lists off a response. One pass over
+/// the names present (a response has 5–10, with none or two of them: `Connection: keep-alive` and
+/// its `Keep-Alive`) instead of a probe for each name that could be there; the names found are
+/// kept on the stack, and only a response that lists more than fit takes a `Vec`.
 pub(crate) fn remove_hop_headers(headers: &mut HeaderMap) {
-    let listed: Vec<HeaderName> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
-        .collect();
-    for name in listed {
-        headers.remove(name);
+    const FIT: usize = 8;
+    let mut found: [Option<HeaderName>; FIT] = [const { None }; FIT];
+    let mut n = 0;
+    let mut more: Vec<HeaderName> = Vec::new();
+    {
+        let connection = headers.get_all(CONNECTION);
+        for name in headers.keys() {
+            if is_hop(name.as_str()) || connection_lists(&connection, name.as_str()) {
+                if n < FIT {
+                    found[n] = Some(name.clone());
+                    n += 1;
+                } else {
+                    more.push(name.clone());
+                }
+            }
+        }
     }
-    for name in HOP_HEADERS {
-        headers.remove(*name);
+    for name in found.iter_mut().take(n) {
+        if let Some(name) = name.take() {
+            headers.remove(name);
+        }
+    }
+    for name in more {
+        headers.remove(name);
     }
 }
 
 /// The protocol a request asks to switch to (`Connection: upgrade` and an `Upgrade` field), e.g.
 /// `websocket`.
 fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
-    let wanted = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
-    if wanted { headers.get(UPGRADE).cloned() } else { None }
+    if connection_lists(&headers.get_all(CONNECTION), "upgrade") {
+        headers.get(UPGRADE).cloned()
+    } else {
+        None
+    }
 }
 
 impl ReverseProxy {
@@ -209,17 +282,27 @@ impl ReverseProxy {
         let mut headers = Some(self.upstream_headers(&ctx));
         let keep = PROXY.wants_sent(&pending);
         let mut kept: Option<HeaderMap> = None;
-        let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
+        // `header_down` with placeholders is filled in now, from the request; one without is
+        // applied as it is after the response. An observer that keeps what was sent (a cache
+        // miss) gets it filled in either way, to apply to the upstream's later answers.
+        let rendered_down: Vec<RenderedOp> = if keep {
+            self.header_down.iter().map(|op| op.render(&ctx)).collect()
+        } else {
+            self.render_down(&ctx)
+        };
         let path_and_query = ctx.req.uri.path_and_query().cloned();
         let method = ctx.req.method.clone();
         let body_stalled = ctx.req.extensions.get::<BodyStalled>().cloned();
         let mut body = ctx.body.take();
         // Without a body the request can be retried on another upstream (lb_try_duration).
         let replayable = body.as_ref().is_none_or(http_body::Body::is_end_stream);
-        let started = Instant::now();
+        // The clock is read only for what reads it: `lb_try_duration` bounds the retries from
+        // here, `unhealthy_latency` times each attempt.
+        let started = (!self.try_duration.is_zero()).then(Instant::now);
         // The servers as they are now, kept for the request; `tried`: those it tried, by bit.
         let loaded = self.servers.load();
         let passive = self.servers.passive();
+        let timed = passive.is_some_and(|p| p.unhealthy_latency.is_some());
         let mut tried: u64 = 0;
         let mut attempt: u32 = 0;
         let outcome = loop {
@@ -267,7 +350,7 @@ impl ReverseProxy {
                 kept = Some(sending.clone());
             }
             *request.headers_mut() = sending;
-            let sent_at = Instant::now();
+            let sent_at = timed.then(Instant::now);
             let sent = self.client.request(request);
             let result = match self.response_header_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
@@ -279,7 +362,8 @@ impl ReverseProxy {
             match result {
                 Ok(response) => {
                     if let Some(passive) = passive {
-                        if passive.faults(response.status().as_u16(), sent_at.elapsed()) {
+                        let took = sent_at.map_or(Duration::ZERO, |at| at.elapsed());
+                        if passive.faults(response.status().as_u16(), took) {
                             server.failed(passive);
                         } else {
                             server.succeeded();
@@ -308,7 +392,7 @@ impl ReverseProxy {
                     attempt += 1;
                     let allowed = (self.retries > 0 || !self.try_duration.is_zero())
                         && (self.retries == 0 || attempt <= self.retries)
-                        && (self.try_duration.is_zero() || started.elapsed() + self.try_interval < self.try_duration);
+                        && started.is_none_or(|at| at.elapsed() + self.try_interval < self.try_duration);
                     if !(connect && replayable && allowed) {
                         break Err(StatusCode::BAD_GATEWAY);
                     }
@@ -320,9 +404,7 @@ impl ReverseProxy {
             Ok((response, lease, chosen)) => {
                 let (mut parts, incoming) = response.into_parts();
                 remove_hop_headers(&mut parts.headers);
-                for op in &rendered_down {
-                    op.apply(&mut parts.headers);
-                }
+                self.apply_down(&rendered_down, &mut parts.headers);
                 // `lb_policy cookie`: the response that chose a server names it to the client.
                 if let Some(server) = chosen
                     && let Some(cookie) = self.servers.cookie_for(server, ctx.conn.tls)
@@ -341,8 +423,10 @@ impl ReverseProxy {
                     headers: kept.as_ref().unwrap_or(&none),
                     header_down: &rendered_down,
                 };
-                let body = PROXY.observe(pending, sent, &mut parts, boxed(incoming));
-                ctx.respond_appending(Response::from_parts(parts, holding(body, (held, lease))))
+                // What is held wraps the upstream's body before it is boxed: one box, one
+                // indirection per frame, whether or not anything is held.
+                let body = PROXY.observe(pending, sent, &mut parts, holding(incoming, (held, lease)));
+                ctx.respond_appending(Response::from_parts(parts, body))
             }
             Err(status) => {
                 if let Some(stale) = PROXY.fallback(&mut pending, &mut ctx, status) {
@@ -384,10 +468,35 @@ impl ReverseProxy {
         }
     }
 
-    /// The request's headers as the upstream gets them.
+    /// `header_down` on a response: as rendered for the request when it was (`rendered`), else the
+    /// operations as they stand, which need no request (the deferred `header` of src/handler.rs).
+    fn apply_down(&self, rendered: &[RenderedOp], headers: &mut HeaderMap) {
+        if rendered.is_empty() {
+            for op in &self.header_down {
+                op.apply(None, headers);
+            }
+        } else {
+            for op in rendered {
+                op.apply(headers);
+            }
+        }
+    }
+
+    /// `header_down` filled in from the request, when any of it has placeholders; else nothing
+    /// (`apply_down` applies the operations as they stand).
+    fn render_down(&self, ctx: &Ctx) -> Vec<RenderedOp> {
+        if self.header_down.iter().any(HeaderOp::is_dynamic) {
+            self.header_down.iter().map(|op| op.render(ctx)).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The request's headers as the upstream gets them. Host is always among them (the client's,
+    /// else the authority), so the client is built not to set it (`client`).
     fn upstream_headers(&self, ctx: &Ctx) -> HeaderMap {
-        let mut headers = ctx.req.headers.clone();
-        remove_hop_headers(&mut headers);
+        // Room for X-Forwarded-For / -Proto / -Host, Host, and what `header_up` adds.
+        let mut headers = forwardable_headers(ctx, 4 + self.header_up.len());
         forwarded_headers(ctx, &mut headers);
         if !headers.contains_key(HOST)
             && let Ok(value) = HeaderValue::from_str(ctx.hostport())
@@ -411,7 +520,7 @@ impl ReverseProxy {
         let mut headers = self.upstream_headers(&ctx);
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, protocol);
-        let rendered_down: Vec<RenderedOp> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
+        let rendered_down = self.render_down(&ctx);
         let place = ctx.req.extensions.get::<Place>().cloned();
         let loaded = self.servers.load();
         let picked = match loaded.pick(&ctx, 0) {
@@ -462,10 +571,8 @@ impl ReverseProxy {
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             let (mut parts, incoming) = response.into_parts();
             remove_hop_headers(&mut parts.headers);
-            for op in &rendered_down {
-                op.apply(&mut parts.headers);
-            }
-            return ctx.respond_appending(Response::from_parts(parts, holding(boxed(incoming), (held, lease))));
+            self.apply_down(&rendered_down, &mut parts.headers);
+            return ctx.respond_appending(Response::from_parts(parts, holding(incoming, (held, lease))));
         }
         // A tunnel counts as the connection it came from (src/guard.rs), not as a request: its
         // slot is given back with this answer.
@@ -477,9 +584,7 @@ impl ReverseProxy {
         if let Some(protocol) = switched_to {
             parts.headers.insert(UPGRADE, protocol);
         }
-        for op in &rendered_down {
-            op.apply(&mut parts.headers);
-        }
+        self.apply_down(&rendered_down, &mut parts.headers);
         tokio::spawn(async move {
             // The tunnel counts at its server until it closes.
             let _lease = lease;
@@ -517,24 +622,34 @@ fn refusal(ctx: &mut Ctx, response: Response<Body>) -> Response<Body> {
     }
 }
 
-/// A response body that keeps what the upstream checks hold (a slot at the upstreams) until it
-/// ends or is dropped; a body as it is when there is nothing to keep.
-fn holding<H: Held>(body: Body, held: H) -> Body {
+/// The upstream's response body, boxed once: with what the upstream checks hold (a slot at the
+/// upstreams, a lease on the server's count) kept until it ends or is dropped, or as it is when
+/// there is nothing to keep.
+fn holding<B, H>(body: B, held: H) -> Body
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+    B::Error: Into<crate::body::BoxError>,
+    H: Held,
+{
     if held.is_empty() {
-        body
+        boxed(body)
     } else {
-        crate::body::boxed(Holding { body, held: Some(held) })
+        boxed(Holding { body, held: Some(held) })
     }
 }
 
-struct Holding<H> {
-    body: Body,
+struct Holding<B, H> {
+    body: B,
     held: Option<H>,
 }
 
-impl<H: Held> http_body::Body for Holding<H> {
+impl<B, H> http_body::Body for Holding<B, H>
+where
+    B: http_body::Body<Data = bytes::Bytes> + Unpin,
+    H: Held,
+{
     type Data = bytes::Bytes;
-    type Error = crate::body::BoxError;
+    type Error = B::Error;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
@@ -556,17 +671,11 @@ impl<H: Held> http_body::Body for Holding<H> {
     }
 }
 
+/// Writes X-Forwarded-For / -Proto / -Host into `headers` (a map `forwardable_headers` made: the
+/// client's own are not in it, the identity headers only a trusted proxy's).
 fn forwarded_headers(ctx: &Ctx, headers: &mut HeaderMap) {
     let peer = ctx.conn.remote.ip();
     let trusted = ctx.conn.trusted;
-    // Look-alikes from anyone: no proxy writes `X_Real_IP`.
-    remove_lookalikes(headers, CLIENT_IDENTITY_HEADERS);
-    remove_lookalikes(headers, FORWARDED_HEADERS);
-    if !trusted {
-        for name in CLIENT_IDENTITY_HEADERS {
-            headers.remove(*name);
-        }
-    }
     // The trusted proxy's entries, then the peer, written into the value at once.
     let mut xff = crate::handler::HeaderText::new();
     if trusted {
@@ -627,6 +736,36 @@ mod tests {
         assert!(h.contains_key("x-kept"));
     }
 
+    #[test]
+    fn a_response_loses_its_hop_headers_and_keeps_the_rest() {
+        // What a Node upstream answers: Connection and its Keep-Alive, among ordinary fields.
+        let mut h = HeaderMap::new();
+        h.insert("content-type", HeaderValue::from_static("text/plain"));
+        h.insert("content-length", HeaderValue::from_static("5"));
+        h.insert(CONNECTION, HeaderValue::from_static("Keep-Alive"));
+        h.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        h.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        h.insert("alt-svc", HeaderValue::from_static("h3=\":443\""));
+        h.insert(UPGRADE, HeaderValue::from_static("h2c"));
+        h.append("set-cookie", HeaderValue::from_static("a=1"));
+        h.append("set-cookie", HeaderValue::from_static("b=2"));
+        remove_hop_headers(&mut h);
+        assert_eq!(h.len(), 4, "{h:?}");
+        assert_eq!(h["content-type"], "text/plain");
+        assert_eq!(h["content-length"], "5");
+        assert_eq!(h.get_all("set-cookie").iter().count(), 2);
+        // Several Connection fields, listing more names than fit on the stack: all of them go.
+        let mut h = HeaderMap::new();
+        h.append(CONNECTION, HeaderValue::from_static("a, b, c"));
+        h.append(CONNECTION, HeaderValue::from_static("d,e ,f, g, h, i, close"));
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            h.insert(name, HeaderValue::from_static("1"));
+        }
+        remove_hop_headers(&mut h);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h.contains_key("j"));
+    }
+
     fn ctx_from(peer: &str, trusted: bool, headers: &[(&'static str, &str)]) -> Ctx {
         let conn = std::sync::Arc::new(crate::handler::ConnInfo {
             remote: peer.parse().unwrap(),
@@ -654,8 +793,7 @@ mod tests {
             ("x-custom", "kept"),
         ];
         let ctx = ctx_from("203.0.113.9:4000", false, &sent);
-        let mut headers = ctx.req.headers.clone();
-        forwarded_headers(&ctx, &mut headers);
+        let headers = to_upstream(&ctx);
         assert!(headers.get("cf-ipcountry").is_none());
         assert!(headers.get("x-real-ip").is_none());
         assert!(headers.get("forwarded").is_none());
@@ -663,14 +801,72 @@ mod tests {
         assert_eq!(headers["x-forwarded-proto"], "http");
         assert_eq!(headers["x-forwarded-host"], "example.test");
         assert_eq!(headers["x-custom"], "kept");
+        assert_eq!(headers["host"], "example.test");
+        assert_eq!(headers.len(), 5, "{headers:?}");
 
         let ctx = ctx_from("10.0.0.5:4000", true, &sent);
-        let mut headers = ctx.req.headers.clone();
-        forwarded_headers(&ctx, &mut headers);
+        let headers = to_upstream(&ctx);
         assert_eq!(headers["cf-ipcountry"], "NL");
         assert_eq!(headers["x-real-ip"], "6.6.6.6");
         assert_eq!(headers["x-forwarded-for"], "6.6.6.6, 10.0.0.5");
         assert_eq!(headers["x-forwarded-proto"], "https");
+        assert_eq!(
+            headers.get_all("x-forwarded-for").iter().count(),
+            1,
+            "one value, extended"
+        );
+    }
+
+    /// The request's headers as `upstream_headers` makes them, short of `header_up`.
+    fn to_upstream(ctx: &Ctx) -> HeaderMap {
+        let mut headers = forwardable_headers(ctx, 4);
+        forwarded_headers(ctx, &mut headers);
+        headers
+    }
+
+    #[test]
+    fn the_request_loses_hop_and_connection_listed_fields_and_keeps_every_value() {
+        let sent = [
+            ("connection", "keep-alive, X-Session"),
+            ("keep-alive", "timeout=5"),
+            ("x-session", "secret"),
+            ("te", "trailers"),
+            ("proxy-authorization", "Basic xyz"),
+            ("accept", "text/html"),
+            ("accept", "application/json"),
+            ("cookie", "a=1"),
+            ("cookie", "b=2"),
+            ("x-forwarded-host", "forged.test"),
+            ("x-forwarded-for", "6.6.6.6"),
+        ];
+        let ctx = ctx_from("203.0.113.9:4000", false, &sent);
+        let headers = to_upstream(&ctx);
+        for gone in ["connection", "keep-alive", "x-session", "te", "proxy-authorization"] {
+            assert!(headers.get(gone).is_none(), "{gone} in {headers:?}");
+        }
+        let values = |name: &str| -> Vec<String> {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(values("accept"), ["text/html", "application/json"]);
+        assert_eq!(values("cookie"), ["a=1", "b=2"]);
+        assert_eq!(
+            values("x-forwarded-for"),
+            ["203.0.113.9"],
+            "the client's own is not kept"
+        );
+        assert_eq!(values("x-forwarded-host"), ["example.test"]);
+        assert_eq!(values("x-forwarded-proto"), ["http"]);
+        assert_eq!(headers["host"], "example.test");
+        // The request's own map is untouched: a retry, the cookie policy and the error routes
+        // read it.
+        assert_eq!(ctx.req.headers.get_all("connection").iter().count(), 1);
+        assert_eq!(ctx.req.headers["x-session"], "secret");
+        // Room for X-Forwarded-* and Host was there from the start: nothing grew.
+        assert!(headers.capacity() >= sent.len() + 1 + 4);
     }
 
     #[test]
@@ -685,8 +881,7 @@ mod tests {
         ];
         for (peer, trusted) in [("203.0.113.9:4000", false), ("10.0.0.5:4000", true)] {
             let ctx = ctx_from(peer, trusted, &sent);
-            let mut headers = ctx.req.headers.clone();
-            forwarded_headers(&ctx, &mut headers);
+            let headers = to_upstream(&ctx);
             for gone in ["x_real_ip", "x.forwarded.for", "x_forwarded_host", "cf_connecting.ip"] {
                 assert!(headers.get(gone).is_none(), "{gone} from {peer}");
             }
