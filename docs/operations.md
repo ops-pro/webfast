@@ -175,8 +175,18 @@ example.com, www.example.com {
 - The PEM files are looked at every minute and re-read when they change (renewals); there is no
   ACME client — certbot, lego or acme.sh write the files.
 - HTTP/2 over TLS; HTTP/3 (QUIC) on the same port number over UDP, advertised with `Alt-Svc`.
-- Resumption: TLS 1.3 session tickets (their keys live in the process: after a restart, or on
-  another replica, a full handshake) and a cache of 16 384 sessions.
+- Resumption: TLS 1.3 session tickets and a cache of 16 384 sessions. The ticket keys live in the
+  process: after a restart, or on another replica, a full handshake. With
+  `WEB_TLS_TICKET_SEED` (or `WEB_TLS_TICKET_SEED_FILE`, a file that holds it, such as a mounted
+  Kubernetes secret), a secret of at least 32 bytes, the keys are made from it instead: every
+  replica given the same seed opens the tickets of the others, with nothing shared between them
+  at run time, and so does the process after a restart. The keys roll every 6 hours by the wall
+  clock (a ticket opens for 6 to 12 hours; clocks a little apart are allowed for). Make the seed
+  with `openssl rand -base64 48` and keep it as a private key: whoever holds it can open the
+  tickets, and so resume a session as its client (TLS 1.3 resumption still makes a fresh key
+  exchange, so recorded traffic stays protected; TLS 1.2 resumption has none). Changing the seed
+  ends resumption with the old tickets. HTTP/3 keeps tickets of the process (single-use, for
+  0-RTT replay protection).
 - HTTP/3 0-RTT: a resumed client sends its first request with the handshake. Early requests are
   answered only for GET, HEAD and OPTIONS, which change nothing if replayed, and reach the
   handlers with `Early-Data: 1`; anything else gets `425 Too Early` and the browser sends it again

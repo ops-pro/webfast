@@ -20,7 +20,9 @@
 //! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_JWT_CONFIG and
 //! WEB_API_FIREWALL_CONFIG: YAML files of the request checks (src/jwt, src/apifw); WEB_TLS_STRICT_SNI
 //! (`off`; `on`: a TLS handshake without SNI or for a name no site names gets no certificate and
-//! ends, src/tls.rs).
+//! ends, src/tls.rs); WEB_TLS_TICKET_SEED, or WEB_TLS_TICKET_SEED_FILE naming a file that holds it:
+//! a secret of at least 32 bytes from which the TLS session ticket keys are made, the same on every
+//! replica given it and across restarts (src/tickets.rs; unset: keys of the process alone).
 //! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
 //! holds, WEB_RATE_LIMIT_DRY_RUN (off): count and log only, and WEB_MAX_UPSTREAM_REQUESTS_PER_IP
 //! (256; 0: no limit): a client's requests at the upstreams at once (src/ratelimit.rs).
@@ -303,6 +305,28 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
         Ok(value) => return Err(format!("WEB_TLS_STRICT_SNI: on or off, not {value:?}")),
         Err(_) => false,
     };
+    // One seed for every replica: the same session tickets everywhere (src/tickets.rs).
+    let ticket_keys = match (
+        std::env::var("WEB_TLS_TICKET_SEED"),
+        std::env::var("WEB_TLS_TICKET_SEED_FILE"),
+    ) {
+        (Ok(_), Ok(_)) => {
+            return Err("WEB_TLS_TICKET_SEED and WEB_TLS_TICKET_SEED_FILE: one or the other".to_string());
+        }
+        (Ok(seed), Err(_)) => Some(seed.trim().as_bytes().to_vec()),
+        (Err(_), Ok(path)) => match std::fs::read(path.trim()) {
+            Ok(seed) => Some(seed.trim_ascii().to_vec()),
+            Err(e) => return Err(format!("WEB_TLS_TICKET_SEED_FILE {path:?}: {e}")),
+        },
+        (Err(_), Err(_)) => None,
+    };
+    let ticket_keys = match ticket_keys {
+        Some(seed) => match webfast::tickets::TicketKeys::new(&seed) {
+            Ok(keys) => Some(std::sync::Arc::new(keys)),
+            Err(e) => return Err(format!("WEB_TLS_TICKET_SEED: {e}")),
+        },
+        None => None,
+    };
     let per_core = match std::env::var("WEB_RUNTIME") {
         Ok(value) if value.trim().eq_ignore_ascii_case("per-core") => Some(true),
         Ok(value) if value.trim().eq_ignore_ascii_case("shared") => Some(false),
@@ -330,6 +354,7 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
     }
     for server in &mut config.servers {
         server.strict_sni = strict_sni;
+        server.ticket_keys = ticket_keys.clone();
         if let Some(per_core) = per_core {
             server.per_core = per_core;
         }

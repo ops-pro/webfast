@@ -353,8 +353,15 @@ fn choose_linear<'a>(
         .or_else(|| candidates().next())
 }
 
-/// Server configuration for TCP (ALPN h2 / http/1.1) or QUIC (ALPN h3, TLS 1.3 only).
-pub fn server_config(resolver: Arc<CertResolver>, alpn: &[&[u8]], quic: bool) -> Result<rustls::ServerConfig> {
+/// Server configuration for TCP (ALPN h2 / http/1.1) or QUIC (ALPN h3, TLS 1.3 only). `tickets`:
+/// TCP session tickets sealed with keys from a shared seed (src/tickets.rs), else with keys of
+/// this process; QUIC keeps its single-use tickets (0-RTT) whatever it is given.
+pub fn server_config(
+    resolver: Arc<CertResolver>,
+    alpn: &[&[u8]],
+    quic: bool,
+    tickets: Option<Arc<crate::tickets::TicketKeys>>,
+) -> Result<rustls::ServerConfig> {
     let builder = rustls::ServerConfig::builder_with_provider(provider());
     let builder = if quic {
         builder.with_protocol_versions(&[&rustls::version::TLS13])?
@@ -372,7 +379,10 @@ pub fn server_config(resolver: Arc<CertResolver>, alpn: &[&[u8]], quic: bool) ->
         // Stateful tickets (the default: no ticketer) allow 0-RTT; quinn takes exactly this value.
         config.max_early_data_size = u32::MAX;
     } else {
-        config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()?;
+        config.ticketer = match tickets {
+            Some(keys) => keys,
+            None => rustls::crypto::aws_lc_rs::Ticketer::new()?,
+        };
     }
     Ok(config)
 }
@@ -687,7 +697,7 @@ mod tests {
                 stamp: Vec::new(),
             }])),
         });
-        let server = Arc::new(server_config(resolver, &[b"h2"], false).unwrap());
+        let server = Arc::new(server_config(resolver, &[b"h2"], false, None).unwrap());
         assert_eq!(server.cert_compressors.len(), 2, "brotli and zlib");
 
         let client = |decompressors: Vec<&'static dyn rustls::compress::CertDecompressor>| {
@@ -711,5 +721,94 @@ mod tests {
         // the ECDSA signature, whose DER length varies by a byte or two).
         let again = server_flight(server, client(vec![rustls::compress::BROTLI_DECOMPRESSOR]));
         assert!(again.abs_diff(brotli) <= 4, "brotli {brotli}, then {again}");
+    }
+
+    /// One handshake of `client` (which keeps its tickets) with `server`: how it went.
+    fn handshake(server: Arc<rustls::ServerConfig>, client: &Arc<rustls::ClientConfig>) -> rustls::HandshakeKind {
+        let mut server = rustls::ServerConnection::new(server).unwrap();
+        let mut client = rustls::ClientConnection::new(client.clone(), "localhost".try_into().unwrap()).unwrap();
+        while client.is_handshaking() || server.is_handshaking() || server.wants_write() {
+            let mut bytes = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut bytes).unwrap();
+            }
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                server.read_tls(&mut rest).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut bytes = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut bytes).unwrap();
+            }
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                client.read_tls(&mut rest).unwrap();
+                client.process_new_packets().unwrap();
+            }
+        }
+        client.handshake_kind().unwrap()
+    }
+
+    #[test]
+    fn replicas_with_one_ticket_seed_resume_each_others_sessions() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let resolver = || {
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+            let signing = provider().key_provider.load_private_key(key).unwrap();
+            Arc::new(CertResolver {
+                strict_sni: false,
+                loaded: RwLock::new(Loaded::new(vec![LoadedEntry {
+                    spec: CertSpec {
+                        hosts: Vec::new(),
+                        cert: std::path::PathBuf::new(),
+                        key: std::path::PathBuf::new(),
+                        managed: false,
+                    },
+                    key: Some(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing))),
+                    stamp: Vec::new(),
+                }])),
+            })
+        };
+        let client = || {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.der().clone()).unwrap();
+            Arc::new(
+                rustls::ClientConfig::builder_with_provider(provider())
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        };
+        let seed = b"a seed every replica is given, 32+ bytes";
+        // Two replicas: their own configurations and keys, made from one seed.
+        let replica = |seed: Option<&[u8]>| {
+            let keys = seed.map(|seed| Arc::new(crate::tickets::TicketKeys::new(seed).unwrap()));
+            Arc::new(server_config(resolver(), &[b"h2"], false, keys).unwrap())
+        };
+        let (a, b) = (replica(Some(seed)), replica(Some(seed)));
+        let browser = client();
+        assert_eq!(handshake(a.clone(), &browser), rustls::HandshakeKind::Full);
+        assert_eq!(
+            handshake(b, &browser),
+            rustls::HandshakeKind::Resumed,
+            "the ticket of A, on B"
+        );
+        assert_eq!(handshake(a, &browser), rustls::HandshakeKind::Resumed, "and of B on A");
+        // Another seed (or none, the keys of each process): a full handshake there.
+        let browser = client();
+        assert_eq!(handshake(replica(Some(seed)), &browser), rustls::HandshakeKind::Full);
+        assert_eq!(
+            handshake(replica(Some(b"another seed, quite unlike the first one")), &browser),
+            rustls::HandshakeKind::Full
+        );
+        let browser = client();
+        assert_eq!(handshake(replica(None), &browser), rustls::HandshakeKind::Full);
+        assert_eq!(handshake(replica(None), &browser), rustls::HandshakeKind::Full);
     }
 }

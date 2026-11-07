@@ -66,6 +66,9 @@ pub struct ServerConfig {
     /// without SNI or for another name ends before any certificate is sent (WEB_TLS_STRICT_SNI,
     /// src/main.rs; src/tls.rs).
     pub strict_sni: bool,
+    /// TLS: session tickets sealed with keys from a shared seed (WEB_TLS_TICKET_SEED, src/main.rs;
+    /// src/tickets.rs), the same on every replica given it; `None`: keys of this process alone.
+    pub ticket_keys: Option<std::sync::Arc<crate::tickets::TicketKeys>>,
     /// TLS: a request whose Host is served with another certificate than the one the connection
     /// was opened for gets 421 Misdirected Request (RFC 9110 §15.5.20). On unless
     /// `strict_sni_host insecure_off`; unlike Caddy, whose `on` wants Host to equal SNI and
@@ -529,6 +532,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                     port: p.port,
                     tls: (!p.tls.is_empty()).then(Vec::new),
                     strict_sni: false,
+                    ticket_keys: None,
                     strict_host: opts.strict_host.unwrap_or(true),
                     protocols: opts.protocols.unwrap_or_default(),
                     trusted_proxies: opts.trusted.clone().unwrap_or_default(),
@@ -654,6 +658,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
                         port: http_port,
                         tls: None,
                         strict_sni: false,
+                        ticket_keys: None,
                         strict_host: opts.strict_host.unwrap_or(true),
                         protocols: Protocols {
                             h2: false,

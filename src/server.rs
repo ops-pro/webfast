@@ -797,6 +797,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         port,
         tls,
         strict_sni,
+        ticket_keys,
         strict_host,
         protocols,
         trusted_proxies,
@@ -842,7 +843,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         // resolver answers it only for a host with a challenge up.
         #[cfg(feature = "acme")]
         alpn.push(crate::acme::challenge::ALPN);
-        let config = tls::server_config(resolver.clone(), &alpn, false)?;
+        let config = tls::server_config(resolver.clone(), &alpn, false, ticket_keys.clone())?;
         acceptor = Some(TlsAcceptor::from(Arc::new(config)));
         if protocols.h3 {
             quic_resolver = Some(resolver);
@@ -868,7 +869,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
     };
     let mut quic_endpoint = None;
     if let Some(resolver) = quic_resolver {
-        let tls_config = tls::server_config(resolver, &[b"h3"], true)?;
+        let tls_config = tls::server_config(resolver, &[b"h3"], true, None)?;
         let quic_crypto =
             quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).context("QUIC TLS configuration")?;
         let mut quic_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));

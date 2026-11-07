@@ -37,6 +37,7 @@ pub mod ratelimit;
 pub mod server;
 pub mod sockets;
 pub mod static_files;
+pub mod tickets;
 pub mod tls;
 pub mod upstreams;
 #[cfg(feature = "compress-files")]

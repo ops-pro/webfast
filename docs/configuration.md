@@ -612,6 +612,8 @@ Those an answer shows are checked by `compat/`:
 | `WEB_PROXY_CACHE_MEMORY`           | `64MiB`     | what the answers kept by `cache` may take, every encoding counted; past it the least asked for go first; `off`: nothing is kept (docs/configuration.md, Proxy cache)                                                                                               |
 | `WEB_COMPRESSED_FILES_MEMORY`      | `64MiB`     | what the compressed variants of files without a precompressed sibling may take; past it the least asked for go first; `off`: none are made (docs/operations.md, Compressed variants) |
 | `WEB_TLS_STRICT_SNI`               | `off`       | `on`: a TLS handshake without SNI, or for a name no site names exactly or by a wildcard, gets no certificate and ends with an alert (docs/operations.md, TLS and HTTP/3) |
+| `WEB_TLS_TICKET_SEED`              | unset       | A secret of at least 32 bytes from which the TLS session ticket keys are made: replicas given the same seed resume each other's sessions, also after a restart (docs/operations.md, TLS and HTTP/3). Unset: keys of the process alone |
+| `WEB_TLS_TICKET_SEED_FILE`         | unset       | A file holding that secret (a mounted secret), in place of `WEB_TLS_TICKET_SEED`; not both |
 | `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
 | `WEB_ACME_DIR`                     | `/data/acme` | where the obtained certificates, their keys and the ACME account are kept (Automatic certificates) |
