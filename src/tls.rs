@@ -26,7 +26,6 @@
 //!     answered from early data.
 
 use crate::config::CertSpec;
-use crate::matcher::host_matches;
 use anyhow::{Context, Result};
 use rustls::SignatureScheme;
 use rustls::crypto::CryptoProvider;
@@ -34,7 +33,6 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -49,7 +47,7 @@ pub fn provider() -> Arc<CryptoProvider> {
 /// Picks the certificate for a handshake (see the module documentation).
 #[derive(Debug)]
 pub struct CertResolver {
-    loaded: RwLock<Vec<LoadedEntry>>,
+    loaded: RwLock<Loaded>,
     /// Certificates only for the names the sites name (WEB_TLS_STRICT_SNI).
     strict_sni: bool,
 }
@@ -65,6 +63,59 @@ struct LoadedEntry {
 /// Certificates read for a configuration, not yet in use (`CertResolver::install`).
 #[derive(Debug)]
 pub struct Certificates(Vec<LoadedEntry>);
+
+/// The certificates in use, their names indexed: a handshake (and a request's Host check) finds
+/// those that fit a name in one or two lookups, however many certificates there are.
+#[derive(Debug)]
+struct Loaded {
+    entries: Vec<LoadedEntry>,
+    index: crate::matcher::HostIndex,
+}
+
+impl Loaded {
+    fn new(entries: Vec<LoadedEntry>) -> Loaded {
+        let index = crate::matcher::HostIndex::new(entries.iter().map(|e| e.spec.hosts.as_slice()));
+        Loaded { entries, index }
+    }
+
+    /// `f` of the entries that fit `name` best (as `fit` ranks them): those naming it exactly,
+    /// else by a wildcard, else those for any host; `None` when none fits, and with `strict` SNI
+    /// also when only one for any host would.
+    fn best<R>(&self, name: Option<&str>, strict: bool, f: impl FnOnce(Option<&[u32]>) -> R) -> R {
+        let any = if strict || self.index.any().is_empty() {
+            None
+        } else {
+            Some(self.index.any())
+        };
+        match name {
+            Some(name) => self.index.lookup(name, |exact, wildcard| {
+                if !exact.is_empty() {
+                    f(Some(exact))
+                } else if !wildcard.is_empty() {
+                    f(Some(wildcard))
+                } else {
+                    f(any)
+                }
+            }),
+            None => f(any),
+        }
+    }
+}
+
+impl std::ops::Deref for Loaded {
+    type Target = [LoadedEntry];
+
+    fn deref(&self) -> &[LoadedEntry] {
+        &self.entries
+    }
+}
+
+/// In place only: an entry re-read from its files keeps its names, so the index stays right.
+impl std::ops::DerefMut for Loaded {
+    fn deref_mut(&mut self) -> &mut [LoadedEntry] {
+        &mut self.entries
+    }
+}
 
 /// The certificate and key files' sizes and modification times: changed when renewed.
 type Stamp = Vec<(u64, Option<SystemTime>)>;
@@ -112,7 +163,7 @@ impl CertResolver {
     /// gets no certificate and ends (the site for any host gives none either).
     pub fn new(specs: Vec<CertSpec>, strict_sni: bool, provider: &CryptoProvider) -> Result<CertResolver> {
         Ok(CertResolver {
-            loaded: RwLock::new(CertResolver::read(&specs, provider)?.0),
+            loaded: RwLock::new(Loaded::new(CertResolver::read(&specs, provider)?.0)),
             strict_sni,
         })
     }
@@ -147,7 +198,7 @@ impl CertResolver {
     /// under way keep the certificate they chose.
     pub fn install(&self, certificates: Certificates) {
         if let Ok(mut loaded) = self.loaded.write() {
-            *loaded = certificates.0;
+            *loaded = Loaded::new(certificates.0);
         }
     }
 
@@ -164,29 +215,18 @@ impl CertResolver {
         let Ok(loaded) = self.loaded.read() else {
             return true;
         };
-        let host = host.to_ascii_lowercase();
-        let by_sni = self.certificates_for(&loaded, sni);
-        let by_host = self.certificates_for(&loaded, Some(&host));
-        if by_sni.is_empty() && by_host.is_empty() {
-            return true;
-        }
-        by_sni.iter().any(|file| by_host.contains(file))
-    }
-
-    /// The certificates (by their files) of the entries that fit `name` best; none when nothing
-    /// fits, or with strict SNI only the site for any host would.
-    fn certificates_for<'a>(&self, loaded: &'a [LoadedEntry], name: Option<&str>) -> Vec<(&'a Path, &'a Path)> {
-        let Some(best) = loaded.iter().filter_map(|e| fit(&e.spec.hosts, name)).min() else {
-            return Vec::new();
+        // The certificates by their files: those that fit each name best share one.
+        let files = |i: &u32| {
+            let spec = &loaded[*i as usize].spec;
+            (spec.cert.as_path(), spec.key.as_path())
         };
-        if self.strict_sni && best == 2 {
-            return Vec::new();
-        }
-        loaded
-            .iter()
-            .filter(|e| fit(&e.spec.hosts, name) == Some(best))
-            .map(|e| (e.spec.cert.as_path(), e.spec.key.as_path()))
-            .collect()
+        loaded.best(sni, self.strict_sni, |by_sni| {
+            loaded.best(Some(host), self.strict_sni, |by_host| match (by_sni, by_host) {
+                (None, None) => true,
+                (Some(by_sni), Some(by_host)) => by_sni.iter().any(|a| by_host.iter().any(|b| files(a) == files(b))),
+                _ => false,
+            })
+        })
     }
 
     /// Re-reads certificates whose files changed; a broken new file keeps the old certificate.
@@ -220,30 +260,30 @@ impl CertResolver {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let name = hello.server_name().map(str::to_ascii_lowercase);
+        // Compared in any case where it is looked up: no lowercase copy for an ordinary handshake.
+        let name = hello.server_name();
         // TLS-ALPN-01 (src/acme): the challenge certificate for a handshake that asks for it.
         #[cfg(feature = "acme")]
-        if let Some(name) = &name
+        if let Some(name) = name
             && hello.alpn().is_some_and(crate::acme::challenge::offers_challenge)
         {
-            return crate::acme::challenge::alpn_certificate(name);
+            return crate::acme::challenge::alpn_certificate(&name.to_ascii_lowercase());
         }
         let loaded = self.loaded.read().ok()?;
-        let chosen = choose(&loaded, name.as_deref(), hello.signature_schemes(), self.strict_sni);
+        let chosen = choose(&loaded, name, hello.signature_schemes(), self.strict_sni);
         if chosen.is_none() {
             // Scanners do this all the time: debug, not to flood the log.
-            tracing::debug!(
-                sni = name.as_deref().unwrap_or(""),
-                "TLS handshake refused: no site for this name"
-            );
+            tracing::debug!(sni = name.unwrap_or(""), "TLS handshake refused: no site for this name");
         }
         chosen.and_then(|e| e.key.clone())
     }
 }
 
 /// How well a site's `hosts` fit `name`: 0 exactly, 1 by a wildcard, 2 as the site for any host;
-/// `None`: not at all.
+/// `None`: not at all. What `Loaded::best` finds by its index; kept to check it against.
+#[cfg(test)]
 fn fit(hosts: &[String], name: Option<&str>) -> Option<u8> {
+    use crate::matcher::host_matches;
     if hosts.is_empty() {
         return Some(2);
     }
@@ -262,6 +302,35 @@ fn fit(hosts: &[String], name: Option<&str>) -> Option<u8> {
 /// one that only the site for any host would take, gets none (rustls then ends the handshake with
 /// an alert, before any certificate is sent).
 fn choose<'a>(
+    loaded: &'a Loaded,
+    name: Option<&str>,
+    schemes: &[SignatureScheme],
+    strict_sni: bool,
+) -> Option<&'a LoadedEntry> {
+    loaded.best(name, strict_sni, |best| match best {
+        Some(best) => first_signing(best.iter().map(|i| &loaded[*i as usize]), schemes),
+        None if strict_sni => None,
+        // None fits: any of them.
+        None => first_signing(loaded.iter(), schemes),
+    })
+}
+
+/// Of `candidates`, the first with a key that can sign with one of `schemes`, else the first with
+/// a key (an entry whose certificate is still to be obtained has none to give).
+fn first_signing<'a>(
+    candidates: impl Iterator<Item = &'a LoadedEntry> + Clone,
+    schemes: &[SignatureScheme],
+) -> Option<&'a LoadedEntry> {
+    let candidates = candidates.filter(|e| e.key.is_some());
+    candidates
+        .clone()
+        .find(|e| e.key.as_ref().is_some_and(|k| k.key.choose_scheme(schemes).is_some()))
+        .or_else(|| candidates.clone().next())
+}
+
+/// `choose` entry by entry, as it was before the index: kept to check the index against.
+#[cfg(test)]
+fn choose_linear<'a>(
     loaded: &'a [LoadedEntry],
     name: Option<&str>,
     schemes: &[SignatureScheme],
@@ -348,6 +417,54 @@ mod tests {
             },
             key: Some(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing))),
             stamp: Vec::new(),
+        }
+    }
+
+    /// `super::choose` on these entries, checked against the entry-by-entry `choose_linear`.
+    fn choose<'a>(
+        loaded: &'a [LoadedEntry],
+        name: Option<&str>,
+        schemes: &[SignatureScheme],
+        strict: bool,
+    ) -> Option<&'a LoadedEntry> {
+        let indexed = Loaded::new(loaded.to_vec());
+        let position = |entries: &[LoadedEntry], e: &LoadedEntry| entries.iter().position(|l| std::ptr::eq(l, e));
+        let by_index = super::choose(&indexed, name, schemes, strict).and_then(|e| position(&indexed, e));
+        let by_entry = choose_linear(loaded, name, schemes, strict).and_then(|e| position(loaded, e));
+        assert_eq!(by_index, by_entry, "{name:?} {schemes:?} strict {strict}");
+        by_entry.map(|i| &loaded[i])
+    }
+
+    #[test]
+    fn the_index_chooses_as_entry_by_entry() {
+        let p256 = &rcgen::PKCS_ECDSA_P256_SHA256;
+        let loaded = [
+            entry(&["a.test", "b.test"], p256),
+            entry(&["*.w.test"], &rcgen::PKCS_RSA_SHA256),
+            entry(&["*.w.test", "x.w.test"], p256),
+            entry(&[], &rcgen::PKCS_RSA_SHA256),
+            entry(&["b.test"], &rcgen::PKCS_RSA_SHA256),
+            entry(&[], p256),
+        ];
+        let names = [
+            None,
+            Some("a.test"),
+            Some("B.Test"),
+            Some("x.w.test"),
+            Some("y.W.test"),
+            Some("a.y.w.test"),
+            Some("w.test"),
+            Some("other.test"),
+            Some(""),
+        ];
+        for strict in [false, true] {
+            for entries in [&loaded[..], &loaded[..3], &loaded[3..], &loaded[1..2]] {
+                for name in names {
+                    for schemes in [&[EC][..], &[RSA], &[EC, RSA], &[]] {
+                        choose(entries, name, schemes, strict);
+                    }
+                }
+            }
         }
     }
 
@@ -458,7 +575,7 @@ mod tests {
             entry.spec.key = PathBuf::from(format!("cert-{file}.key"));
         }
         CertResolver {
-            loaded: RwLock::new(entries),
+            loaded: RwLock::new(Loaded::new(entries)),
             strict_sni,
         }
     }
@@ -559,7 +676,7 @@ mod tests {
         let signing = provider().key_provider.load_private_key(key).unwrap();
         let resolver = Arc::new(CertResolver {
             strict_sni: false,
-            loaded: RwLock::new(vec![LoadedEntry {
+            loaded: RwLock::new(Loaded::new(vec![LoadedEntry {
                 spec: CertSpec {
                     hosts: Vec::new(),
                     cert: std::path::PathBuf::new(),
@@ -568,7 +685,7 @@ mod tests {
                 },
                 key: Some(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing))),
                 stamp: Vec::new(),
-            }]),
+            }])),
         });
         let server = Arc::new(server_config(resolver, &[b"h2"], false).unwrap());
         assert_eq!(server.cert_compressors.len(), 2, "brotli and zlib");
