@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **The module API's staged checks hand the head's state to the body by value, and a set boxes
+  once** (`webfast_core::module`, docs/modules.md). `Check` has an associated
+  `type Pending: Send + 'static`; `head` returns `Head<Self::Pending>` (`Pass`, `Refuse`,
+  `Body(pending)`) and `body(pending, req, body, client)` returns `impl Future<Output = Checked> +
+  Send` (an `async fn` implements it) instead of a `BoxFuture`. The composed set is two traits:
+  the generic `CheckSet` (for every `Check`, `()`, `Option<T>`, `Arc<T>` and pairs; a pair's
+  pending is `Stage::First`/`Stage::Second`) and the object-safe `Checks`, whose
+  `check(req, body, client) -> Checking` gives `Done(checked)` from the heads alone or
+  `Body(future)` — the one boxed future of the request, over the asking check's body and the
+  heads and bodies after it. `Decided`, `Checks::head`/`body`/`leaves` are gone. The same for the
+  response side: `Inspect::inspect` returns `impl Future`, `InspectSet` is the generic set (each
+  inspector is called only for a response its `covers` took), and `Inspectors::inspect` boxes one
+  future for a covered response, none for the others (pairs boxed twice before, `()` and `None`
+  once more). A module that carried state from `head` to `body` in `req.extensions` now returns
+  it in `Head::Body`. With the request filter's matching change, a 1 KiB form POST through it
+  allocates 37 times where it allocated 49 (the filter on), a 4 KiB multipart upload
+  43 instead of 58; a GET is unchanged at 6, the browser challenge's GET with a cookie at 4.
+- The request filter (webfast-modules) streams a proxied 200 instead of holding it: its body is
+  scanned as it goes out and the response is cut (the connection closed, the HTTP/2 stream reset)
+  at a leak; a 5xx is held and replaced as before (`response.stream: false` holds a 200 too).
+
 ## 0.1.3 — 2026-11-07
 
 Less CPU and fewer allocations wherever a response is compressed, proxied, cached or goes through

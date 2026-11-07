@@ -283,8 +283,10 @@ the tuples here — `Modules` among the request checks (after the ACME answer, b
 `ModuleInspectors` among the proxy observers (before the cache) — each calling the set the binary
 composed through one `&'static dyn`. The set is still a tuple, written in the binary; the dyn
 call is one vtable call per request for the whole set, and its protocol is synchronous first
-(`Check::head` decides, `Check::body` boxes a future only for a body; `Inspect::covers`, then
-`inspect`), so a clean request allocates nothing for them, as before. `Hooks::get::<T>()` finds a
+(`Check::head` decides and hands its body phase what it found by value; `Checks::check` boxes
+one future for the whole set, only for a request whose body a check asked for; `Inspect::covers`,
+then one boxed future over the inspectors that cover the response), so a clean request allocates
+nothing for them, as before. `Hooks::get::<T>()` finds a
 module's leaf by its type among the composed sets, which is how a zero-sized observer finds its
 module (`Ctx::hook`). The JWT and API firewall could move out the same way; the upstream checks
 they use would take the same protocol.

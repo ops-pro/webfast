@@ -14,14 +14,15 @@
 //! The modules of other crates (src/module.rs, docs/modules.md) take part through two slots of
 //! these tuples, `Modules` among the request checks and `ModuleInspectors` among the proxy
 //! observers: each calls the set the binary composed through one `&'static dyn`, whose heads
-//! decide synchronously, so a clean request allocates nothing for them either.
+//! decide synchronously, so a clean request allocates nothing for them either; a request whose
+//! body a module reads, or a response a module covers, costs one boxed future for the whole set.
 
 use crate::body::Body;
 use crate::config::Config;
 use crate::encode::Encoding;
 use crate::files::{FileEntry, FileStore};
 use crate::handler::{ConnInfo, Ctx, RenderedOp};
-use crate::module::{Decided, ModuleHooks};
+use crate::module::{Checking, ModuleHooks};
 use crate::proxy::ReverseProxy;
 use anyhow::Result;
 use http::uri::Authority;
@@ -403,16 +404,16 @@ impl<T: UpstreamCheck> UpstreamCheck for Arc<T> {
 // The modules' slots: the sets the binary composed, behind one `&'static dyn` each.
 
 /// The modules' request checks (`module::Checks`), as one check of the core's tuple: the heads
-/// in order, synchronously; a boxed future only from the leaf that asked for the body on.
+/// in order, synchronously; one boxed future, for the whole set, only when a check asked for the
+/// body.
 #[derive(Clone, Copy)]
 pub struct Modules(pub &'static dyn crate::module::Checks);
 
 impl RequestCheck for Modules {
     async fn check(&self, req: &mut http::request::Parts, body: Body, client: Client<'_>) -> Checked {
-        match self.0.head(req, client) {
-            Decided::Pass => Ok(body),
-            Decided::Refuse(response) => Err(response),
-            Decided::Body(at) => self.0.body(req, body, client, at).await,
+        match self.0.check(req, body, client) {
+            Checking::Done(checked) => checked,
+            Checking::Body(checking) => checking.await,
         }
     }
 }

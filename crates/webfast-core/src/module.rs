@@ -7,10 +7,12 @@
 //! writes (`(A, (B, ()))`), resolved at compile time there.
 //!
 //! The checks decide synchronously where they can: `Check::head` sees the request's head and
-//! answers `Pass`, `Refuse` or `Body`; only `Body` costs a boxed future (`Check::body`), and a
-//! clean GET never gets there. The same for a proxied response: `Inspect::covers` is a plain call,
-//! `Inspect::inspect` boxes only for a response it covers. So the request path allocates nothing
-//! for a module that has nothing to say, as it did when the modules were `cfg`s of the core.
+//! answers `Pass`, `Refuse` or `Body(pending)`, handing the body phase what it found by value;
+//! only `Body` costs a boxed future — one for the whole set, made by `Checks::check` over the
+//! bodies and the heads after them — and a clean GET never gets there. The same for a proxied
+//! response: `Inspect::covers` is a plain call, and the set's one boxed future is made only for a
+//! response some inspector covers. So the request path allocates nothing for a module that has
+//! nothing to say, as it did when the modules were `cfg`s of the core.
 
 use crate::body::Body;
 use crate::caddyfile::Line;
@@ -136,26 +138,35 @@ impl dyn RouteHandler {
 
 /// A request check of a module: before the site's routes and ready answers, after the ACME answer
 /// and before the core's JWT and API firewall checks. The head first, synchronously; the body only
-/// when the head could not decide.
+/// when the head could not decide, with what the head handed it (`Head::Body`).
 pub trait Check: Any + Send + Sync {
-    /// The request's head: let it through (perhaps changed), refuse it, or ask for the body.
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head;
+    /// What the head phase hands the body phase, by value (`()` when it needs nothing).
+    type Pending: Send + 'static;
 
-    /// After `Head::Body`: the check with the body — what `head` could not decide, not the head's
-    /// work again. The body given back is the one the routes read (the same bytes, when the check
-    /// read some).
-    fn body<'a>(&'a self, req: &'a mut http::request::Parts, body: Body, client: Client<'a>) -> BoxFuture<'a, Checked>;
+    /// The request's head: let it through (perhaps changed), refuse it, or ask for the body.
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<Self::Pending>;
+
+    /// After `Head::Body(pending)`: the check with the body — what `head` could not decide, not
+    /// the head's work again. The body given back is the one the routes read (the same bytes,
+    /// when the check read some). Not boxed here: the set boxes once for all its checks.
+    fn body<'a>(
+        &'a self,
+        pending: Self::Pending,
+        req: &'a mut http::request::Parts,
+        body: Body,
+        client: Client<'a>,
+    ) -> impl Future<Output = Checked> + Send + 'a;
 }
 
 /// What `Check::head` decided.
-pub enum Head {
+pub enum Head<P = ()> {
     /// The routes next (the core's own checks first).
     Pass,
     /// This is the answer; marked `extensions::ErrorPage` to go through the site's
     /// `handle_errors`.
     Refuse(Response<Body>),
-    /// `Check::body` decides.
-    Body,
+    /// `Check::body` decides, given this.
+    Body(P),
 }
 
 /// An inspector of proxied responses: sees a `reverse_proxy`'s response before the proxy cache
@@ -166,75 +177,73 @@ pub trait Inspect: Any + Send + Sync {
     /// request in `ctx`).
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool;
 
-    /// The response as the upstream gave it: may read the start of the body (giving back a body
-    /// that yields the same bytes) and replace the response; `Err` is sent in its place, through
-    /// the site's `handle_errors` when marked `extensions::ErrorPage`. May be called for a response
-    /// `covers` did not take (another inspector did): `Ok(body)` then.
+    /// A response `covers` took, as the upstream gave it: may read the start of the body (giving
+    /// back a body that yields the same bytes), wrap the body, and replace the response; `Err` is
+    /// sent in its place, through the site's `handle_errors` when marked `extensions::ErrorPage`.
+    /// Not boxed here: the set boxes once for all its inspectors.
     fn inspect<'a>(
         &'a self,
         ctx: &'a mut Ctx,
         parts: &'a mut http::response::Parts,
         body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>>;
+    ) -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a;
 }
 
 // The composed sets: `()` for none, a leaf, `Option<T>` for a module that is built but not
-// configured, `Arc<T>` for a shared one, and nested pairs `(A, (B, ()))` for the order. The core
-// calls them through `&'static dyn Checks` and `&'static dyn Inspectors`: one vtable call per
-// request for the whole set, and a boxed future only where a leaf asked for the body.
+// configured, `Arc<T>` for a shared one, and nested pairs `(A, (B, ()))` for the order. Two traits
+// each: the generic one the tuple recursion is written in (`CheckSet`, `InspectSet`: what a head
+// hands on is a type, the futures are not boxed), and the object-safe one the core calls through
+// `&'static dyn` (`Checks`, `Inspectors`), implemented for every generic set: one vtable call per
+// request for the whole set, and one boxed future at most — for a request whose body a check asked
+// for, for a response an inspector covers — however many modules there are.
 
-/// A composed set of request checks, as the core calls it. Implemented for every `Check`, for
-/// `()`, `Option<T>`, `Arc<T>` and pairs `(A, B)`; nothing else implements it.
-pub trait Checks: Send + Sync + 'static {
-    /// The heads in order; `Decided::Body(at)`: the leaf at `at` (in the set's order) wants the
-    /// body, those before it passed.
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Decided;
+/// A composed set of request checks, generically: what the object-safe `Checks` is made of.
+/// Implemented for every `Check`, for `()`, `Option<T>`, `Arc<T>` and pairs `(A, B)`; nothing else
+/// implements it.
+pub trait CheckSet: Send + Sync + 'static {
+    /// What the heads hand the bodies: for a pair, which of the two asked, and its leaf's.
+    type Pending: Send + 'static;
 
-    /// The checks from the leaf at `at` on: its `body`, then the rest's heads and bodies.
+    /// The heads in order, until one refuses or asks for the body.
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<Self::Pending>;
+
+    /// From the leaf that asked for the body on: its `body`, then the rest's heads and bodies —
+    /// one future for all of them.
     fn body<'a>(
         &'a self,
+        pending: Self::Pending,
         req: &'a mut http::request::Parts,
         body: Body,
         client: Client<'a>,
-        at: u32,
-    ) -> BoxFuture<'a, Checked>;
-
-    /// The leaves in the set: what the position `Decided::Body` names counts.
-    fn leaves(&self) -> u32;
+    ) -> impl Future<Output = Checked> + Send + 'a;
 
     /// The leaf of type `id`, for `Hooks::get`.
     fn find(&self, id: TypeId) -> Option<&dyn Any>;
 }
 
-/// What a set of checks decided from the heads alone.
-pub enum Decided {
-    Pass,
-    Refuse(Response<Body>),
-    /// The leaf at this position wants the body.
-    Body(u32),
+/// Which side of a pair asked for the body, and what its head handed on.
+pub enum Stage<A, B> {
+    /// The first: its body, then the second's head (and perhaps body).
+    First(A),
+    /// The second (the first passed).
+    Second(B),
 }
 
-impl<T: Check> Checks for T {
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Decided {
-        match Check::head(self, req, client) {
-            Head::Pass => Decided::Pass,
-            Head::Refuse(response) => Decided::Refuse(response),
-            Head::Body => Decided::Body(0),
-        }
+impl<T: Check> CheckSet for T {
+    type Pending = T::Pending;
+
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<T::Pending> {
+        Check::head(self, req, client)
     }
 
     fn body<'a>(
         &'a self,
+        pending: T::Pending,
         req: &'a mut http::request::Parts,
         body: Body,
         client: Client<'a>,
-        _: u32,
-    ) -> BoxFuture<'a, Checked> {
-        Check::body(self, req, body, client)
-    }
-
-    fn leaves(&self) -> u32 {
-        1
+    ) -> impl Future<Output = Checked> + Send + 'a {
+        Check::body(self, pending, req, body, client)
     }
 
     fn find(&self, id: TypeId) -> Option<&dyn Any> {
@@ -242,23 +251,23 @@ impl<T: Check> Checks for T {
     }
 }
 
-impl Checks for () {
-    fn head(&self, _: &mut http::request::Parts, _: Client<'_>) -> Decided {
-        Decided::Pass
+impl CheckSet for () {
+    type Pending = std::convert::Infallible;
+
+    fn head(&self, _: &mut http::request::Parts, _: Client<'_>) -> Head<Self::Pending> {
+        Head::Pass
     }
 
     fn body<'a>(
         &'a self,
+        pending: Self::Pending,
         _: &'a mut http::request::Parts,
         body: Body,
         _: Client<'a>,
-        _: u32,
-    ) -> BoxFuture<'a, Checked> {
-        Box::pin(async { Ok(body) })
-    }
-
-    fn leaves(&self) -> u32 {
-        0
+    ) -> impl Future<Output = Checked> + Send + 'a {
+        // Not reached: no head of `()` asks for the body (`Infallible` has no value).
+        let _: std::convert::Infallible = pending;
+        std::future::ready(Ok(body))
     }
 
     fn find(&self, _: TypeId) -> Option<&dyn Any> {
@@ -266,29 +275,28 @@ impl Checks for () {
     }
 }
 
-impl<T: Checks> Checks for Option<T> {
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Decided {
+impl<T: CheckSet> CheckSet for Option<T> {
+    type Pending = T::Pending;
+
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<T::Pending> {
         match self {
             Some(check) => check.head(req, client),
-            None => Decided::Pass,
+            None => Head::Pass,
         }
     }
 
-    fn body<'a>(
+    async fn body<'a>(
         &'a self,
+        pending: T::Pending,
         req: &'a mut http::request::Parts,
         body: Body,
         client: Client<'a>,
-        at: u32,
-    ) -> BoxFuture<'a, Checked> {
+    ) -> Checked {
         match self {
-            Some(check) => check.body(req, body, client, at),
-            None => Box::pin(async { Ok(body) }),
+            Some(check) => check.body(pending, req, body, client).await,
+            // Not reached: a `None` asks for no body.
+            None => Ok(body),
         }
-    }
-
-    fn leaves(&self) -> u32 {
-        self.as_ref().map_or(0, Checks::leaves)
     }
 
     fn find(&self, id: TypeId) -> Option<&dyn Any> {
@@ -296,23 +304,21 @@ impl<T: Checks> Checks for Option<T> {
     }
 }
 
-impl<T: Checks> Checks for Arc<T> {
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Decided {
+impl<T: CheckSet> CheckSet for Arc<T> {
+    type Pending = T::Pending;
+
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<T::Pending> {
         (**self).head(req, client)
     }
 
     fn body<'a>(
         &'a self,
+        pending: T::Pending,
         req: &'a mut http::request::Parts,
         body: Body,
         client: Client<'a>,
-        at: u32,
-    ) -> BoxFuture<'a, Checked> {
-        (**self).body(req, body, client, at)
-    }
-
-    fn leaves(&self) -> u32 {
-        (**self).leaves()
+    ) -> impl Future<Output = Checked> + Send + 'a {
+        (**self).body(pending, req, body, client)
     }
 
     fn find(&self, id: TypeId) -> Option<&dyn Any> {
@@ -320,40 +326,40 @@ impl<T: Checks> Checks for Arc<T> {
     }
 }
 
-impl<A: Checks, B: Checks> Checks for (A, B) {
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Decided {
+impl<A: CheckSet, B: CheckSet> CheckSet for (A, B) {
+    type Pending = Stage<A::Pending, B::Pending>;
+
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<Self::Pending> {
         match self.0.head(req, client) {
-            Decided::Pass => match self.1.head(req, client) {
-                Decided::Body(at) => Decided::Body(at + self.0.leaves()),
-                decided => decided,
+            Head::Pass => match self.1.head(req, client) {
+                Head::Pass => Head::Pass,
+                Head::Refuse(response) => Head::Refuse(response),
+                Head::Body(pending) => Head::Body(Stage::Second(pending)),
             },
-            decided => decided,
+            Head::Refuse(response) => Head::Refuse(response),
+            // The second's head runs after the first's body: what the first changes, it sees.
+            Head::Body(pending) => Head::Body(Stage::First(pending)),
         }
     }
 
-    fn body<'a>(
+    async fn body<'a>(
         &'a self,
+        pending: Self::Pending,
         req: &'a mut http::request::Parts,
         body: Body,
         client: Client<'a>,
-        at: u32,
-    ) -> BoxFuture<'a, Checked> {
-        let first = self.0.leaves();
-        if at >= first {
-            return self.1.body(req, body, client, at - first);
-        }
-        Box::pin(async move {
-            let body = self.0.body(req, body, client, at).await?;
-            match self.1.head(req, client) {
-                Decided::Pass => Ok(body),
-                Decided::Refuse(response) => Err(response),
-                Decided::Body(at) => self.1.body(req, body, client, at).await,
+    ) -> Checked {
+        match pending {
+            Stage::First(pending) => {
+                let body = self.0.body(pending, req, body, client).await?;
+                match self.1.head(req, client) {
+                    Head::Pass => Ok(body),
+                    Head::Refuse(response) => Err(response),
+                    Head::Body(pending) => self.1.body(pending, req, body, client).await,
+                }
             }
-        })
-    }
-
-    fn leaves(&self) -> u32 {
-        self.0.leaves() + self.1.leaves()
+            Stage::Second(pending) => self.1.body(pending, req, body, client).await,
+        }
     }
 
     fn find(&self, id: TypeId) -> Option<&dyn Any> {
@@ -361,25 +367,59 @@ impl<A: Checks, B: Checks> Checks for (A, B) {
     }
 }
 
-/// A composed set of inspectors, as the core calls it. Implemented for every `Inspect`, for `()`,
-/// `Option<T>`, `Arc<T>` and pairs `(A, B)`.
-pub trait Inspectors: Send + Sync + 'static {
-    /// Whether any inspector covers the response.
-    fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool;
-
-    /// Every inspector in order, each on the body the one before gave back.
-    fn inspect<'a>(
-        &'a self,
-        ctx: &'a mut Ctx,
-        parts: &'a mut http::response::Parts,
-        body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>>;
+/// A composed set of request checks, as the core calls it (`extensions::Modules`): implemented for
+/// every `CheckSet`.
+pub trait Checks: Send + Sync + 'static {
+    /// The heads in order, synchronously; `Checking::Body` when a check asked for the body: the
+    /// one boxed future, for its body and the rest of the set.
+    fn check<'a>(&'a self, req: &'a mut http::request::Parts, body: Body, client: Client<'a>) -> Checking<'a>;
 
     /// The leaf of type `id`, for `Hooks::get`.
     fn find(&self, id: TypeId) -> Option<&dyn Any>;
 }
 
-impl<T: Inspect> Inspectors for T {
+/// What a set of checks decided from the heads alone, or the rest of its work.
+pub enum Checking<'a> {
+    /// Decided: the body to go on with (untouched), or the refusal.
+    Done(Checked),
+    /// A check wants the body: this future decides.
+    Body(BoxFuture<'a, Checked>),
+}
+
+impl<T: CheckSet> Checks for T {
+    fn check<'a>(&'a self, req: &'a mut http::request::Parts, body: Body, client: Client<'a>) -> Checking<'a> {
+        match CheckSet::head(self, req, client) {
+            Head::Pass => Checking::Done(Ok(body)),
+            Head::Refuse(response) => Checking::Done(Err(response)),
+            Head::Body(pending) => Checking::Body(Box::pin(CheckSet::body(self, pending, req, body, client))),
+        }
+    }
+
+    fn find(&self, id: TypeId) -> Option<&dyn Any> {
+        CheckSet::find(self, id)
+    }
+}
+
+/// A composed set of inspectors, generically: what the object-safe `Inspectors` is made of.
+/// Implemented for every `Inspect`, for `()`, `Option<T>`, `Arc<T>` and pairs `(A, B)`.
+pub trait InspectSet: Send + Sync + 'static {
+    /// Whether any inspector covers the response.
+    fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool;
+
+    /// For a response the set covers: every inspector that covers it, in order, each on the body
+    /// the one before gave back — one future for all of them.
+    fn inspect<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        parts: &'a mut http::response::Parts,
+        body: Body,
+    ) -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a;
+
+    /// The leaf of type `id`, for `Hooks::get`.
+    fn find(&self, id: TypeId) -> Option<&dyn Any>;
+}
+
+impl<T: Inspect> InspectSet for T {
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool {
         Inspect::covers(self, ctx, parts)
     }
@@ -389,7 +429,7 @@ impl<T: Inspect> Inspectors for T {
         ctx: &'a mut Ctx,
         parts: &'a mut http::response::Parts,
         body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>> {
+    ) -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a {
         Inspect::inspect(self, ctx, parts, body)
     }
 
@@ -398,7 +438,7 @@ impl<T: Inspect> Inspectors for T {
     }
 }
 
-impl Inspectors for () {
+impl InspectSet for () {
     fn covers(&self, _: &Ctx, _: &http::response::Parts) -> bool {
         false
     }
@@ -408,8 +448,8 @@ impl Inspectors for () {
         _: &'a mut Ctx,
         _: &'a mut http::response::Parts,
         body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>> {
-        Box::pin(async { Ok(body) })
+    ) -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a {
+        std::future::ready(Ok(body))
     }
 
     fn find(&self, _: TypeId) -> Option<&dyn Any> {
@@ -417,20 +457,20 @@ impl Inspectors for () {
     }
 }
 
-impl<T: Inspectors> Inspectors for Option<T> {
+impl<T: InspectSet> InspectSet for Option<T> {
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool {
         self.as_ref().is_some_and(|inspector| inspector.covers(ctx, parts))
     }
 
-    fn inspect<'a>(
+    async fn inspect<'a>(
         &'a self,
         ctx: &'a mut Ctx,
         parts: &'a mut http::response::Parts,
         body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>> {
+    ) -> Result<Body, Response<Body>> {
         match self {
-            Some(inspector) => inspector.inspect(ctx, parts, body),
-            None => Box::pin(async { Ok(body) }),
+            Some(inspector) => inspector.inspect(ctx, parts, body).await,
+            None => Ok(body),
         }
     }
 
@@ -439,7 +479,7 @@ impl<T: Inspectors> Inspectors for Option<T> {
     }
 }
 
-impl<T: Inspectors> Inspectors for Arc<T> {
+impl<T: InspectSet> InspectSet for Arc<T> {
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool {
         (**self).covers(ctx, parts)
     }
@@ -449,7 +489,7 @@ impl<T: Inspectors> Inspectors for Arc<T> {
         ctx: &'a mut Ctx,
         parts: &'a mut http::response::Parts,
         body: Body,
-    ) -> BoxFuture<'a, Result<Body, Response<Body>>> {
+    ) -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a {
         (**self).inspect(ctx, parts, body)
     }
 
@@ -458,9 +498,56 @@ impl<T: Inspectors> Inspectors for Arc<T> {
     }
 }
 
-impl<A: Inspectors, B: Inspectors> Inspectors for (A, B) {
+impl<A: InspectSet, B: InspectSet> InspectSet for (A, B) {
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool {
         self.0.covers(ctx, parts) || self.1.covers(ctx, parts)
+    }
+
+    async fn inspect<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        parts: &'a mut http::response::Parts,
+        body: Body,
+    ) -> Result<Body, Response<Body>> {
+        // Each side only for what it covers (as the first left the response).
+        let body = if self.0.covers(ctx, parts) {
+            self.0.inspect(ctx, parts, body).await?
+        } else {
+            body
+        };
+        if self.1.covers(ctx, parts) {
+            self.1.inspect(ctx, parts, body).await
+        } else {
+            Ok(body)
+        }
+    }
+
+    fn find(&self, id: TypeId) -> Option<&dyn Any> {
+        self.0.find(id).or_else(|| self.1.find(id))
+    }
+}
+
+/// A composed set of inspectors, as the core calls it (`extensions::ModuleInspectors`):
+/// implemented for every `InspectSet`.
+pub trait Inspectors: Send + Sync + 'static {
+    /// Whether any inspector covers the response: if not, `inspect` is not called (nothing boxed).
+    fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool;
+
+    /// For a response the set covers: the inspectors that cover it in order, in one boxed future.
+    fn inspect<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        parts: &'a mut http::response::Parts,
+        body: Body,
+    ) -> BoxFuture<'a, Result<Body, Response<Body>>>;
+
+    /// The leaf of type `id`, for `Hooks::get`.
+    fn find(&self, id: TypeId) -> Option<&dyn Any>;
+}
+
+impl<T: InspectSet> Inspectors for T {
+    fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool {
+        InspectSet::covers(self, ctx, parts)
     }
 
     fn inspect<'a>(
@@ -469,14 +556,11 @@ impl<A: Inspectors, B: Inspectors> Inspectors for (A, B) {
         parts: &'a mut http::response::Parts,
         body: Body,
     ) -> BoxFuture<'a, Result<Body, Response<Body>>> {
-        Box::pin(async move {
-            let body = self.0.inspect(ctx, parts, body).await?;
-            self.1.inspect(ctx, parts, body).await
-        })
+        Box::pin(InspectSet::inspect(self, ctx, parts, body))
     }
 
     fn find(&self, id: TypeId) -> Option<&dyn Any> {
-        self.0.find(id).or_else(|| self.1.find(id))
+        InspectSet::find(self, id)
     }
 }
 
@@ -670,7 +754,8 @@ mod tests {
     use crate::handler::ConnInfo;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A check that counts its heads and bodies, passes, refuses, or asks for the body.
+    /// A check that counts its heads and bodies, passes, refuses, or asks for the body — handing
+    /// its body phase a token it checks.
     struct Leaf {
         heads: AtomicUsize,
         bodies: AtomicUsize,
@@ -686,11 +771,13 @@ mod tests {
     }
 
     impl Check for Leaf {
-        fn head(&self, _: &mut http::request::Parts, _: Client<'_>) -> Head {
-            self.heads.fetch_add(1, Ordering::Relaxed);
+        type Pending = (usize, &'static str);
+
+        fn head(&self, _: &mut http::request::Parts, _: Client<'_>) -> Head<Self::Pending> {
+            let n = self.heads.fetch_add(1, Ordering::Relaxed);
             match self.answer {
                 "pass" => Head::Pass,
-                "body" => Head::Body,
+                "body" => Head::Body((n, self.answer)),
                 _ => {
                     let mut response = Response::new(crate::body::empty());
                     *response.status_mut() = http::StatusCode::FORBIDDEN;
@@ -699,15 +786,22 @@ mod tests {
             }
         }
 
-        fn body<'a>(&'a self, _: &'a mut http::request::Parts, body: Body, _: Client<'a>) -> BoxFuture<'a, Checked> {
+        async fn body<'a>(
+            &'a self,
+            pending: Self::Pending,
+            _: &'a mut http::request::Parts,
+            body: Body,
+            _: Client<'a>,
+        ) -> Checked {
+            assert_eq!(pending, (0, "body"), "what the head handed on");
             self.bodies.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Ok(body) })
+            Ok(body)
         }
     }
 
-    /// The whole set as the core runs it (`extensions::Modules`).
+    /// The whole set as the core runs it (`extensions::Modules`), and whether it boxed.
     #[allow(clippy::result_large_err)]
-    async fn run(set: &dyn Checks) -> Checked {
+    async fn run(set: &dyn Checks) -> (Checked, bool) {
         let conn = ConnInfo {
             remote: "203.0.113.7:4000".parse().unwrap(),
             tls: false,
@@ -720,18 +814,18 @@ mod tests {
             at: At::Routes,
         };
         let (mut parts, ()) = http::Request::get("/").body(()).unwrap().into_parts();
-        match set.head(&mut parts, client) {
-            Decided::Pass => Ok(crate::body::empty()),
-            Decided::Refuse(response) => Err(response),
-            Decided::Body(at) => set.body(&mut parts, crate::body::empty(), client, at).await,
+        match set.check(&mut parts, crate::body::empty(), client) {
+            Checking::Done(checked) => (checked, false),
+            Checking::Body(checking) => (checking.await, true),
         }
     }
 
     #[tokio::test]
     async fn the_heads_decide_and_only_the_leaf_that_asked_reads_the_body() {
         let set = (leaf("pass"), (Some(leaf("body")), (Arc::new(leaf("pass")), ())));
-        assert_eq!(set.leaves(), 3);
-        assert!(run(&set).await.is_ok());
+        let (checked, boxed) = run(&set).await;
+        assert!(checked.is_ok());
+        assert!(boxed, "the body: one future");
         let (a, b, c) = (&set.0, set.1.0.as_ref().unwrap(), &set.1.1.0);
         assert_eq!(
             (a.heads.load(Ordering::Relaxed), a.bodies.load(Ordering::Relaxed)),
@@ -748,27 +842,98 @@ mod tests {
         );
 
         let refusing = (leaf("pass"), (leaf("refuse"), (leaf("pass"), ())));
-        let refused = run(&refusing).await.expect_err("refused");
-        assert_eq!(refused.status(), http::StatusCode::FORBIDDEN);
+        let (refused, boxed) = run(&refusing).await;
+        assert_eq!(refused.expect_err("refused").status(), http::StatusCode::FORBIDDEN);
+        assert!(!boxed, "decided by the heads: nothing boxed");
         assert_eq!(refusing.1.1.0.heads.load(Ordering::Relaxed), 0, "not reached");
 
         let after_body = (leaf("body"), (leaf("refuse"), ()));
-        assert!(run(&after_body).await.is_err(), "a refusal after a body read");
+        assert!(run(&after_body).await.0.is_err(), "a refusal after a body read");
         assert_eq!(after_body.0.bodies.load(Ordering::Relaxed), 1);
 
+        let two_bodies = (leaf("body"), (leaf("pass"), (leaf("body"), ())));
+        assert!(run(&two_bodies).await.0.is_ok());
+        assert_eq!(two_bodies.0.bodies.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            two_bodies.1.1.0.bodies.load(Ordering::Relaxed),
+            1,
+            "the second body in the same future"
+        );
+
         let none: Option<Leaf> = None;
-        assert!(run(&(none, ())).await.is_ok());
-        assert!(run(&()).await.is_ok());
+        assert!(!run(&(none, ())).await.1);
+        assert!(run(&()).await.0.is_ok());
+        assert!(!run(&(leaf("pass"), ())).await.1, "a pass: nothing boxed");
     }
 
     #[test]
     fn a_leaf_is_found_by_its_type() {
         let set = (leaf("pass"), (Some(Arc::new(leaf("body"))), ()));
-        let found = set.find(TypeId::of::<Leaf>()).and_then(|a| a.downcast_ref::<Leaf>());
+        let found = Checks::find(&set, TypeId::of::<Leaf>()).and_then(|a| a.downcast_ref::<Leaf>());
         assert_eq!(found.map(|l| l.answer), Some("pass"));
-        assert!(set.find(TypeId::of::<String>()).is_none());
+        assert!(Checks::find(&set, TypeId::of::<String>()).is_none());
         let empty: (Option<Leaf>, ()) = (None, ());
-        assert!(empty.find(TypeId::of::<Leaf>()).is_none());
+        assert!(Checks::find(&empty, TypeId::of::<Leaf>()).is_none());
+    }
+
+    /// An inspector that covers a status, and counts what it inspected.
+    struct Covering {
+        status: u16,
+        inspected: AtomicUsize,
+    }
+
+    impl Inspect for Covering {
+        fn covers(&self, _: &Ctx, parts: &http::response::Parts) -> bool {
+            parts.status.as_u16() == self.status
+        }
+
+        async fn inspect<'a>(
+            &'a self,
+            _: &'a mut Ctx,
+            _: &'a mut http::response::Parts,
+            body: Body,
+        ) -> Result<Body, Response<Body>> {
+            self.inspected.fetch_add(1, Ordering::Relaxed);
+            Ok(body)
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_inspectors_that_cover_a_response_inspect_it() {
+        let covering = |status| Covering {
+            status,
+            inspected: AtomicUsize::new(0),
+        };
+        let set = (covering(200), (Some(covering(500)), (Arc::new(covering(200)), ())));
+        let conn = Arc::new(ConnInfo {
+            remote: "203.0.113.7:4000".parse().unwrap(),
+            tls: false,
+            trusted: false,
+            sni: None,
+        });
+        let (req, body) = http::Request::get("/").body(crate::body::empty()).unwrap().into_parts();
+        let mut ctx = Ctx::new(conn.clone(), req, body, conn.remote.ip());
+        let (mut parts, ()) = Response::new(()).into_parts();
+        let inspectors: &dyn Inspectors = &set;
+        assert!(inspectors.covers(&ctx, &parts));
+        assert!(
+            inspectors
+                .inspect(&mut ctx, &mut parts, crate::body::empty())
+                .await
+                .is_ok()
+        );
+        let counts = (
+            set.0.inspected.load(Ordering::Relaxed),
+            set.1.0.as_ref().unwrap().inspected.load(Ordering::Relaxed),
+            set.1.1.0.inspected.load(Ordering::Relaxed),
+        );
+        assert_eq!(counts, (1, 0, 1));
+        parts.status = http::StatusCode::NOT_FOUND;
+        assert!(
+            !inspectors.covers(&ctx, &parts),
+            "none covers it: the core does not call inspect"
+        );
+        assert!(!Inspectors::covers(&(), &ctx, &parts));
     }
 
     #[test]

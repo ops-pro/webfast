@@ -41,17 +41,28 @@ checks through one `&'static dyn module::Checks` and the set of inspectors throu
 `&'static dyn module::Inspectors` — one vtable call per request for the whole set — and the
 protocol is synchronous first:
 
-- `Check::head(&self, &mut Parts, Client) -> Head` sees the request's head and answers `Pass`,
-  `Refuse(response)` or `Body`. A clean GET is `Pass` from every head: no future, no allocation.
-- Only `Head::Body` costs a boxed future, `Check::body(...) -> BoxFuture<Checked>`: the check
-  reads the body (which allocates anyway) and gives it back with the same bytes.
-- `Inspect::covers(&self, &Ctx, &response::Parts) -> bool` is a plain call; `Inspect::inspect`
-  boxes only for a response some inspector covers.
+- `Check::head(&self, &mut Parts, Client) -> Head<Self::Pending>` sees the request's head and
+  answers `Pass`, `Refuse(response)` or `Body(pending)`. A clean GET is `Pass` from every head:
+  no future, no allocation.
+- `Body(pending)` hands the body phase what the head found, by value (`Check::Pending`: the
+  request filter's state and evaluation so far; `()` for the challenge's endpoint) — nothing goes
+  through the request's extensions. `Check::body(pending, …)` returns `impl Future`, unboxed.
+- The whole set costs one boxed future for a request whose body some check asked for, and none
+  otherwise: `Checks::check` runs the heads and returns `Checking::Done(checked)`, or
+  `Checking::Body(future)` — one box over the body of the check that asked and the heads (and
+  bodies) of the checks after it, however many there are.
+- `Inspect::covers(&self, &Ctx, &response::Parts) -> bool` is a plain call; the set boxes one
+  future for a response some inspector covers (over every inspector that covers it,
+  `Inspect::inspect` returning `impl Future`), none for the others.
 
 The sets themselves are tuples the binary writes — `(ChallengeEndpoint, (Option<Arc<Ngfw>>, ()))`
 — so the order is a type fixed at compile time, and `()` is a module that is not built. The core
-keeps the pairs' bookkeeping (`module::Checks`, `module::Inspectors`: implemented for every leaf,
-for `()`, `Option<T>`, `Arc<T>` and pairs); a module implements `Check` or `Inspect` alone.
+keeps the pairs' bookkeeping in two traits per kind: the generic `module::CheckSet` and
+`module::InspectSet` (implemented for every leaf, for `()`, `Option<T>`, `Arc<T>` and pairs; a
+pair's `Pending` is `Stage::First(a)` or `Stage::Second(b)`), whose futures are not boxed, and the
+object-safe `module::Checks` and `module::Inspectors` the core calls through `&'static dyn`
+(implemented for every generic set, and boxing once). A module implements `Check` or `Inspect`
+alone.
 
 `Handler::Extension(Arc<dyn RouteHandler>)` is a vtable call where `Handler::Challenge` was a
 match arm; `RouteHandler::run` is synchronous, as the directive handlers of the core are.
@@ -144,15 +155,49 @@ type, for a module looking at the routes it installed.
 
 ```rust
 pub trait Check: Any + Send + Sync {
-    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head;
-    fn body<'a>(&'a self, req: &'a mut http::request::Parts, body: Body, client: Client<'a>) -> BoxFuture<'a, Checked>;
+    /// What the head phase hands the body phase, by value.
+    type Pending: Send + 'static;
+    fn head(&self, req: &mut http::request::Parts, client: Client<'_>) -> Head<Self::Pending>;
+    fn body<'a>(&'a self, pending: Self::Pending, req: &'a mut http::request::Parts, body: Body, client: Client<'a>)
+        -> impl Future<Output = Checked> + Send + 'a;
 }
-pub enum Head { Pass, Refuse(Response<Body>), Body }
+pub enum Head<P = ()> { Pass, Refuse(Response<Body>), Body(P) }
 
 pub trait Inspect: Any + Send + Sync {
     fn covers(&self, ctx: &Ctx, parts: &http::response::Parts) -> bool;
     fn inspect<'a>(&'a self, ctx: &'a mut Ctx, parts: &'a mut http::response::Parts, body: Body)
-        -> BoxFuture<'a, Result<Body, Response<Body>>>;
+        -> impl Future<Output = Result<Body, Response<Body>>> + Send + 'a;
+}
+
+// What the core calls, through `&'static dyn`: implemented for every composed set.
+pub trait Checks: Send + Sync + 'static {
+    fn check<'a>(&'a self, req: &'a mut http::request::Parts, body: Body, client: Client<'a>) -> Checking<'a>;
+    fn find(&self, id: TypeId) -> Option<&dyn Any>;
+}
+pub enum Checking<'a> { Done(Checked), Body(BoxFuture<'a, Checked>) }
+```
+
+A check that needs the body, written with `async fn` (the trait's `impl Future + Send` accepts
+it):
+
+```rust
+pub struct Endpoint;
+
+impl Check for Endpoint {
+    type Pending = ();   // the head decided by the path; nothing to hand on
+
+    fn head(&self, req: &mut http::request::Parts, _: Client<'_>) -> Head {
+        if req.method == Method::POST && req.uri.path() == "/.well-known/endpoint" {
+            Head::Body(())
+        } else {
+            Head::Pass
+        }
+    }
+
+    async fn body<'a>(&'a self, _: (), req: &'a mut http::request::Parts, body: Body, _: Client<'a>) -> Checked {
+        let form = Limited::new(body, 4096).collect().await.map_err(|_| bad_request())?.to_bytes();
+        Err(answer(req, &form))   // the endpoint's answer is the response
+    }
 }
 ```
 
@@ -162,15 +207,17 @@ its JWT and API firewall checks, with `extensions::Client` (the client's address
 `handle_errors` routes, as a handler's own failure does; one without the mark goes out as it is
 (the challenge page is the answer, not an error). `head` may change the request — the request
 filter takes the headers of its `header` actions off every request and sets the geo header — and
-what it must carry over to `body` goes into `req.extensions` in a type of its own (the filter's
-`AfterHead`: an allocation only a request whose body is read pays).
+what it must carry over to `body` is its `Pending`, handed back by value (the filter's `Pending`:
+the state it ran with, its evaluation so far, the body's kind), so the hand-over allocates nothing.
 
 An `Inspect` sees a `reverse_proxy`'s response before the proxy cache keeps it and before the
 client gets it. It is zero-sized and composed as a constant for every proxy; it finds its module's
 state through `ctx.hook::<T>()` (`Hooks::get`: the leaf of type `T` among the composed checks and
-inspectors — `Option<Arc<Ngfw>>` in the checks answers `&Ngfw`). `inspect` may read the start of
-the body and must give back a body that yields the same bytes (`webfast_ngfw::body::read_prefix` chains
-the frames read with the rest); an `Err` replaces the response.
+inspectors — `Option<Arc<Ngfw>>` in the checks answers `&Ngfw`). `inspect` is called only for a
+response its `covers` took; it may read the start of the body and must give back a body that yields
+the same bytes (`webfast_ngfw::body::read_prefix` chains the frames read with the rest), or wrap the
+body (the filter's response phase scans a 200 as it streams, and ends the body with an error on a
+leak); an `Err` replaces the response.
 
 The upstream checks (`UpstreamCheck`, at a `reverse_proxy` and a `cache` hit, with a slot held for
 the response's life) stay the core's for now: the JWT and API firewall use them, and when those
