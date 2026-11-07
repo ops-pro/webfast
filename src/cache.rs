@@ -31,9 +31,10 @@ use crate::proxy::ReverseProxy;
 use bytes::{Bytes, BytesMut};
 use http::header::{
     ACCEPT, ACCEPT_ENCODING, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, COOKIE, DATE, ETAG, EXPIRES, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
+    CONTENT_TYPE, COOKIE, DATE, ETAG, EXPIRES, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
     IF_UNMODIFIED_SINCE, LAST_MODIFIED, RANGE, SET_COOKIE, TRANSFER_ENCODING, UPGRADE, VARY,
 };
+use http::uri::{Authority, PathAndQuery};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use http_body::{Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -41,6 +42,7 @@ use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
@@ -109,14 +111,57 @@ impl Settings {
     }
 }
 
+/// A directive's settings and what every miss derives from them: its `Cache-Status`, in its four
+/// forms, made once here and shared with each answer.
+struct Configured {
+    settings: Settings,
+    /// By `forced` (bit 0) and `stored` (bit 1); `None` when `name` is no header value.
+    miss_status: [Option<HeaderValue>; 4],
+}
+
+impl Configured {
+    fn new(settings: Settings) -> Configured {
+        let status = |forced: bool, stored: bool| {
+            let fwd = if forced { "request" } else { "uri-miss" };
+            let stored = if stored { "; stored" } else { "" };
+            HeaderValue::from_str(&format!("{}; fwd={fwd}{stored}", settings.name)).ok()
+        };
+        Configured {
+            miss_status: [
+                status(false, false),
+                status(true, false),
+                status(false, true),
+                status(true, true),
+            ],
+            settings,
+        }
+    }
+
+    /// Appends the `Cache-Status` of a miss: `forced` by the client (`fwd=request`), `stored` on
+    /// its way to the client.
+    fn add_miss_status(&self, headers: &mut HeaderMap, forced: bool, stored: bool) {
+        if let Some(value) = &self.miss_status[usize::from(forced) | (usize::from(stored) << 1)] {
+            headers.append(CACHE_STATUS.clone(), value.clone());
+        }
+    }
+}
+
+impl Deref for Configured {
+    type Target = Settings;
+
+    fn deref(&self) -> &Settings {
+        &self.settings
+    }
+}
+
 /// One `cache` directive.
 pub struct Cache {
-    settings: Arc<Settings>,
+    settings: Arc<Configured>,
 }
 
 /// A `Miss` on the request (`http::Extensions`), from the `cache` directive to the `reverse_proxy`
 /// that takes it; `Clone` is required of extensions, never used (a miss is taken, not copied).
-pub struct PendingMiss(pub Box<Miss>);
+pub struct PendingMiss(pub Miss);
 
 impl Clone for PendingMiss {
     fn clone(&self) -> Self {
@@ -126,8 +171,8 @@ impl Clone for PendingMiss {
 
 /// A request the cache did not answer, on its way to `reverse_proxy` (src/proxy.rs `tee`).
 pub struct Miss {
-    key: Key,
-    settings: Arc<Settings>,
+    key: Keyed,
+    settings: Arc<Configured>,
     /// The response may be kept: a GET without Range, and without the client's no-store.
     store: bool,
     /// The client asked for the upstream's answer (no-cache, max-age): `Cache-Status: fwd=request`.
@@ -141,13 +186,92 @@ pub struct Miss {
     fallback: Option<Arc<Entry>>,
 }
 
-/// Where a stored response comes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where a stored response comes from: the entry's own texts (copies made on the worker; a
+/// request's would keep its connection's buffers alive for as long as the entry).
+#[derive(Debug, Clone)]
 struct Key {
     hash: u64,
     https: bool,
     hostport: Box<str>,
     uri: Box<str>,
+}
+
+impl Key {
+    fn is(&self, https: bool, hostport: &str, uri: &str) -> bool {
+        self.https == https && self.hostport.eq_ignore_ascii_case(hostport) && &*self.uri == uri
+    }
+}
+
+/// The key of a response on its way to the store.
+enum Keyed {
+    /// A miss: the request's texts, shared with it, nothing copied on the connection's thread.
+    Asked {
+        hash: u64,
+        https: bool,
+        hostport: HostPort,
+        /// `None`: `/`.
+        uri: Option<PathAndQuery>,
+    },
+    /// A revalidation: the entry's.
+    Known(Key),
+}
+
+impl Keyed {
+    fn hostport(&self) -> &str {
+        match self {
+            Keyed::Asked { hostport, .. } => hostport.as_str(),
+            Keyed::Known(key) => &key.hostport,
+        }
+    }
+
+    fn uri(&self) -> &str {
+        match self {
+            Keyed::Asked { uri, .. } => uri.as_ref().map_or("/", PathAndQuery::as_str),
+            Keyed::Known(key) => &key.uri,
+        }
+    }
+
+    fn into_key(self) -> Key {
+        match self {
+            Keyed::Asked { hash, https, .. } => Key {
+                hash,
+                https,
+                hostport: self.hostport().into(),
+                uri: self.uri().into(),
+            },
+            Keyed::Known(key) => key,
+        }
+    }
+}
+
+/// The host and port a request names, as src/handler.rs `hostport_of` reads them: its URI's
+/// authority, or else its Host.
+#[derive(Debug, Clone)]
+enum HostPort {
+    Authority(Authority),
+    /// Visible ASCII, checked when taken.
+    Header(HeaderValue),
+    None,
+}
+
+impl HostPort {
+    fn of(parts: &http::request::Parts) -> HostPort {
+        if let Some(authority) = parts.uri.authority() {
+            return HostPort::Authority(authority.clone());
+        }
+        match parts.headers.get(HOST) {
+            Some(value) if value.to_str().is_ok() => HostPort::Header(value.clone()),
+            _ => HostPort::None,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            HostPort::Authority(authority) => authority.as_str(),
+            HostPort::Header(value) => value.to_str().unwrap_or(""),
+            HostPort::None => "",
+        }
+    }
 }
 
 /// A stored response.
@@ -157,14 +281,17 @@ pub struct Entry {
     /// The upstream's headers without those of the representation: Content-Length,
     /// Content-Encoding, ETag and Age are set for each answer.
     headers: HeaderMap,
+    /// The upstream's ETag, for its revalidation.
     etag: Option<HeaderValue>,
     last_modified: Option<HeaderValue>,
     /// The encoding the upstream's body came in; `None`: identity.
     origin: Option<Encoding>,
-    identity: Bytes,
-    encoded: [Option<Bytes>; 3],
+    identity: Variant,
+    encoded: [Option<Variant>; 3],
     /// The encodings to offer, best first among equals (the site's `encode` order).
     offer: Vec<Encoding>,
+    /// An answer says `Vary: Accept-Encoding`: encodings are offered and the headers do not say it.
+    vary: bool,
     /// The site's `encode`, for a revalidation that brings a new body.
     encode: Option<Arc<Encode>>,
     received: Instant,
@@ -175,14 +302,113 @@ pub struct Entry {
     /// One background revalidation at a time.
     revalidating: AtomicBool,
     fetch: Arc<Fetch>,
-    settings: Arc<Settings>,
+    settings: Arc<Configured>,
+}
+
+/// One representation of a stored response, with the header values of its own made once: an
+/// answer takes a copy of each (shared bytes).
+#[derive(Clone)]
+struct Variant {
+    body: Bytes,
+    /// The upstream's ETag for the encoding it sent (and when weak), otherwise with the encoding's
+    /// letter appended to it (src/encode.rs `etag_with`; `i`: identity).
+    etag: Option<HeaderValue>,
+    content_length: HeaderValue,
+}
+
+impl Variant {
+    fn new(body: Bytes, etag: Option<&HeaderValue>, origin: Option<Encoding>, encoding: Option<Encoding>) -> Variant {
+        Variant {
+            etag: etag_of(etag, origin, encoding),
+            content_length: header_small(body.len() as u64),
+            body,
+        }
+    }
+}
+
+/// The ETag of the representation in `encoding`, from the upstream's `etag` (sent in `origin`).
+fn etag_of(etag: Option<&HeaderValue>, origin: Option<Encoding>, encoding: Option<Encoding>) -> Option<HeaderValue> {
+    let etag = etag?;
+    if encoding == origin || etag.as_bytes().starts_with(b"W/") {
+        return Some(etag.clone());
+    }
+    let text = etag.to_str().ok()?;
+    let letter = encoding.map_or('i', Encoding::letter);
+    crate::encode::etag_with(text, letter)
+}
+
+/// Numbers up to this have a header value ready (`Age`, `Content-Length`).
+const SMALL: usize = 4096;
+
+/// The digits of `0..=SMALL` in a row, for header values that point into them.
+static DIGITS: [u8; small_digits_len()] = small_digits();
+
+const fn small_digits_len() -> usize {
+    let mut len = 0;
+    let mut n = 0;
+    while n <= SMALL {
+        len += digits_of(n);
+        n += 1;
+    }
+    len
+}
+
+const fn digits_of(n: usize) -> usize {
+    let mut digits = 1;
+    let mut rest = n / 10;
+    while rest > 0 {
+        digits += 1;
+        rest /= 10;
+    }
+    digits
+}
+
+const fn small_digits() -> [u8; small_digits_len()] {
+    let mut out = [0u8; small_digits_len()];
+    let mut at = 0;
+    let mut n = 0;
+    while n <= SMALL {
+        let digits = digits_of(n);
+        let mut rest = n;
+        let mut i = digits;
+        while i > 0 {
+            i -= 1;
+            out[at + i] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+        }
+        at += digits;
+        n += 1;
+    }
+    out
+}
+
+/// A header value for each number up to `SMALL`, each a view of `DIGITS` (static bytes: a copy of
+/// one is a pointer, with nothing counted or allocated).
+static SMALL_NUMBERS: LazyLock<Vec<HeaderValue>> = LazyLock::new(|| {
+    let digits = Bytes::from_static(&DIGITS);
+    let mut at = 0;
+    (0..=SMALL)
+        .map(|n| {
+            let len = digits_of(n);
+            at += len;
+            HeaderValue::from_maybe_shared(digits.slice(at - len..at)).expect("digits")
+        })
+        .collect()
+});
+
+/// A number as a header value: ready for a small one, written for the rest.
+fn header_small(n: u64) -> HeaderValue {
+    match usize::try_from(n).ok().and_then(|n| SMALL_NUMBERS.get(n)) {
+        Some(value) => value.clone(),
+        None => crate::handler::header_number(n),
+    }
 }
 
 /// How a background request reaches the upstream again: the proxy, and the request as it was sent
 /// without the client's identity, credentials, cookies and conditions.
 struct Fetch {
     proxy: Arc<ReverseProxy>,
-    path_and_query: String,
+    path_and_query: Box<str>,
     headers: HeaderMap,
     /// The proxy's `header_down`, as it was filled in for that request.
     header_down: Vec<RenderedOp>,
@@ -226,18 +452,28 @@ impl Directives {
                     None => (item.trim(), None),
                 };
                 let seconds = argument.and_then(|a| a.parse::<u64>().ok());
-                match name.to_ascii_lowercase().as_str() {
-                    "no-store" => d.no_store = true,
-                    "no-cache" => d.no_cache = true,
-                    "private" => d.private = true,
-                    "public" => d.public = true,
-                    "must-revalidate" | "proxy-revalidate" => d.must_revalidate = true,
-                    "only-if-cached" => d.only_if_cached = true,
-                    "max-age" => d.max_age = seconds.or(Some(0)),
-                    "s-maxage" => d.s_maxage = seconds.or(Some(0)),
-                    "stale-while-revalidate" => d.stale_while_revalidate = seconds,
-                    "stale-if-error" => d.stale_if_error = seconds,
-                    _ => {}
+                // Compared in place, in any case: no lowercase copy of the name.
+                let is = |directive: &str| name.eq_ignore_ascii_case(directive);
+                if is("no-store") {
+                    d.no_store = true;
+                } else if is("no-cache") {
+                    d.no_cache = true;
+                } else if is("private") {
+                    d.private = true;
+                } else if is("public") {
+                    d.public = true;
+                } else if is("must-revalidate") || is("proxy-revalidate") {
+                    d.must_revalidate = true;
+                } else if is("only-if-cached") {
+                    d.only_if_cached = true;
+                } else if is("max-age") {
+                    d.max_age = seconds.or(Some(0));
+                } else if is("s-maxage") {
+                    d.s_maxage = seconds.or(Some(0));
+                } else if is("stale-while-revalidate") {
+                    d.stale_while_revalidate = seconds;
+                } else if is("stale-if-error") {
+                    d.stale_if_error = seconds;
                 }
             }
         }
@@ -245,18 +481,26 @@ impl Directives {
     }
 }
 
+/// A shard's lock on a cache line of its own: a hit on one shard does not bounce the line that
+/// holds its neighbours' locks.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+/// One shard of the store, on cache lines of its own.
+type Shard = Padded<Mutex<FxHashMap<u64, Arc<Entry>>>>;
+
 /// The entries, by a hash of their key (ahash, keyed by the process: a client cannot aim keys at one
 /// shard), in shards.
 struct Store {
     hasher: ahash::RandomState,
-    shards: Vec<Mutex<FxHashMap<u64, Arc<Entry>>>>,
+    shards: Vec<Shard>,
     /// The order entries came in and what they take (src/background.rs: CLOCK eviction).
     budget: Mutex<Budget<Weak<Entry>>>,
 }
 
 static STORE: LazyLock<Store> = LazyLock::new(|| Store {
     hasher: ahash::RandomState::new(),
-    shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
+    shards: (0..SHARDS).map(|_| Padded(Mutex::new(FxHashMap::default()))).collect(),
     budget: Mutex::new(Budget::new()),
 });
 
@@ -268,12 +512,45 @@ enum Job {
 
 /// A response on its way to the store: what was decided from its headers.
 struct Pending {
-    miss: Box<Miss>,
+    miss: Miss,
     status: StatusCode,
     headers: HeaderMap,
     freshness: Freshness,
     received: Instant,
-    fetch: Arc<Fetch>,
+    fetch: Fetching,
+}
+
+/// How the entry will reach the upstream again: what a revalidation's entry has already, or what
+/// the proxy sent on the miss, to be made into a `Fetch` on the worker, not the connection's thread.
+enum Fetching {
+    Ready(Arc<Fetch>),
+    Sent {
+        proxy: Arc<ReverseProxy>,
+        /// The path and query the proxy sent, when another than the one asked for (`Miss::key`:
+        /// rewritten on the way).
+        path_and_query: Option<Box<str>>,
+        headers: HeaderMap,
+        header_down: Vec<RenderedOp>,
+    },
+}
+
+impl Fetching {
+    fn into_fetch(self, key: &Key) -> Arc<Fetch> {
+        match self {
+            Fetching::Ready(fetch) => fetch,
+            Fetching::Sent {
+                proxy,
+                path_and_query,
+                headers,
+                header_down,
+            } => Arc::new(Fetch {
+                proxy,
+                path_and_query: path_and_query.unwrap_or_else(|| key.uri.clone()),
+                headers: background_headers(headers),
+                header_down,
+            }),
+        }
+    }
 }
 
 /// The worker (src/background.rs): stores answers and revalidates entries, and once a minute
@@ -310,7 +587,7 @@ impl Cache {
     pub fn new(settings: Settings) -> Cache {
         LazyLock::force(&WORKER);
         Cache {
-            settings: Arc::new(settings),
+            settings: Arc::new(Configured::new(settings)),
         }
     }
 
@@ -380,20 +657,22 @@ impl Cache {
             return Some(ctx.status(StatusCode::GATEWAY_TIMEOUT));
         }
         let store = method == Method::GET && !asked.no_store;
-        ctx.req.extensions.insert(PendingMiss(Box::new(Miss {
-            key: Key {
+        let credentialed = ctx.req.extensions.get::<crate::handler::Credentialed>().is_some();
+        // The miss is boxed once, by the extensions; its key shares the request's texts.
+        ctx.req.extensions.insert(PendingMiss(Miss {
+            key: Keyed::Asked {
                 hash,
                 https,
-                hostport: ctx.hostport().into(),
-                uri: uri.into(),
+                hostport: HostPort::of(&ctx.req),
+                uri: path_and_query,
             },
             settings: self.settings.clone(),
             store,
             forced,
-            credentialed: ctx.req.extensions.get::<crate::handler::Credentialed>().is_some(),
+            credentialed,
             encode: None,
             fallback,
-        })));
+        }));
         None
     }
 }
@@ -425,7 +704,7 @@ impl Miss {
     /// The upstream answered: `Cache-Status` and `default_cache_control` on its response, and when
     /// it may be kept, its body passes through a tee that hands it to the worker once whole.
     pub fn tee(
-        self: Box<Self>,
+        self,
         proxy: &Arc<ReverseProxy>,
         path_and_query: &str,
         sent: &HeaderMap,
@@ -449,36 +728,34 @@ impl Miss {
         } else {
             None
         };
-        let status = format!(
-            "{}; fwd={}",
-            self.settings.name,
-            if self.forced { "request" } else { "uri-miss" }
-        );
         let Some(freshness) = decided else {
-            add_status(&mut parts.headers, &status);
+            self.settings.add_miss_status(&mut parts.headers, self.forced, false);
             return body;
         };
+        self.settings.add_miss_status(&mut parts.headers, self.forced, true);
+        // What the worker needs and the proxy lends: copied here (the response's headers go on to
+        // the client; the sent ones and `header_down` are the proxy's). The path is most often the
+        // one asked for, shared in the key already.
         let pending = Pending {
             status: parts.status,
             headers: parts.headers.clone(),
             freshness,
             received: Instant::now(),
-            fetch: Arc::new(Fetch {
+            fetch: Fetching::Sent {
                 proxy: proxy.clone(),
-                path_and_query: path_and_query.to_string(),
-                headers: background_headers(sent),
+                path_and_query: (path_and_query != self.key.uri()).then(|| path_and_query.into()),
+                headers: sent.clone(),
                 header_down: header_down.to_vec(),
-            }),
+            },
             miss: self,
         };
-        add_status(&mut parts.headers, &format!("{status}; stored"));
         let cap = pending.miss.settings.max_body();
         crate::body::boxed(Tee {
             inner: body,
             pieces: Vec::new(),
             size: 0,
             cap,
-            pending: Some(Box::new(pending)),
+            pending: Some(pending),
         })
     }
 
@@ -487,12 +764,6 @@ impl Miss {
     pub fn fallback(&mut self, ctx: &mut Ctx, upstream: StatusCode) -> Option<Response<Body>> {
         let entry = self.fallback.take()?;
         Some(entry.answer(ctx, Instant::now(), Some(Some(upstream))))
-    }
-}
-
-fn add_status(headers: &mut HeaderMap, value: &str) {
-    if let Ok(value) = HeaderValue::from_str(value) {
-        headers.append(CACHE_STATUS.clone(), value);
     }
 }
 
@@ -588,8 +859,7 @@ fn storable(status: StatusCode, headers: &HeaderMap, sent: &HeaderMap, settings:
 
 /// The request headers background requests send: those of the request that filled the entry,
 /// without its client's address, credentials, cookies, conditions and range.
-fn background_headers(sent: &HeaderMap) -> HeaderMap {
-    let mut headers = sent.clone();
+fn background_headers(mut headers: HeaderMap) -> HeaderMap {
     for name in [
         AUTHORIZATION,
         COOKIE,
@@ -612,10 +882,11 @@ fn background_headers(sent: &HeaderMap) -> HeaderMap {
 /// The upstream's body on its way to the client, its frames kept on the side up to the cap.
 struct Tee {
     inner: Body,
+    /// Room is made at the first frame: a body that fails before one costs none.
     pieces: Vec<Bytes>,
     size: usize,
     cap: usize,
-    pending: Option<Box<Pending>>,
+    pending: Option<Pending>,
 }
 
 impl Tee {
@@ -624,9 +895,17 @@ impl Tee {
         self.pieces = Vec::new();
     }
 
+    fn keep(&mut self, data: &Bytes) {
+        if self.pieces.capacity() == 0 {
+            // Most bodies come in one or two frames.
+            self.pieces.reserve_exact(2);
+        }
+        self.pieces.push(data.clone());
+    }
+
     fn hand_over(&mut self) {
         if let Some(pending) = self.pending.take() {
-            submit(Job::Store(pending, std::mem::take(&mut self.pieces)));
+            submit(Job::Store(Box::new(pending), std::mem::take(&mut self.pieces)));
         }
     }
 }
@@ -646,7 +925,7 @@ impl http_body::Body for Tee {
                         this.give_up();
                     } else {
                         if !data.is_empty() {
-                            this.pieces.push(data.clone());
+                            this.keep(data);
                         }
                         // hyper stops polling a body that says it has ended.
                         if this.inner.is_end_stream() {
@@ -683,11 +962,23 @@ impl Drop for Tee {
 }
 
 impl Store {
+    /// The hash of a key: the host in any ASCII case.
     fn hash(&self, https: bool, hostport: &str, uri: &str) -> u64 {
         let mut hasher = self.hasher.build_hasher();
         hasher.write_u8(u8::from(https));
-        for b in hostport.bytes() {
-            hasher.write_u8(b.to_ascii_lowercase());
+        // The host lowercased on the stack and written at once: a write is a mixing round, one per
+        // byte would be as many. A host longer than the buffer (not one that resolves) goes byte
+        // by byte.
+        let mut lower = [0u8; 256];
+        if let Some(lower) = lower.get_mut(..hostport.len()) {
+            for (to, from) in lower.iter_mut().zip(hostport.bytes()) {
+                *to = from.to_ascii_lowercase();
+            }
+            hasher.write(lower);
+        } else {
+            for b in hostport.bytes() {
+                hasher.write_u8(b.to_ascii_lowercase());
+            }
         }
         hasher.write_u8(0xff);
         hasher.write(uri.as_bytes());
@@ -696,6 +987,7 @@ impl Store {
 
     fn shard(&self, hash: u64) -> std::sync::MutexGuard<'_, FxHashMap<u64, Arc<Entry>>> {
         self.shards[(hash as usize) % SHARDS]
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -703,7 +995,10 @@ impl Store {
     fn get(&self, hash: u64, https: bool, hostport: &str, uri: &str) -> Option<Arc<Entry>> {
         let shard = self.shard(hash);
         let entry = shard.get(&hash).filter(|e| e.key.is(https, hostport, uri))?;
-        entry.touched.store(true, Ordering::Relaxed);
+        // Written once per round, not on every hit: a store dirties the line for every thread.
+        if !entry.touched.load(Ordering::Relaxed) {
+            entry.touched.store(true, Ordering::Relaxed);
+        }
         Some(entry.clone())
     }
 
@@ -775,7 +1070,7 @@ impl Store {
     fn sweep(&self, now: Instant) {
         let mut released = 0;
         for shard in &self.shards {
-            let mut shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut shard = shard.0.lock().unwrap_or_else(PoisonError::into_inner);
             shard.retain(|_, entry| {
                 let keep = entry.age(now)
                     < entry.freshness.fresh + entry.freshness.while_revalidating.max(entry.freshness.if_error);
@@ -788,12 +1083,6 @@ impl Store {
         let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
         budget.release(released);
         budget.retain(|weak| weak.strong_count() > 0);
-    }
-}
-
-impl Key {
-    fn is(&self, https: bool, hostport: &str, uri: &str) -> bool {
-        self.https == https && self.hostport.eq_ignore_ascii_case(hostport) && &*self.uri == uri
     }
 }
 
@@ -815,39 +1104,28 @@ impl Entry {
         self.freshness.initial_age + now.saturating_duration_since(self.received)
     }
 
-    /// The ETag of the representation in `encoding`: the upstream's for its own, otherwise with
-    /// the encoding's letter appended to a strong one (src/encode.rs `etag_with`; `i`: identity).
-    fn etag_for(&self, encoding: Option<Encoding>) -> Option<HeaderValue> {
-        let etag = self.etag.as_ref()?;
-        if encoding == self.origin || etag.as_bytes().starts_with(b"W/") {
-            return Some(etag.clone());
-        }
-        let text = etag.to_str().ok()?;
-        let letter = encoding.map_or('i', Encoding::letter);
-        crate::encode::etag_with(text, letter)
-    }
-
     /// The answer from the entry. `stale`: `None` when fresh; `Some(None)` while it is
     /// revalidated; `Some(Some(status))` in place of the upstream's failure.
     fn answer(&self, ctx: &mut Ctx, now: Instant, stale: Option<Option<StatusCode>>) -> Response<Body> {
         let age = self.age(now);
         let accept = ctx.accept_encoding();
         let encoding = accept.ranked(&self.offer).find(|e| self.encoded[*e as usize].is_some());
-        let body = encoding
+        let variant = encoding
             .and_then(|e| self.encoded[e as usize].as_ref())
             .unwrap_or(&self.identity);
         // With room for the fields added below (ETag, Vary, Age, Cache-Status, Content-Length,
-        // Content-Encoding): a clone has none, and would grow on the way.
+        // Content-Encoding): a clone has none, and would grow on the way. The values of the
+        // variant's own are ready (`Variant`), as is a small Age.
         let mut headers = HeaderMap::with_capacity(self.headers.len() + 6);
         headers.extend(self.headers.iter().map(|(name, value)| (name.clone(), value.clone())));
-        let etag = self.etag_for(encoding);
-        if let Some(etag) = &etag {
+        let etag = variant.etag.as_ref();
+        if let Some(etag) = etag {
             headers.insert(ETAG, etag.clone());
         }
-        if !self.offer.is_empty() && !has_vary(&headers, "accept-encoding") {
+        if self.vary {
             headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
-        headers.insert(AGE, crate::handler::header_number(age.as_secs()));
+        headers.insert(AGE, header_small(age.as_secs()));
         let ttl = self.freshness.fresh.as_secs() as i64 - age.as_secs() as i64;
         let mut status = crate::handler::HeaderText::new();
         {
@@ -870,9 +1148,7 @@ impl Entry {
         }
         let request = &ctx.req.headers;
         let not_modified = match request.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
-            Some(list) => etag
-                .as_ref()
-                .is_some_and(|etag| crate::static_files::etag_list_matches(list, etag, false)),
+            Some(list) => etag.is_some_and(|etag| crate::static_files::etag_list_matches(list, etag, false)),
             None => match (
                 request.get(IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()),
                 self.last_modified.as_ref().and_then(|v| v.to_str().ok()),
@@ -891,14 +1167,14 @@ impl Entry {
             *response.status_mut() = StatusCode::NOT_MODIFIED;
             response
         } else {
-            headers.insert(CONTENT_LENGTH, crate::handler::header_number(body.len() as u64));
+            headers.insert(CONTENT_LENGTH, variant.content_length.clone());
             if let Some(encoding) = encoding {
                 headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
             }
             let mut response = Response::new(if ctx.req.method == Method::HEAD {
                 crate::body::empty()
             } else {
-                crate::body::full(body.clone())
+                crate::body::full(variant.body.clone())
             });
             *response.status_mut() = self.status;
             response
@@ -945,7 +1221,14 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
         received,
         fetch,
     } = pending;
-    let cap = miss.settings.max_body();
+    let Miss {
+        key, settings, encode, ..
+    } = miss;
+    // The entry's own copies of the key's texts and of how to fetch it again, made here and not
+    // on the connection's thread.
+    let key = key.into_key();
+    let fetch = fetch.into_fetch(&key);
+    let cap = settings.max_body();
     let origin = headers
         .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -954,17 +1237,18 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
         Some(encoding) => match decode(encoding, &raw, cap, 0) {
             Some(identity) => identity,
             None => {
-                tracing::debug!(uri = %miss.key.uri, "not stored: its body does not decode within max_cacheable_body_bytes");
+                tracing::debug!(uri = %key.uri, "not stored: its body does not decode within max_cacheable_body_bytes");
                 return None;
             }
         },
         None => raw.clone(),
     };
-    let offer: Vec<Encoding> = match &miss.encode {
+    let offer: Vec<Encoding> = match &encode {
         Some(encode) if encodes(encode, status, &headers, identity.len()) => encode.formats.clone(),
         _ => origin.into_iter().collect(),
     };
-    let mut encoded: [Option<Bytes>; 3] = [None, None, None];
+    let etag = headers.remove(ETAG);
+    let mut encoded: [Option<Variant>; 3] = [None, None, None];
     for &encoding in &offer {
         let variant = if Some(encoding) == origin {
             Some(raw.clone())
@@ -986,9 +1270,10 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
             }
         };
         // Only an encoding that saves something is offered.
-        encoded[encoding as usize] = variant.filter(|v| v.len() < identity.len() || Some(encoding) == origin);
+        encoded[encoding as usize] = variant
+            .filter(|v| v.len() < identity.len() || Some(encoding) == origin)
+            .map(|body| Variant::new(body, etag.as_ref(), origin, Some(encoding)));
     }
-    let etag = headers.remove(ETAG);
     let last_modified = headers.get(LAST_MODIFIED).cloned();
     for name in [CONTENT_LENGTH, CONTENT_ENCODING, TRANSFER_ENCODING, AGE] {
         headers.remove(name);
@@ -996,29 +1281,31 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
     headers.remove(&CACHE_STATUS);
     let header_bytes: usize = headers.iter().map(|(n, v)| n.as_str().len() + v.len() + 32).sum();
     let size = identity.len()
-        + encoded.iter().flatten().map(Bytes::len).sum::<usize>()
+        + encoded.iter().flatten().map(|v| v.body.len()).sum::<usize>()
         + header_bytes
-        + miss.key.hostport.len()
-        + miss.key.uri.len()
+        + key.hostport.len()
+        + key.uri.len()
         + 512;
+    let vary = !offer.is_empty() && !has_vary(&headers, "accept-encoding");
     Some(Entry {
-        key: miss.key.clone(),
+        key,
         status,
         headers,
+        identity: Variant::new(identity, etag.as_ref(), origin, None),
         etag,
         last_modified,
         origin,
-        identity,
         encoded,
         offer,
-        encode: miss.encode.clone(),
+        vary,
+        encode,
         received,
         freshness,
         size,
         touched: AtomicBool::new(false),
         revalidating: AtomicBool::new(false),
         fetch,
-        settings: miss.settings.clone(),
+        settings,
     })
 }
 
@@ -1165,6 +1452,8 @@ async fn revalidate(entry: Arc<Entry>) {
                 identity: entry.identity.clone(),
                 encoded: entry.encoded.clone(),
                 offer: entry.offer.clone(),
+                // Vary is kept as it was (not merged above).
+                vary: entry.vary,
                 encode: entry.encode.clone(),
                 received,
                 freshness,
@@ -1193,8 +1482,8 @@ async fn revalidate(entry: Arc<Entry>) {
                 return;
             };
             let pending = Pending {
-                miss: Box::new(Miss {
-                    key: entry.key.clone(),
+                miss: Miss {
+                    key: Keyed::Known(entry.key.clone()),
                     settings: entry.settings.clone(),
                     store: true,
                     forced: false,
@@ -1202,12 +1491,12 @@ async fn revalidate(entry: Arc<Entry>) {
                     credentialed: false,
                     encode: entry.encode.clone(),
                     fallback: None,
-                }),
+                },
                 status,
                 headers: parts.headers,
                 freshness,
                 received,
-                fetch: entry.fetch.clone(),
+                fetch: Fetching::Ready(entry.fetch.clone()),
             };
             match build(pending, raw).await {
                 Some(fresh) => STORE.insert(Arc::new(fresh)),
@@ -1222,7 +1511,7 @@ async fn revalidate(entry: Arc<Entry>) {
 pub struct Observer;
 
 impl crate::extensions::ProxyObserver for Observer {
-    type Pending = Option<Box<Miss>>;
+    type Pending = Option<Miss>;
 
     fn begin(&self, ctx: &mut Ctx) -> Self::Pending {
         let mut miss = ctx.req.extensions.remove::<PendingMiss>().map(|m| m.0);
@@ -1358,6 +1647,144 @@ mod tests {
         )
         .unwrap();
         assert!(strict.while_revalidating.is_zero() && strict.if_error.is_zero());
+    }
+
+    #[test]
+    fn directives_are_read_in_any_case_without_a_copy() {
+        let d = Directives::of(&headers(&[
+            ("cache-control", "No-Store, MAX-AGE=\"5\" , Public"),
+            ("cache-control", "s-maxage, Stale-While-Revalidate=7, Proxy-Revalidate"),
+        ]));
+        assert!(d.no_store && d.public && d.must_revalidate);
+        assert!(!d.no_cache && !d.private && !d.only_if_cached);
+        assert_eq!(d.max_age, Some(5));
+        assert_eq!(d.s_maxage, Some(0), "no argument: 0");
+        assert_eq!(d.stale_while_revalidate, Some(7));
+        assert_eq!(d.stale_if_error, None);
+    }
+
+    #[test]
+    fn the_cache_status_of_a_miss_is_made_once() {
+        let configured = Configured::new(Settings::default());
+        let status = |forced, stored| {
+            let mut map = HeaderMap::new();
+            configured.add_miss_status(&mut map, forced, stored);
+            map.get(&CACHE_STATUS).unwrap().to_str().unwrap().to_string()
+        };
+        assert_eq!(status(false, false), "webfast; fwd=uri-miss");
+        assert_eq!(status(true, false), "webfast; fwd=request");
+        assert_eq!(status(false, true), "webfast; fwd=uri-miss; stored");
+        assert_eq!(status(true, true), "webfast; fwd=request; stored");
+        // A name no header value can hold: no Cache-Status, rather than a wrong one.
+        let odd = Configured::new(Settings {
+            name: Arc::from("two\nlines"),
+            ..Settings::default()
+        });
+        let mut map = HeaderMap::new();
+        odd.add_miss_status(&mut map, false, true);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn small_numbers_are_ready_as_header_values() {
+        for n in [0, 1, 9, 10, 99, 100, 999, 1000, 4095, 4096, 4097, 65536, u64::MAX] {
+            assert_eq!(header_small(n), crate::handler::header_number(n), "{n}");
+        }
+        assert_eq!(DIGITS.len(), SMALL_NUMBERS.iter().map(HeaderValue::len).sum::<usize>());
+    }
+
+    #[test]
+    fn the_hash_takes_the_host_in_any_case_at_any_length() {
+        let store = Store {
+            hasher: ahash::RandomState::new(),
+            shards: Vec::new(),
+            budget: Mutex::new(Budget::new()),
+        };
+        assert_eq!(
+            store.hash(false, "Example.COM:8080", "/a"),
+            store.hash(false, "example.com:8080", "/a")
+        );
+        assert_ne!(
+            store.hash(false, "example.com", "/a"),
+            store.hash(false, "example.org", "/a")
+        );
+        assert_ne!(
+            store.hash(false, "example.com", "/a"),
+            store.hash(true, "example.com", "/a")
+        );
+        assert_ne!(
+            store.hash(false, "example.com", "/a"),
+            store.hash(false, "example.com", "/b")
+        );
+        // Past the stack buffer: the same host still hashes alike, in either case.
+        let long = "a".repeat(300);
+        assert_eq!(
+            store.hash(false, &long, "/"),
+            store.hash(false, &long.to_ascii_uppercase(), "/")
+        );
+        assert_ne!(store.hash(false, &long, "/"), store.hash(false, &long[1..], "/"));
+    }
+
+    #[test]
+    fn a_key_shares_the_requests_texts() {
+        let mut parts = http::Request::builder()
+            .uri("/p?q=1")
+            .header("host", "Example.com")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let asked = Keyed::Asked {
+            hash: 7,
+            https: false,
+            hostport: HostPort::of(&parts),
+            uri: parts.uri.path_and_query().cloned(),
+        };
+        assert_eq!(asked.hostport(), "Example.com");
+        assert_eq!(asked.uri(), "/p?q=1");
+        // The entry's key: the same texts, its own.
+        let key = asked.into_key();
+        assert_eq!((key.hash, &*key.hostport, &*key.uri), (7, "Example.com", "/p?q=1"));
+        assert!(key.is(false, "example.com", "/p?q=1"));
+        assert!(!key.is(true, "example.com", "/p?q=1"));
+        assert!(!key.is(false, "example.com", "/p"));
+        let known = Keyed::Known(key.clone());
+        assert_eq!((known.hostport(), known.uri()), ("Example.com", "/p?q=1"));
+        assert_eq!(known.into_key().uri, key.uri);
+        // An absolute-form URI names the host itself; no URI (`None`) is `/`.
+        parts.uri = "http://Other.net".parse().unwrap();
+        assert_eq!(HostPort::of(&parts).as_str(), "Other.net");
+        assert_eq!(crate::handler::hostport_of(&parts), "Other.net");
+        let root = Keyed::Asked {
+            hash: 0,
+            https: true,
+            hostport: HostPort::of(&parts),
+            uri: parts.uri.path_and_query().cloned(),
+        };
+        assert_eq!(root.uri(), "/");
+        parts.headers.remove(HOST);
+        parts.uri = "/".parse().unwrap();
+        assert_eq!(HostPort::of(&parts).as_str(), "");
+    }
+
+    #[test]
+    fn each_variant_has_its_own_etag() {
+        let strong = HeaderValue::from_static("\"abc\"");
+        let weak = HeaderValue::from_static("W/\"abc\"");
+        let tag = |etag: &HeaderValue, origin, encoding| {
+            etag_of(Some(etag), origin, encoding)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap()
+        };
+        assert_eq!(tag(&strong, None, None), "\"abc\"", "the upstream's own representation");
+        assert_eq!(tag(&strong, None, Some(Encoding::Gzip)), "\"abc.g\"");
+        assert_eq!(tag(&strong, Some(Encoding::Br), Some(Encoding::Br)), "\"abc\"");
+        assert_eq!(tag(&strong, Some(Encoding::Br), None), "\"abc.i\"");
+        assert_eq!(tag(&weak, None, Some(Encoding::Zstd)), "W/\"abc\"", "weak: as it is");
+        assert!(etag_of(None, None, None).is_none());
+        let variant = Variant::new(Bytes::from_static(b"hello"), Some(&strong), None, Some(Encoding::Zstd));
+        assert_eq!(variant.content_length, "5");
+        assert_eq!(variant.etag.unwrap(), "\"abc.z\"");
     }
 
     #[test]
