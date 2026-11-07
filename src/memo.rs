@@ -152,7 +152,7 @@ impl Answers {
             }
             let mut response = Response::new(empty());
             *response.status_mut() = StatusCode::NOT_MODIFIED;
-            *response.headers_mut() = not_modified.clone();
+            *response.headers_mut() = with_room(not_modified);
             return Some(response);
         }
         let body = match &answer.file {
@@ -161,7 +161,7 @@ impl Answers {
         };
         let mut response = Response::new(body);
         *response.status_mut() = answer.status;
-        *response.headers_mut() = answer.headers.clone();
+        *response.headers_mut() = with_room(&answer.headers);
         Some(response)
     }
 
@@ -363,6 +363,14 @@ async fn run(
     parts.extensions.insert(Preparing);
     let ctx = Ctx::new(conn.clone(), parts, body, conn.remote.ip());
     Some(Next::start(routes.clone()).run(ctx).await)
+}
+
+/// A copy of a ready answer's header map with room for what every response gets on its way out
+/// (`Date`, `Alt-Svc`): a clone has none, and would grow at once.
+fn with_room(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len() + 2);
+    out.extend(headers.iter().map(|(name, value)| (name.clone(), value.clone())));
+    out
 }
 
 /// The header map with every value made `'static` (interned for the life of the process, the same
