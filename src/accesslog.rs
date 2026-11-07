@@ -87,9 +87,20 @@ enum Message {
     Flush(SyncSender<()>),
 }
 
-struct Writer {
+/// The queue of one output's writer thread.
+pub(crate) struct Writer {
     queue: SyncSender<Message>,
     dropped: AtomicU64,
+}
+
+impl Writer {
+    /// Queues `line` (newline included); dropped and counted when the queue is full (the output
+    /// is stuck), so that no request waits on it.
+    pub(crate) fn write(&self, line: String) {
+        if let Err(TrySendError::Full(_)) = self.queue.try_send(Message::Line(line)) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 static STDOUT: OnceLock<Writer> = OnceLock::new();
@@ -99,7 +110,10 @@ static FILES: Mutex<Vec<(&'static Path, &'static Writer)>> = Mutex::new(Vec::new
 /// Writer threads started so far (flushed on shutdown).
 static STARTED: Mutex<Vec<Output>> = Mutex::new(Vec::new());
 
-fn writer(output: Output) -> Option<&'static Writer> {
+/// The writer of an output, started on first use; `None` for `discard`. A file's is found in a
+/// list under a lock: resolved once, where the output is configured (src/eventlog.rs), not per
+/// line.
+pub(crate) fn writer(output: Output) -> Option<&'static Writer> {
     let cell = match output {
         Output::Stdout => &STDOUT,
         Output::Stderr => &STDERR,
@@ -134,9 +148,8 @@ fn start_writer(output: Output) -> Writer {
 
 /// Queues `line` (newline included) for `output`; dropped and counted when its queue is full.
 pub fn write_line(output: Output, line: String) {
-    let Some(writer) = writer(output) else { return };
-    if let Err(TrySendError::Full(_)) = writer.queue.try_send(Message::Line(line)) {
-        writer.dropped.fetch_add(1, Ordering::Relaxed);
+    if let Some(writer) = writer(output) {
+        writer.write(line);
     }
 }
 
@@ -256,7 +269,7 @@ impl AccessLog {
 
     /// The log line, newline included.
     fn line(&self, info: &RequestInfo, status: u16, size: u64) -> String {
-        let duration = info.started.elapsed().as_secs_f64();
+        let duration = info.started.elapsed();
         let host = info.host.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
         let uri = info.uri.path_and_query().map_or("/", |pq| pq.as_str());
         // The fixed part of a JSON line is about 300 bytes; host and URI on top (escaping may
@@ -264,38 +277,64 @@ impl AccessLog {
         let mut line = String::with_capacity(320 + host.len() + uri.len());
         match self.format {
             Format::Json => {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let _ = write!(
-                    line,
-                    r#"{{"level":"info","ts":{ts},"logger":"http.log.access","msg":"handled request","request":{{"remote_ip":"{}","remote_port":"{}","client_ip":"{}","proto":"{}","method":""#,
-                    info.remote.ip(),
-                    info.remote.port(),
-                    info.client_ip,
-                    info.proto,
-                );
+                line.push_str(r#"{"level":"info","ts":"#);
+                write_timestamp(&mut line);
+                line.push_str(r#","logger":"http.log.access","msg":"handled request","request":{"remote_ip":""#);
+                let _ = write!(line, "{}", info.remote.ip());
+                line.push_str(r#"","remote_port":""#);
+                let _ = write!(line, "{}", info.remote.port());
+                line.push_str(r#"","client_ip":""#);
+                let _ = write!(line, "{}", info.client_ip);
+                line.push_str(r#"","proto":""#);
+                line.push_str(info.proto);
+                line.push_str(r#"","method":""#);
                 json_escape(&mut line, info.method.as_str());
                 line.push_str(r#"","host":""#);
                 json_escape(&mut line, host);
                 line.push_str(r#"","uri":""#);
                 json_escape(&mut line, uri);
-                let _ = writeln!(line, r#""}},"duration":{duration},"size":{size},"status":{status}}}"#);
+                line.push_str(r#""},"duration":"#);
+                write_seconds(&mut line, duration.as_secs(), duration.subsec_nanos(), 9);
+                let _ = writeln!(line, r#","size":{size},"status":{status}}}"#);
             }
             Format::Console => {
-                let _ = writeln!(
+                let _ = write!(
                     line,
-                    "{} {} {} {host} {uri} {status} {size} {:.3}ms",
-                    info.client_ip,
-                    info.proto,
-                    info.method,
-                    duration * 1000.0
+                    "{} {} {} {host} {uri} {status} {size} ",
+                    info.client_ip, info.proto, info.method
                 );
+                // Milliseconds to three places, rounded, from the microseconds.
+                let micros = (duration.as_nanos() + 500) / 1000;
+                let _ = writeln!(line, "{}.{:03}ms", micros / 1000, micros % 1000);
             }
         }
         line
     }
+}
+
+/// The time now as Caddy's `ts`: Unix seconds with the fraction to the microsecond.
+pub(crate) fn write_timestamp(out: &mut String) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    write_seconds(out, now.as_secs(), now.subsec_nanos(), 6);
+}
+
+/// `secs.fraction`, the fraction to `digits` places (at most 9) with the trailing zeros dropped
+/// but one: the JSON number a float would give, written from the integers (formatting an `f64`
+/// in its shortest form costs more than the rest of the line).
+pub(crate) fn write_seconds(out: &mut String, secs: u64, nanos: u32, digits: usize) {
+    let digits = digits.clamp(1, 9);
+    let mut frac = nanos / 10u32.pow(9 - digits as u32);
+    let mut text = [b'0'; 9];
+    for slot in text[..digits].iter_mut().rev() {
+        *slot = b'0' + (frac % 10) as u8;
+        frac /= 10;
+    }
+    let mut kept = digits;
+    while kept > 1 && text[kept - 1] == b'0' {
+        kept -= 1;
+    }
+    let _ = write!(out, "{secs}.");
+    out.push_str(std::str::from_utf8(&text[..kept]).expect("digits"));
 }
 
 /// JSON string contents: quotes, backslashes and control characters escaped.
@@ -406,14 +445,44 @@ mod tests {
         assert_eq!(parsed["request"]["remote_port"], "4000");
         assert_eq!(parsed["status"], 200);
         assert_eq!(parsed["size"], 1234);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let ts = parsed["ts"].as_f64().unwrap();
+        assert!(ts <= now && ts > now - 5.0, "{ts} against {now}");
+        let duration = parsed["duration"].as_f64().unwrap();
+        assert!((0.0..1.0).contains(&duration), "{duration}");
         let console = AccessLog {
             output: Output::Discard,
             format: Format::Console,
         };
-        assert!(
-            console
-                .line(&info, 200, 1234)
-                .starts_with("203.0.113.9 HTTP/1.1 GET example.com /en/")
+        let line = console.line(&info, 200, 1234);
+        let rest = line
+            .strip_prefix("203.0.113.9 HTTP/1.1 GET example.com /en/?q=%22x%22 200 1234 ")
+            .unwrap();
+        let ms = rest.strip_suffix("ms\n").unwrap();
+        assert_eq!(
+            ms.split('.').nth(1).map(str::len),
+            Some(3),
+            "{ms:?}: milliseconds to three places"
         );
+        assert!(ms.parse::<f64>().unwrap() < 1000.0, "{ms}");
+    }
+
+    #[test]
+    fn seconds_are_written_as_a_float_would_be() {
+        let written = |secs, nanos, digits| {
+            let mut out = String::new();
+            write_seconds(&mut out, secs, nanos, digits);
+            out
+        };
+        assert_eq!(written(1760788800, 123_000_000, 6), "1760788800.123");
+        assert_eq!(written(1760788800, 123_456_789, 6), "1760788800.123456");
+        assert_eq!(written(0, 0, 6), "0.0");
+        assert_eq!(written(0, 123_456_789, 9), "0.123456789");
+        assert_eq!(written(0, 123_000, 9), "0.000123");
+        assert_eq!(written(7, 999_999_999, 3), "7.999");
+        assert_eq!(written(3, 500_000_000, 1), "3.5");
+        // The same number a float gives.
+        let d = Duration::new(12, 345_678_000);
+        assert_eq!(written(12, 345_678_000, 9).parse::<f64>().unwrap(), d.as_secs_f64());
     }
 }

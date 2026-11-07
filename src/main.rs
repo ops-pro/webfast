@@ -142,17 +142,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(n) = workers {
-        builder.worker_threads(n);
-    }
-    let runtime = match builder.enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot start the async runtime");
-            return ExitCode::FAILURE;
-        }
-    };
     let lz4_min_saving = match webfast::files::lz4_min_saving_from_env() {
         Ok(setting) => setting,
         Err(e) => {
@@ -184,8 +173,9 @@ fn main() -> ExitCode {
     } else {
         watch
     };
-    let loaded =
-        runtime.block_on(async { load_parsed_reusing(&file, max_memory, lz4_min_saving, max_in_memory, watch, &[]) });
+    // Loading needs no runtime (`reload` and `validate` load the same way): the files are read on
+    // threads of their own, and nothing is spawned until the server starts.
+    let loaded = load_parsed_reusing(&file, max_memory, lz4_min_saving, max_in_memory, watch, &[]);
     let mut config = match loaded {
         Ok(config) => config,
         Err(e) => {
@@ -224,6 +214,18 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+    // The shared runtime, sized once the configuration says what runs on it.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = shared_runtime_workers(workers, &config) {
+        builder.worker_threads(n);
+    }
+    let runtime = match builder.enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
     let reload = Reload {
         path: config_path,
         max_memory,
@@ -262,6 +264,20 @@ fn workers_from_env() -> Result<Option<usize>, String> {
         },
         Err(_) => Ok(None),
     }
+}
+
+/// The worker threads of the shared runtime; `None`: tokio's default, one per CPU. With a runtime
+/// per core (docs/operations.md, Workers) the connections run on threads of their own, and the
+/// shared runtime is left the signals, the reloads (on the blocking pool), the certificate and
+/// key refreshes — and HTTP/3, whose connections quinn drives there. Without HTTP/3 on any port,
+/// a full set of workers would only sleep next to the connection threads: at most four then.
+fn shared_runtime_workers(workers: Option<usize>, config: &config::Config) -> Option<usize> {
+    let per_core_only = config.servers.iter().all(|s| s.per_core && !s.protocols.h3);
+    if !per_core_only {
+        return workers;
+    }
+    let cpus = workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    Some(cpus.min(4))
 }
 
 /// Connection limits and threads from the environment, for every port.

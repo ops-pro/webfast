@@ -227,6 +227,12 @@ at 1000 requests/s on 8 CPUs a request cost 69 µs of CPU with 8 workers, 57–5
 1. A small site with little traffic does well with 1–2. One HTTP/2 connection carrying many
 clients (a CDN in front) is served by one core.
 
+Next to the connection threads runs one shared multi-threaded runtime: the signals and reloads,
+the certificate and key refreshes, and HTTP/3, whose connections quinn drives there. With a runtime
+per core (`WEB_RUNTIME=per-core`, the default on Unix) and HTTP/3 off on every port, it gets at
+most 4 threads rather than one per CPU, which would only sleep; with HTTP/3 on, or
+`WEB_RUNTIME=shared`, it has `WEB_WORKERS` threads (one per CPU by default).
+
 ## Files and memory
 
 The site roots are read at startup on every CPU and held in memory, at most `WEB_MAX_MEMORY` over
@@ -333,7 +339,7 @@ many.
 
 The request checks (docs/configuration.md, Request checks) write what they refuse, and what
 `log_only` lets through, to event logs of their own: JSON lines in a file, which logrotate may
-move, or the server's log.
+move, or on stderr next to the server's log.
 
 ## Limits
 

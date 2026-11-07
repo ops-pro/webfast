@@ -485,8 +485,9 @@ spec:
 let through, goes there as one JSON line per request: to a file (relative to the module's file,
 appended to and opened again when logrotate moves it), `stdout`, `stderr` or `discard`. The access
 log's writer threads write the lines in batches, so no request waits for the disk. Without `log`
-the events go to the server's own log. In a read-only container a file needs a writable mount for
-its directory.
+the events go to stderr, next to the server's own log, in the same shape and the same batches
+(and only at a `LOG_LEVEL` that shows `info`, or `warn` for the requests let through). In a
+read-only container a file needs a writable mount for its directory.
 
 ```json
 {

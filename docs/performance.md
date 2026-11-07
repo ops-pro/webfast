@@ -28,7 +28,9 @@ measured in one sitting, in alternating order.
   count); formatting it per response, 120–130 ns.
 - **A runtime per core**: each listening socket (SO_REUSEPORT, one per worker) gets a thread with a
   single-threaded tokio runtime and its own epoll; connections stay there, no work is handed between
-  threads. HTTP/3 runs on the shared runtime (quinn drives one UDP socket).
+  threads. HTTP/3 runs on the shared runtime (quinn drives one UDP socket); with HTTP/3 off that
+  runtime, left the signals, reloads and refreshes, gets at most 4 threads (docs/operations.md,
+  Workers).
 - **Three system calls per request** on a keep-alive connection: `epoll_wait`, `recvfrom`, `writev`
   (headers and body in one) — strace, 1000 requests/s.
 - **Compression off the request threads**: an on-the-fly body over 64 KiB is compressed on the

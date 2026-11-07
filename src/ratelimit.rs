@@ -24,8 +24,9 @@
 //! Zones are checked from the tightest to the most permissive, and the first exceeded ends the
 //! check, as in the plugin; the request then fails with 429 and `Retry-After` (src/handler.rs
 //! `HandlerError`: `handle_errors 429` can answer it). Keys are hashed with a key of the process's
-//! own, kept in 64 shards each under its own lock; a sweeper thread drops the keys that are fully
-//! rested again and logs, once per `sweep_interval`, how many requests each zone limited.
+//! own (ahash: a few nanoseconds, and no key can be made to collide from outside), kept in 64
+//! shards each under its own lock on cache lines of its own; a sweeper thread drops the keys that
+//! are fully rested again and logs, once per `sweep_interval`, how many requests each zone limited.
 //! WEB_RATE_LIMIT_KEYS bounds the keys of a zone (when full, new keys are limited, as nginx does),
 //! WEB_RATE_LIMIT_DRY_RUN only logs. The state of a zone outlives a reload when its name, limits
 //! and key stay.
@@ -99,15 +100,15 @@ pub fn set_max_upstream_requests_per_ip(n: usize) {
 /// The requests at the upstreams per client: the client's address (an IPv6 /64 is one, as for
 /// connections, src/guard.rs), hashed with the process's key, → how many.
 struct InFlight {
-    hasher: std::hash::RandomState,
-    shards: Vec<Mutex<FxHashMap<u64, usize>>>,
+    hasher: ahash::RandomState,
+    shards: Vec<Shard<usize>>,
     /// Requests refused since the last summary.
     refused: AtomicU64,
 }
 
 static IN_FLIGHT: LazyLock<InFlight> = LazyLock::new(|| InFlight {
-    hasher: std::hash::RandomState::new(),
-    shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
+    hasher: ahash::RandomState::new(),
+    shards: shards(),
     refused: AtomicU64::new(0),
 });
 
@@ -130,9 +131,7 @@ fn upstream_slot(ip: IpAddr, trusted_self: bool) -> Result<Option<UpstreamSlot>,
     }
     let in_flight = &*IN_FLIGHT;
     let key = in_flight.hasher.hash_one(crate::guard::address_key(ip));
-    let mut shard = in_flight.shards[(key as usize) % SHARDS]
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut shard = in_flight.shards[(key as usize) % SHARDS].lock();
     let count = shard.entry(key).or_insert(0);
     if *count >= max {
         in_flight.refused.fetch_add(1, Ordering::Relaxed);
@@ -147,9 +146,7 @@ fn upstream_slot(ip: IpAddr, trusted_self: bool) -> Result<Option<UpstreamSlot>,
 
 impl Drop for UpstreamSlot {
     fn drop(&mut self) {
-        let mut shard = IN_FLIGHT.shards[(self.key as usize) % SHARDS]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut shard = IN_FLIGHT.shards[(self.key as usize) % SHARDS].lock();
         if let Some(count) = shard.get_mut(&self.key) {
             *count -= 1;
             if *count == 0 {
@@ -157,6 +154,22 @@ impl Drop for UpstreamSlot {
             }
         }
     }
+}
+
+/// One shard of a keyed map, under its own lock, on cache lines of its own: a lock taken on one
+/// thread does not bounce the line of the shard next to it between the cores (a `Mutex` around
+/// a map is some 40 bytes; two to a 64-byte line, and 128 for the adjacent-line prefetcher).
+#[repr(align(128))]
+struct Shard<V>(Mutex<FxHashMap<u64, V>>);
+
+impl<V> Shard<V> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FxHashMap<u64, V>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn shards<V>() -> Vec<Shard<V>> {
+    (0..SHARDS).map(|_| Shard(Mutex::new(FxHashMap::default()))).collect()
 }
 
 /// Monotonic nanoseconds since the first use (the zones' clock).
@@ -196,9 +209,9 @@ struct ZoneState {
     tolerance: u64,
     ipv4_prefix: u8,
     ipv6_prefix: u8,
-    hasher: std::hash::RandomState,
+    hasher: ahash::RandomState,
     /// Key hash → the time (`now_nanos`) at which the key is fully rested.
-    shards: Vec<Mutex<FxHashMap<u64, u64>>>,
+    shards: Vec<Shard<u64>>,
     /// Since the last summary: requests limited, and up to a few of their keys (with `log_key`).
     limited: AtomicU64,
     keys_seen: Mutex<Vec<String>>,
@@ -330,8 +343,8 @@ impl Zone {
             tolerance: window.saturating_sub(interval),
             ipv4_prefix: spec.ipv4_prefix,
             ipv6_prefix: spec.ipv6_prefix,
-            hasher: std::hash::RandomState::new(),
-            shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            hasher: ahash::RandomState::new(),
+            shards: shards(),
             limited: AtomicU64::new(0),
             keys_seen: Mutex::new(Vec::new()),
             log_key: options.log_key,
@@ -419,9 +432,7 @@ impl ZoneState {
     /// One request of the key at `now`: `None` when it may pass (and is counted), otherwise how
     /// many nanoseconds until it may.
     fn take(&self, hash: u64, now: u64) -> Option<u64> {
-        let mut shard = self.shards[(hash as usize) % SHARDS]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut shard = self.shards[(hash as usize) % SHARDS].lock();
         let full = shard.len() >= MAX_KEYS.load(Ordering::Relaxed) / SHARDS;
         if full && !shard.contains_key(&hash) {
             // As nginx when its zone is full: the rested keys go first, and if none did, the new
@@ -453,7 +464,7 @@ impl ZoneState {
         self.shards
             .iter()
             .map(|shard| {
-                let mut shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut shard = shard.lock();
                 shard.retain(|_, rested_at| *rested_at > now);
                 shard.len()
             })
@@ -589,8 +600,8 @@ mod tests {
             tolerance: window - interval,
             ipv4_prefix: 0,
             ipv6_prefix: 0,
-            hasher: std::hash::RandomState::new(),
-            shards: (0..SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            hasher: ahash::RandomState::new(),
+            shards: shards(),
             limited: AtomicU64::new(0),
             keys_seen: Mutex::new(Vec::new()),
             log_key: false,

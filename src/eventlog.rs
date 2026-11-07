@@ -2,11 +2,14 @@
 //! `log_only`, as one JSON line. With `log: {output: …}` in the check's file the lines go there —
 //! a file (appended to, followed through logrotate), `stdout`, `stderr` or `discard` — through
 //! the access log's writer threads (src/accesslog.rs: in batches, never making a request wait);
-//! without it they go to the server's own log. Tokens are not written (a query parameter a JWT
-//! may come in shows as `REDACTED`), and a schema error says where and which keyword failed, not
-//! the value, which may be a password; the URI is otherwise as the access log has it.
+//! without it they go to stderr, where the server's own log goes, in the same shape and through
+//! the same writer thread (a line through `tracing` is a write(2) of its own, one syscall per
+//! refused request under an attack), when the server's log level lets them. Tokens are not
+//! written (a query parameter a JWT may come in shows as `REDACTED`), and a schema error says
+//! where and which keyword failed, not the value, which may be a password; the URI is otherwise
+//! as the access log has it.
 
-use crate::accesslog::{Output, json_escape, write_line};
+use crate::accesslog::{Output, Writer, json_escape, write_timestamp, writer};
 use crate::handler::hostport_of;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -15,7 +18,6 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -27,8 +29,16 @@ pub struct LogConfig {
 /// Where a check's events go.
 pub struct EventLog {
     logger: &'static str,
-    /// `None`: the server's log.
-    output: Option<Output>,
+    sink: Sink,
+}
+
+/// The writer of the lines, resolved once, with the configuration.
+enum Sink {
+    /// No `log.output`: stderr, as the server's log, at its level (`info` for a refused request,
+    /// `warn` for one let through).
+    ServerLog(Option<&'static Writer>),
+    /// `log.output` named it; `None`: `discard`.
+    Configured(Option<&'static Writer>),
 }
 
 /// One request that did not pass a check.
@@ -50,53 +60,42 @@ pub struct Event<'a> {
 
 impl EventLog {
     pub fn new(logger: &'static str, config: Option<&LogConfig>, base: &Path) -> EventLog {
-        EventLog {
-            logger,
-            output: config.map(|c| Output::parse(&c.output, base)),
-        }
+        let sink = match config {
+            Some(config) => Sink::Configured(writer(Output::parse(&config.output, base))),
+            None => Sink::ServerLog(writer(Output::Stderr)),
+        };
+        EventLog { logger, sink }
     }
 
     pub fn record(&self, event: &Event<'_>) {
+        let writer = match self.sink {
+            Sink::Configured(writer) => writer,
+            Sink::ServerLog(writer) => {
+                let wanted = if event.refused {
+                    tracing::enabled!(tracing::Level::INFO)
+                } else {
+                    tracing::enabled!(tracing::Level::WARN)
+                };
+                writer.filter(|_| wanted)
+            }
+        };
+        let Some(writer) = writer else { return };
         let uri = redacted(
             event.parts.uri.path_and_query().map_or("/", |pq| pq.as_str()),
             event.parts.extensions.get::<HiddenParams>().map_or(&[][..], |h| &h.0),
         );
-        match self.output {
-            None if event.refused => tracing::info!(
-                logger = self.logger,
-                client_ip = %event.client_ip,
-                method = %event.parts.method,
-                host = hostport_of(event.parts),
-                uri = &*uri,
-                reason = event.reason,
-                detail = event.detail,
-                status = event.status,
-                "request refused"
-            ),
-            None => tracing::warn!(
-                logger = self.logger,
-                client_ip = %event.client_ip,
-                method = %event.parts.method,
-                host = hostport_of(event.parts),
-                uri = &*uri,
-                reason = event.reason,
-                detail = event.detail,
-                "request let through (log_only)"
-            ),
-            Some(Output::Discard) => {}
-            Some(output) => write_line(output, self.line(event, &uri)),
-        }
+        writer.write(self.line(event, &uri));
     }
 
     fn line(&self, event: &Event<'_>, uri: &str) -> String {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
         let mut line = String::with_capacity(256);
+        line.push_str(r#"{"level":""#);
+        line.push_str(if event.refused { "info" } else { "warn" });
+        line.push_str(r#"","ts":"#);
+        write_timestamp(&mut line);
         let _ = write!(
             line,
-            r#"{{"level":"{}","ts":{ts},"logger":"{}","msg":"{}","request":{{"client_ip":"{}","method":""#,
-            if event.refused { "info" } else { "warn" },
+            r#","logger":"{}","msg":"{}","request":{{"client_ip":"{}","method":""#,
             self.logger,
             if event.refused {
                 "request refused"
