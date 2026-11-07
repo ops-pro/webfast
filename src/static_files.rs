@@ -27,6 +27,8 @@ pub struct FileServer {
     pub hide: Vec<String>,
     pub pass_thru: bool,
     pub canonical_uris: bool,
+    /// `hide` as `hidden` compares it, worked out at the first request.
+    hides: std::sync::OnceLock<Vec<Hide>>,
 }
 
 impl Default for FileServer {
@@ -38,6 +40,41 @@ impl Default for FileServer {
             hide: Vec::new(),
             pass_thru: false,
             canonical_uris: true,
+            hides: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// A `hide` pattern in the forms `hidden` compares, made once rather than per request.
+#[derive(Debug)]
+enum Hide {
+    /// No `/`: any element of the path.
+    Element(String),
+    /// The path from the root: the pattern with its leading `/`, and the same as a directory
+    /// prefix (`<pattern>/`), which hides everything under it.
+    Path { pattern: String, prefix: String },
+}
+
+impl Hide {
+    fn new(pattern: &str) -> Hide {
+        if !pattern.contains('/') {
+            return Hide::Element(pattern.to_string());
+        }
+        let pattern = if pattern.starts_with('/') {
+            pattern.to_string()
+        } else {
+            format!("/{pattern}")
+        };
+        let prefix = format!("{}/", pattern.trim_end_matches('/'));
+        Hide::Path { pattern, prefix }
+    }
+
+    fn hides(&self, file: &str) -> bool {
+        match self {
+            Hide::Element(pattern) => file
+                .split('/')
+                .any(|element| crate::caddyfile::wildcard(pattern, element)),
+            Hide::Path { pattern, prefix } => crate::caddyfile::wildcard(pattern, file) || file.starts_with(prefix),
         }
     }
 }
@@ -47,25 +84,25 @@ impl FileServer {
         let Some(store) = self.root.clone().or_else(|| ctx.root.clone()) else {
             return ctx.fail(StatusCode::NOT_FOUND, Some("filesystem not found".into()));
         };
-        // One buffer for the file, directory and index lookups.
-        let mut key = if needs_clean(ctx.path()) {
-            clean_path(ctx.path(), true)
-        } else {
-            ctx.path().to_string()
-        };
+        // The path as the lookups take it: the request's own when it is clean (most are), a
+        // cleaned copy otherwise.
+        let cleaned = needs_clean(ctx.path()).then(|| clean_path(ctx.path(), true));
+        let path = cleaned.as_deref().unwrap_or_else(|| ctx.path());
         let mut implicit_index = false;
-        let mut found: Option<(String, Arc<FileEntry>)> = None;
         // The files as they are now: the same for every lookup of this request.
         let mut files = store.files();
-        if !key.ends_with('/')
-            && let Some(entry) = files.file(&key)
+        let found = if !path.ends_with('/')
+            && let Some(slot) = files.lookup(path)
         {
-            let entry = entry.clone();
-            found = Some((key, entry));
+            (!self.hidden(path)).then_some(slot)
         } else {
+            // One buffer for the directory and its index files.
+            let mut key = String::with_capacity(path.len() + 1 + self.index.iter().map(String::len).max().unwrap_or(0));
+            key.push_str(path);
             if !key.ends_with('/') {
                 key.push('/');
             }
+            let mut found = None;
             if files.is_dir(&key) {
                 let dir_len = key.len();
                 for index in &self.index {
@@ -74,22 +111,25 @@ impl FileServer {
                     if self.hidden(&key) {
                         continue;
                     }
-                    if let Some(entry) = files.file(&key) {
-                        let entry = entry.clone();
-                        found = Some((key, entry));
+                    if let Some(slot) = files.lookup(&key) {
+                        found = Some(slot);
                         implicit_index = true;
                         break;
                     }
                 }
             }
-        }
-        let Some((file, entry)) = found.filter(|(file, _)| !self.hidden(file)) else {
+            found
+        };
+        let Some(slot) = found else {
             drop(files);
             if self.pass_thru {
                 return next.run(ctx).await;
             }
             return ctx.fail(StatusCode::NOT_FOUND, None);
         };
+        // Kept past the snapshot: a delta is worked out across an await.
+        let entry = slot.entry.clone();
+        let siblings = slot.siblings();
 
         if self.canonical_uris {
             // Only when the last path element was not rewritten (Caddy #4205: no redirect loops).
@@ -153,28 +193,31 @@ impl FileServer {
         let mut wanted = [None::<crate::encode::Encoding>; 3];
         let mut chosen: &Arc<FileEntry> = &entry;
         let mut chosen_encoding = None;
-        let mut sidecar_key = String::with_capacity(file.len() + 4);
-        for encoding in ctx.accept_encoding().ranked(&self.precompressed) {
-            sidecar_key.clear();
-            sidecar_key.push_str(&file);
-            sidecar_key.push_str(encoding.suffix());
-            if let Some(sidecar) = files.file(&sidecar_key) {
-                chosen = sidecar;
-                chosen_encoding = Some(encoding);
-                break;
-            }
-            match REPRESENTATIONS.lookup(&entry, encoding) {
-                Lookup::Have(made) => {
-                    variant = Some(made);
+        // A file of a type not worth compressing and without a sibling (an image, mostly) is sent as
+        // it is, whatever the client takes; a variant is only for a compressible file.
+        if entry.compressible || siblings.iter().any(Option::is_some) {
+            for encoding in ctx.accept_encoding().ranked(&self.precompressed) {
+                if let Some(sibling) = &siblings[encoding as usize] {
+                    chosen = sibling;
                     chosen_encoding = Some(encoding);
                     break;
                 }
-                Lookup::Missing => {
-                    if let Some(slot) = wanted.iter_mut().find(|slot| slot.is_none()) {
-                        *slot = Some(encoding);
-                    }
+                if !entry.compressible {
+                    continue;
                 }
-                Lookup::No => {}
+                match REPRESENTATIONS.lookup(&entry, encoding) {
+                    Lookup::Have(made) => {
+                        variant = Some(made);
+                        chosen_encoding = Some(encoding);
+                        break;
+                    }
+                    Lookup::Missing => {
+                        if let Some(slot) = wanted.iter_mut().find(|slot| slot.is_none()) {
+                            *slot = Some(encoding);
+                        }
+                    }
+                    Lookup::No => {}
+                }
             }
         }
         if let Some(made) = &variant {
@@ -372,20 +415,10 @@ impl FileServer {
     }
 
     fn hidden(&self, file: &str) -> bool {
-        self.hide.iter().any(|pattern| {
-            if pattern.contains('/') {
-                let pattern = if pattern.starts_with('/') {
-                    pattern.clone()
-                } else {
-                    format!("/{pattern}")
-                };
-                crate::caddyfile::wildcard(&pattern, file)
-                    || file.starts_with(&format!("{}/", pattern.trim_end_matches('/')))
-            } else {
-                file.split('/')
-                    .any(|element| crate::caddyfile::wildcard(pattern, element))
-            }
-        })
+        self.hides
+            .get_or_init(|| self.hide.iter().map(|pattern| Hide::new(pattern)).collect())
+            .iter()
+            .any(|hide| hide.hides(file))
     }
 }
 
@@ -517,7 +550,8 @@ async fn serve_disk(
 /// A piece of a file being read on the blocking pool: the file back, and the bytes.
 type Reading = tokio::task::JoinHandle<std::io::Result<(std::fs::File, Vec<u8>)>>;
 
-/// How much of a file on disk is read at a time.
+/// How much of a file on disk is read at a time: 256 KiB pieces went faster but held about twice
+/// the memory with 16 downloads under way (docs/performance.md, Large files from disk).
 const PIECE: usize = 64 << 10;
 
 /// `remaining` bytes of a file, read on the blocking pool a piece at a time — the next piece is
@@ -540,7 +574,8 @@ impl DiskBody {
     /// Starts reading the next piece (none when everything has been read). The piece's buffer is
     /// allocated here, on the connection's thread, which also frees it once sent: allocated on the
     /// blocking pool's threads instead, each with a heap of its own, the pieces stayed in those
-    /// heaps (16 downloads at once kept over 200 MB resident).
+    /// heaps (16 downloads at once kept over 200 MB resident). Zeroed: `Read` has no stable way
+    /// into spare capacity, and clippy refuses a `set_len` over it.
     fn read_next(&mut self, mut file: std::fs::File) {
         let want = (self.remaining.min(PIECE as u64)) as usize;
         if want == 0 {
@@ -881,8 +916,12 @@ fn parse_ranges(header: &str, size: u64) -> Result<Vec<(u64, u64)>, RangeError> 
 /// browser or a PDF reader asks for a handful).
 const MAX_RANGES: usize = 64;
 
-/// At most MAX_RANGES, none of them overlapping (empty ranges are fine).
+/// At most MAX_RANGES, none of them overlapping (empty ranges are fine). One range, the usual
+/// case, has nothing to overlap: no sorting.
 fn ranges_are_bounded(ranges: &[(u64, u64)]) -> bool {
+    if ranges.len() <= 1 {
+        return true;
+    }
     if ranges.len() > MAX_RANGES {
         return false;
     }
@@ -959,6 +998,7 @@ mod tests {
 
     #[test]
     fn too_many_or_overlapping_ranges_are_not_bounded() {
+        assert!(ranges_are_bounded(&[]) && ranges_are_bounded(&[(0, 10)]), "one or none");
         assert!(ranges_are_bounded(&[(0, 2), (5, 2), (2, 3)]), "adjacent is fine");
         assert!(!ranges_are_bounded(&[(0, 10), (5, 10)]), "overlapping");
         assert!(!ranges_are_bounded(&[(0, 1), (0, 1)]), "the same byte twice");
@@ -999,6 +1039,33 @@ mod tests {
         assert!(etag_list_matches("\"x\", \"abc\"", &etag, false));
         assert!(etag_list_matches("*", &etag, true));
         assert!(!etag_list_matches("\"abd\"", &etag, false));
+    }
+
+    #[test]
+    fn hide_patterns_match_elements_or_paths() {
+        let server = FileServer {
+            hide: vec![
+                ".git".into(),
+                "*.secret".into(),
+                "private/".into(),
+                "/drafts/*.md".into(),
+            ],
+            ..FileServer::default()
+        };
+        // Without `/`: any element of the path.
+        assert!(server.hidden("/.git/config"));
+        assert!(server.hidden("/a/b/.git"));
+        assert!(server.hidden("/keys/db.secret"));
+        assert!(!server.hidden("/gitlog.txt"));
+        // With `/`: from the root, with or without the leading slash, and everything under a
+        // directory.
+        assert!(server.hidden("/private/"));
+        assert!(server.hidden("/private/notes.txt"));
+        assert!(server.hidden("/private/deep/er.txt"));
+        assert!(!server.hidden("/en/private/notes.txt"));
+        assert!(server.hidden("/drafts/a.md"));
+        assert!(!server.hidden("/drafts/a.txt"));
+        assert!(!FileServer::default().hidden("/anything"));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! bytes as they are decompresses them (some GB/s: tens of microseconds for a page); 304s, HEAD and
 //! the precompressed siblings that browsers get cost nothing.
 
+use crate::encode::Encoding;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::HeaderValue;
@@ -370,9 +371,9 @@ fn pack(parts: &[&[u8]]) -> Vec<(Bytes, Arc<Chunk>)> {
 }
 
 /// What the buffers `files` are in hold besides them: bytes of replaced files, not yet freed.
-fn chunk_waste(files: &FxHashMap<String, Arc<FileEntry>>) -> (usize, usize) {
+fn chunk_waste<'a>(files: impl Iterator<Item = &'a Arc<FileEntry>>) -> (usize, usize) {
     let mut chunks: FxHashMap<*const Chunk, (usize, usize)> = FxHashMap::default();
-    for file in files.values() {
+    for file in files {
         if let Some(chunk) = &file.chunk {
             chunks.entry(Arc::as_ptr(chunk)).or_insert((chunk.len, 0)).1 += file.stored_len();
         }
@@ -447,12 +448,39 @@ impl Totals {
     }
 }
 
+/// A file as a snapshot lists it: the entry and its precompressed siblings (`<name>.zst`, `.br`,
+/// `.gz`), found once when the snapshot is made — a request indexes by the encoding instead of
+/// building each sibling's path and looking it up. A sibling is an ordinary entry, in memory or
+/// on disk by its own size.
+#[derive(Debug)]
+pub struct Slot {
+    pub entry: Arc<FileEntry>,
+    /// By `Encoding as usize`.
+    siblings: [Option<Arc<FileEntry>>; 3],
+}
+
+impl Slot {
+    /// The file's precompressed sibling in `encoding`.
+    pub fn sibling(&self, encoding: Encoding) -> Option<&Arc<FileEntry>> {
+        self.siblings[encoding as usize].as_ref()
+    }
+
+    /// The siblings, by `Encoding as usize`, to keep past the snapshot.
+    pub fn siblings(&self) -> [Option<Arc<FileEntry>>; 3] {
+        self.siblings.clone()
+    }
+
+    pub fn has_siblings(&self) -> bool {
+        self.siblings.iter().any(Option::is_some)
+    }
+}
+
 /// A store's files at one moment.
 #[derive(Debug, Default)]
 pub struct Files {
     /// "/dir/name.ext" → file. FxHash: the keys are our own paths, so a fast non-keyed hash is
     /// safe here (requests only look up, they never insert).
-    files: FxHashMap<String, Arc<FileEntry>>,
+    files: FxHashMap<String, Slot>,
     /// "/", "/dir/", "/dir/sub/": every directory that holds a file.
     dirs: FxHashSet<String>,
     /// SHA-256 → the file (its key), for compression dictionaries.
@@ -461,12 +489,14 @@ pub struct Files {
 }
 
 impl Files {
-    fn new(files: FxHashMap<String, Arc<FileEntry>>) -> Files {
+    fn new(entries: FxHashMap<String, Arc<FileEntry>>) -> Files {
         let mut dirs = FxHashSet::default();
         dirs.insert("/".to_string());
         let mut totals = Totals::default();
         let mut by_sha256 = FxHashMap::default();
-        for (key, file) in &files {
+        let mut files = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        let mut sibling_key = String::new();
+        for (key, file) in &entries {
             totals.add(file);
             if let Some(hash) = file.sha256 {
                 by_sha256.insert(hash, (key.clone(), file.clone()));
@@ -478,6 +508,19 @@ impl Files {
                     break;
                 }
             }
+            let siblings = [Encoding::Zstd, Encoding::Br, Encoding::Gzip].map(|encoding| {
+                sibling_key.clear();
+                sibling_key.push_str(key);
+                sibling_key.push_str(encoding.suffix());
+                entries.get(&sibling_key).cloned()
+            });
+            files.insert(
+                key.clone(),
+                Slot {
+                    entry: file.clone(),
+                    siblings,
+                },
+            );
         }
         Files {
             files,
@@ -488,6 +531,11 @@ impl Files {
     }
 
     pub fn file(&self, path: &str) -> Option<&Arc<FileEntry>> {
+        self.files.get(path).map(|slot| &slot.entry)
+    }
+
+    /// The file at `path` with its precompressed siblings.
+    pub fn lookup(&self, path: &str) -> Option<&Slot> {
         self.files.get(path)
     }
 
@@ -498,6 +546,12 @@ impl Files {
     /// Every file's path ("/dir/name.ext").
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
+    }
+
+    /// Every file.
+    #[cfg(test)]
+    fn entries(&self) -> impl Iterator<Item = &Arc<FileEntry>> {
+        self.files.values().map(|slot| &slot.entry)
     }
 
     /// `path` ends with `/`.
@@ -747,7 +801,7 @@ impl FileStore {
         let mut to_read = Vec::new();
         let mut disk = (0, 0);
         for (key, path, meta) in found {
-            match old.files.get(&key) {
+            match old.file(&key) {
                 Some(file) if file.meta == Some(meta) => {
                     files.insert(key, file.clone());
                 }
@@ -765,8 +819,8 @@ impl FileStore {
         // Files on disk that changed or came: counted as such, whatever the old entry was.
         out.added += disk.0;
         out.changed += disk.1;
-        out.removed = old.files.keys().filter(|key| !files.contains_key(*key)).count();
-        out.removed -= to_read.iter().filter(|(key, _, _)| old.files.contains_key(key)).count();
+        out.removed = old.paths().filter(|key| !files.contains_key(*key)).count();
+        out.removed -= to_read.iter().filter(|(key, _, _)| old.contains(key)).count();
         if to_read.is_empty() && out.removed == 0 && disk == (0, 0) {
             out.totals = old.totals;
             out.millis = started.elapsed().as_millis() as u64;
@@ -781,7 +835,7 @@ impl FileStore {
             .collect();
         let mut packed = pack(&parts).into_iter();
         for ((key, path, meta), file) in to_read.iter().zip(&loaded) {
-            let previous = old.files.get(key);
+            let previous = old.file(key);
             match file {
                 Ok(Some(prepared)) => {
                     let (stored, chunk) = packed.next().expect("a buffer for each file read");
@@ -811,7 +865,7 @@ impl FileStore {
         drop(loaded);
         // Buffers kept for a few unchanged files while most of theirs were replaced: when they hold
         // more than a quarter again of what is live, every file is copied into new ones.
-        let (waste, live) = chunk_waste(&files);
+        let (waste, live) = chunk_waste(files.values());
         if waste > live / 4 && waste > CHUNK {
             let entries: Vec<(&String, &Arc<FileEntry>)> =
                 files.iter().filter(|(_, file)| file.on_disk().is_none()).collect();
@@ -839,6 +893,7 @@ impl FileStore {
             let replaced: Vec<(String, Arc<FileEntry>)> = old
                 .files
                 .iter()
+                .map(|(key, slot)| (key, &slot.entry))
                 .filter(|(key, file)| files.file(key).is_none_or(|now| !Arc::ptr_eq(now, file)))
                 .map(|(key, file)| (key.clone(), file.clone()))
                 .collect();
@@ -1184,6 +1239,51 @@ mod tests {
     }
 
     #[test]
+    fn precompressed_siblings_are_found_when_the_snapshot_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("css")).unwrap();
+        std::fs::write(dir.path().join("css/a.css"), "a { color: red }").unwrap();
+        std::fs::write(dir.path().join("css/a.css.br"), "br").unwrap();
+        std::fs::write(dir.path().join("css/a.css.gz"), "gz").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "p").unwrap();
+        let mut budget = 1 << 20;
+        let store = FileStore::load_with(dir.path(), &mut budget, None, true, None).unwrap();
+        {
+            let files = store.files();
+            let slot = files.lookup("/css/a.css").unwrap();
+            assert!(Arc::ptr_eq(&slot.entry, files.file("/css/a.css").unwrap()));
+            assert!(slot.has_siblings());
+            assert!(Arc::ptr_eq(
+                slot.sibling(Encoding::Br).unwrap(),
+                files.file("/css/a.css.br").unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                slot.sibling(Encoding::Gzip).unwrap(),
+                files.file("/css/a.css.gz").unwrap()
+            ));
+            assert!(slot.sibling(Encoding::Zstd).is_none());
+            assert!(!files.lookup("/plain.txt").unwrap().has_siblings());
+            assert!(
+                !files.lookup("/css/a.css.br").unwrap().has_siblings(),
+                "a sibling of a sibling"
+            );
+            assert!(files.lookup("/css/a.css.zst").is_none());
+        }
+        // A sibling that comes or goes with a rescan is found in the new snapshot.
+        std::fs::write(dir.path().join("css/a.css.zst"), "zst").unwrap();
+        std::fs::remove_file(dir.path().join("css/a.css.gz")).unwrap();
+        assert!(store.rescan(1 << 20).unwrap().replaced());
+        let files = store.files();
+        let slot = files.lookup("/css/a.css").unwrap();
+        assert!(Arc::ptr_eq(
+            slot.sibling(Encoding::Zstd).unwrap(),
+            files.file("/css/a.css.zst").unwrap()
+        ));
+        assert!(slot.sibling(Encoding::Gzip).is_none());
+        assert!(slot.sibling(Encoding::Br).is_some());
+    }
+
+    #[test]
     fn budget_is_enforced() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.bin"), vec![0u8; 100]).unwrap();
@@ -1279,15 +1379,15 @@ mod tests {
         }
         let mut budget = 1 << 30;
         let store = FileStore::load_with(dir.path(), &mut budget, None, true, None).unwrap();
-        assert_eq!(chunk_waste(&store.files().files).0, 0);
-        assert!(store.files().files.len() > CHUNK / (64 * 1024), "several buffers");
+        assert_eq!(chunk_waste(store.files().entries()).0, 0);
+        assert!(store.files().len() > CHUNK / (64 * 1024), "several buffers");
 
         // A few changed: their old copies stay in the shared buffers for now.
         for i in 0..4 {
             std::fs::write(dir.path().join(format!("{i}.bin")), file(i, 1)).unwrap();
         }
         assert_eq!(store.rescan(1 << 30).unwrap().changed, 4);
-        let (waste, _) = chunk_waste(&store.files().files);
+        let (waste, _) = chunk_waste(store.files().entries());
         assert!(waste > 0 && waste < CHUNK, "{waste}");
 
         // Most changed, one file left in each buffer: everything goes into new buffers, nothing held
@@ -1304,7 +1404,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("{i}.bin")), file(i, 2)).unwrap();
         }
         assert_eq!(store.rescan(1 << 30).unwrap().changed, changed.len());
-        let (waste, live) = chunk_waste(&store.files().files);
+        let (waste, live) = chunk_waste(store.files().entries());
         assert_eq!(waste, 0);
         assert_eq!(live as u64, store.totals().stored);
         for i in 0..40 {
