@@ -1237,6 +1237,11 @@ impl crate::extensions::ProxyObserver for Observer {
         pending.as_mut().and_then(|miss| miss.fallback(ctx, status))
     }
 
+    /// A miss stores what the upstream answered, by the headers it was asked with.
+    fn wants_sent(&self, pending: &Self::Pending) -> bool {
+        pending.is_some()
+    }
+
     fn observe(
         &self,
         pending: Self::Pending,

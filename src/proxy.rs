@@ -204,7 +204,11 @@ impl ReverseProxy {
         {
             return self.tunnel(ctx, protocol, client, held).await;
         }
-        let headers = self.upstream_headers(&ctx);
+        // The headers go with the request, not copied; a retry (after a failed connection) makes
+        // them again. Kept only for an observer that looks at them (a cache miss).
+        let mut headers = Some(self.upstream_headers(&ctx));
+        let keep = PROXY.wants_sent(&pending);
+        let mut kept: Option<HeaderMap> = None;
         let rendered_down: Vec<_> = self.header_down.iter().map(|op| op.render(&ctx)).collect();
         let path_and_query = ctx.req.uri.path_and_query().cloned();
         let method = ctx.req.method.clone();
@@ -258,7 +262,11 @@ impl ReverseProxy {
             *request.method_mut() = method.clone();
             *request.uri_mut() = uri;
             *request.version_mut() = http::Version::HTTP_11;
-            *request.headers_mut() = headers.clone();
+            let sending = headers.take().unwrap_or_else(|| self.upstream_headers(&ctx));
+            if keep && kept.is_none() {
+                kept = Some(sending.clone());
+            }
+            *request.headers_mut() = sending;
             let sent_at = Instant::now();
             let sent = self.client.request(request);
             let result = match self.response_header_timeout {
@@ -326,10 +334,11 @@ impl ReverseProxy {
                 {
                     return stale;
                 }
+                let none = HeaderMap::new();
                 let sent = Sent {
                     proxy: self,
                     path_and_query: path_and_query.as_ref().map_or("/", |pq| pq.as_str()),
-                    headers: &headers,
+                    headers: kept.as_ref().unwrap_or(&none),
                     header_down: &rendered_down,
                 };
                 let body = PROXY.observe(pending, sent, &mut parts, boxed(incoming));

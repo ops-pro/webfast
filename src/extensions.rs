@@ -108,6 +108,12 @@ pub trait ProxyObserver: Send + Sync {
 
     /// The response as it goes out: its body, perhaps wrapped.
     fn observe(&self, pending: Self::Pending, sent: Sent<'_>, parts: &mut http::response::Parts, body: Body) -> Body;
+
+    /// Whether `observe` will look at the headers sent (`Sent::headers`): if not, the proxy keeps
+    /// no copy of them (they go to the upstream with the request).
+    fn wants_sent(&self, _pending: &Self::Pending) -> bool {
+        true
+    }
 }
 
 /// What `file_server` has of a file in an encoding, when there is no precompressed sibling.
@@ -175,6 +181,10 @@ impl ProxyObserver for () {
     fn observe(&self, _: (), _: Sent<'_>, _: &mut http::response::Parts, body: Body) -> Body {
         body
     }
+
+    fn wants_sent(&self, _: &()) -> bool {
+        false
+    }
 }
 
 impl Representation for () {
@@ -240,6 +250,10 @@ impl<A: ProxyObserver, B: ProxyObserver> ProxyObserver for (A, B) {
         self.0
             .fallback(&mut pending.0, ctx, status)
             .or_else(|| self.1.fallback(&mut pending.1, ctx, status))
+    }
+
+    fn wants_sent(&self, pending: &Self::Pending) -> bool {
+        self.0.wants_sent(&pending.0) || self.1.wants_sent(&pending.1)
     }
 
     fn observe(&self, pending: Self::Pending, sent: Sent<'_>, parts: &mut http::response::Parts, body: Body) -> Body {

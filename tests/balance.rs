@@ -345,3 +345,46 @@ async fn a_name_that_does_not_resolve_yet_gets_502_until_it_does() {
     }
     running.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test]
+async fn a_retried_request_goes_with_all_its_headers() {
+    // An upstream that answers with the head it was sent.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while let Some(head) = read_head(&mut stream).await {
+                    let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{head}", head.len());
+                    if stream.write_all(answer.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    // The headers are handed to the first attempt; the retry makes them again.
+    let (running, port) = start(&format!(
+        ":0 {{\n\treverse_proxy {dead} {echo} {{\n\t\tlb_policy first\n\t\tlb_retries 1\n\t\tlb_try_interval 1ms\n\t\theader_up X-Up \"{{method}} {{uri}}\"\n\t}}\n}}\n"
+    ))
+    .await;
+    let answer = get(port, "/a?b=c", &[("X-Client", "kept")]).await;
+    assert_eq!(answer.status, 200);
+    let sent = answer.body.to_ascii_lowercase();
+    for field in [
+        "x-client: kept",
+        "x-up: get /a?b=c",
+        "x-forwarded-for: 127.0.0.1",
+        "x-forwarded-proto: http",
+        "x-forwarded-host: test",
+        "host: test",
+    ] {
+        assert!(
+            sent.lines().any(|line| line == field),
+            "{field} missing in:\n{}",
+            answer.body
+        );
+    }
+    running.shutdown(Duration::from_secs(1)).await;
+}
