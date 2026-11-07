@@ -2342,7 +2342,7 @@ dependencies = [
 [[package]]
 name = "webfast-challenge"
 version = "0.1.0"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#aacecc915c711f52060457c6cf026f7a97e8d004"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#e37c4b63bc5256dfc173b7c7a1c3cc1474662ec5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2410,7 +2410,7 @@ dependencies = [
 [[package]]
 name = "webfast-ngfw"
 version = "0.1.0"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#aacecc915c711f52060457c6cf026f7a97e8d004"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#e37c4b63bc5256dfc173b7c7a1c3cc1474662ec5"
 dependencies = [
  "aho-corasick",
  "anyhow",
