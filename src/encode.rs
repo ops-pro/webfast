@@ -36,7 +36,7 @@ impl Encoding {
         }
     }
 
-    fn parse_ignore_case(name: &str) -> Option<Encoding> {
+    pub(crate) fn parse_ignore_case(name: &str) -> Option<Encoding> {
         [Encoding::Zstd, Encoding::Br, Encoding::Gzip]
             .into_iter()
             .find(|e| e.name().eq_ignore_ascii_case(name))
@@ -330,20 +330,20 @@ impl Encode {
         if headers.contains_key(CONTENT_ENCODING) {
             return false;
         }
-        if headers.get_all(CACHE_CONTROL).iter().any(|v| {
-            v.to_str()
-                .is_ok_and(|v| v.to_ascii_lowercase().contains("no-transform"))
-        }) {
+        if headers
+            .get_all(CACHE_CONTROL)
+            .iter()
+            .any(|v| contains_ignore_case(v.as_bytes(), b"no-transform"))
+        {
             return false;
         }
         let Some(content_type) = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
             return false;
         };
-        let content_type = content_type.to_ascii_lowercase();
-        if content_type.starts_with("text/event-stream") || incremental(headers) {
+        if starts_with_ignore_case(content_type, "text/event-stream") || incremental(headers) {
             return false;
         }
-        if !self.types.iter().any(|t| type_matches(t, &content_type)) {
+        if !types_match(self.types.iter().map(String::as_str), content_type) {
             return false;
         }
         if let Some(length) = headers
@@ -383,14 +383,66 @@ pub fn etag_without(tagged: &str, letter: char) -> Option<String> {
     }
     crate::files::is_own_etag(base).then(|| format!("\"{base}\""))
 }
-pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => content_type.starts_with(prefix),
-        // `pattern` alone, or followed by its parameters (no string made for the comparison).
-        None => content_type
-            .strip_prefix(pattern)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(';')),
+/// Whether `content_type` is of one of `patterns` (lowercase, `*` at the end for any rest), in any
+/// ASCII case, with no lowercase copy of it made: a type without capitals (most are sent so) is
+/// compared as it is, byte for byte.
+pub(crate) fn types_match<'a>(patterns: impl IntoIterator<Item = &'a str>, content_type: &str) -> bool {
+    types_match_as(patterns, content_type, !has_capitals(content_type))
+}
+
+fn has_capitals(text: &str) -> bool {
+    text.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// `text.starts_with(prefix)`, byte for byte when `as_is`, otherwise ASCII case aside.
+fn starts_as(text: &str, prefix: &str, as_is: bool) -> bool {
+    if as_is {
+        text.starts_with(prefix)
+    } else {
+        starts_with_ignore_case(text, prefix)
     }
+}
+
+fn types_match_as<'a>(patterns: impl IntoIterator<Item = &'a str>, content_type: &str, as_is: bool) -> bool {
+    let mut patterns = patterns.into_iter();
+    if as_is {
+        patterns.any(|pattern| {
+            type_is(pattern, content_type, |text: &str, prefix: &str| {
+                text.starts_with(prefix)
+            })
+        })
+    } else {
+        patterns.any(|pattern| type_is(pattern, content_type, starts_with_ignore_case))
+    }
+}
+
+/// `pattern` alone, followed by its parameters, or (with `*`) by any rest: `starts` compares.
+#[inline(always)]
+fn type_is(pattern: &str, content_type: &str, starts: impl Fn(&str, &str) -> bool) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => starts(content_type, prefix),
+        None => {
+            starts(content_type, pattern) && matches!(content_type.as_bytes().get(pattern.len()), None | Some(b';'))
+        }
+    }
+}
+
+/// `types_match` for one pattern.
+#[cfg(test)]
+pub(crate) fn type_matches(pattern: &str, content_type: &str) -> bool {
+    types_match([pattern], content_type)
+}
+
+/// `text.starts_with(prefix)`, ASCII case aside.
+pub(crate) fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Whether `needle` (not empty) is in `text`, ASCII case aside.
+pub(crate) fn contains_ignore_case(text: &[u8], needle: &[u8]) -> bool {
+    text.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Compresses at the encoding's highest level, for work done once in the background (the proxy
@@ -451,7 +503,9 @@ pub(crate) const INCREMENTAL: http::header::HeaderName = http::header::HeaderNam
 /// Whether a body of `content_type` is worth compressing: Caddy's list (`DEFAULT_TYPES`), never
 /// an event stream.
 pub fn compressible(content_type: &str) -> bool {
-    !content_type.starts_with("text/event-stream") && DEFAULT_TYPES.iter().any(|t| type_matches(t, content_type))
+    let as_is = !has_capitals(content_type);
+    !starts_as(content_type, "text/event-stream", as_is)
+        && types_match_as(DEFAULT_TYPES.iter().copied(), content_type, as_is)
 }
 
 pub fn has_vary(headers: &HeaderMap, field: &str) -> bool {
@@ -614,6 +668,25 @@ mod tests {
 
     fn accepted(headers: &HeaderMap, offered: &[Encoding]) -> Vec<Encoding> {
         AcceptEncoding::parse(headers).ranked(offered).collect()
+    }
+
+    #[test]
+    fn types_match_in_any_case() {
+        assert!(type_matches("text/*", "Text/HTML; charset=UTF-8"));
+        assert!(type_matches("application/json", "APPLICATION/JSON"));
+        assert!(type_matches("application/json", "application/json;charset=utf-8"));
+        assert!(!type_matches("application/json", "application/jsonx"));
+        assert!(!type_matches("application/json", "application/js"));
+        assert!(!type_matches("text/*", "tex"));
+        assert!(type_matches("text/*", "text/"));
+        assert!(starts_with_ignore_case("TEXT/Event-Stream", "text/event-stream"));
+        assert!(!starts_with_ignore_case("text/event", "text/event-stream"));
+        assert!(contains_ignore_case(b"public, No-Transform", b"no-transform"));
+        assert!(!contains_ignore_case(b"no-trans", b"no-transform"));
+        assert!(compressible("Text/Html"));
+        assert!(!compressible("Text/Event-Stream"));
+        // A type that is not ASCII at the pattern's end is no panic.
+        assert!(!type_matches("text/html", "text/htmд"));
     }
 
     #[test]

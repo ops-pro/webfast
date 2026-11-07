@@ -24,7 +24,7 @@
 
 use crate::background::{Budget, Seen, Worker};
 use crate::body::{Body, BoxError};
-use crate::encode::{Encode, Encoding, has_vary, type_matches};
+use crate::encode::{Encode, Encoding, contains_ignore_case, has_vary, starts_with_ignore_case, types_match};
 use crate::extensions::UpstreamCheck;
 use crate::handler::{Ctx, RenderedOp};
 use crate::proxy::ReverseProxy;
@@ -514,17 +514,14 @@ fn storable(status: StatusCode, headers: &HeaderMap, sent: &HeaderMap, settings:
     if headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/event-stream"))
+        .is_some_and(|v| starts_with_ignore_case(v.trim_start(), "text/event-stream"))
         || crate::encode::incremental(headers)
     {
         return None;
     }
-    match headers
-        .get(CONTENT_ENCODING)
-        .map(|v| v.to_str().unwrap_or("?").trim().to_ascii_lowercase())
-    {
+    match headers.get(CONTENT_ENCODING).map(|v| v.to_str().unwrap_or("?").trim()) {
         None => {}
-        Some(coding) if coding == "identity" || Encoding::parse(&coding).is_some() => {}
+        Some(coding) if coding.eq_ignore_ascii_case("identity") || Encoding::parse_ignore_case(coding).is_some() => {}
         Some(_) => return None,
     }
     let max_body = settings.max_body();
@@ -940,7 +937,7 @@ async fn build(pending: Pending, raw: Bytes) -> Option<Entry> {
     let origin = headers
         .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| Encoding::parse(&v.trim().to_ascii_lowercase()));
+        .and_then(|v| Encoding::parse_ignore_case(v.trim()));
     let identity = match origin {
         Some(encoding) => match decode(encoding, &raw, cap, 0) {
             Some(identity) => identity,
@@ -1026,17 +1023,17 @@ fn encodes(encode: &Encode, status: StatusCode, headers: &HeaderMap, len: usize)
     {
         return false;
     }
-    if headers.get_all(CACHE_CONTROL).iter().any(|v| {
-        v.to_str()
-            .is_ok_and(|v| v.to_ascii_lowercase().contains("no-transform"))
-    }) {
+    if headers
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .any(|v| contains_ignore_case(v.as_bytes(), b"no-transform"))
+    {
         return false;
     }
     let Some(content_type) = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    let content_type = content_type.to_ascii_lowercase();
-    encode.types.iter().any(|t| type_matches(t, &content_type))
+    types_match(encode.types.iter().map(String::as_str), content_type)
 }
 
 /// Decodes a body, giving up past `cap` bytes; `expected`: the length it should have, when known

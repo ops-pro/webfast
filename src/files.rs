@@ -630,11 +630,7 @@ impl FileStore {
                 .content_type
                 .as_ref()
                 .and_then(|t| t.to_str().ok())
-                .is_some_and(|t| {
-                    crate::encode::DEFAULT_TYPES
-                        .iter()
-                        .any(|p| crate::encode::type_matches(p, t))
-                });
+                .is_some_and(|t| crate::encode::types_match(crate::encode::DEFAULT_TYPES.iter().copied(), t));
             if !compressible || file.len() > PREVIOUS_VERSIONS / 4 || previous.iter().any(|p| p.sha256 == sha256) {
                 continue;
             }
