@@ -1027,7 +1027,8 @@ async fn accept_loop(
                         };
                         let request = stall_limited(request, limits.stall);
                         let response = handle(conn, request).await;
-                        Ok::<_, Infallible>(response.map(|body| boxed(Tracked::new(body, flight))))
+                        // Not boxed again: hyper takes the tracking body as it is.
+                        Ok::<_, Infallible>(response.map(|body| Tracked::new(body, flight)))
                     }
                 })
             };
@@ -1086,7 +1087,7 @@ async fn serve_connection<I, S>(
     ends: crate::guard::Ends,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-    S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>
+    S: hyper::service::Service<Request<Incoming>, Response = Response<Tracked>, Error = Infallible>
         + Clone
         + Send
         + 'static,
