@@ -354,18 +354,8 @@ impl http_body::Body for Tracked {
     }
 }
 
-/// Set when a request body timed out (`StalledBody`); kept in the request's extensions so the
-/// handler that was reading the body (the proxy) can tell a stalled client from a failed upstream.
-#[derive(Debug, Clone, Default)]
-pub struct BodyStalled(pub Arc<AtomicBool>);
-
-impl BodyStalled {
-    pub fn happened(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-/// The error a stalled request body ends with.
+/// The error a stalled request body ends with. The handler that was sending the body on (the proxy)
+/// finds it in the failure's chain of causes (`body_fault`): a stalled client, not a failed upstream.
 #[derive(Debug)]
 pub struct StalledError;
 
@@ -377,30 +367,44 @@ impl std::fmt::Display for StalledError {
 
 impl std::error::Error for StalledError {}
 
-/// A request body that must keep moving: with no frame for `stall` it ends with an error and
-/// marks `BodyStalled`. A body that is already complete (no body, or one hyper has buffered) never
-/// arms the timer. The timer lives in the body (pinned once boxed) and is set again at each wait,
-/// not made anew.
+/// A request body that must keep moving: with no frame for `stall` it ends with `StalledError`. A
+/// body that is already complete (no body, or one hyper has buffered) never arms the timer. The
+/// timer lives in the body (pinned once boxed) and is set again at each wait, not made anew.
 pub struct StalledBody {
     inner: Body,
     stall: Duration,
     timer: tokio::time::Sleep,
     /// The timer is set for the wait under way.
     armed: bool,
-    stalled: BodyStalled,
 }
 
 impl StalledBody {
-    pub fn new(inner: Body, stall: Duration, stalled: BodyStalled) -> StalledBody {
+    pub fn new(inner: Body, stall: Duration) -> StalledBody {
         StalledBody {
             inner,
             stall,
             // Not registered with the runtime until it is set and polled.
             timer: tokio::time::sleep_until(far_future()),
             armed: false,
-            stalled,
         }
     }
+}
+
+/// What a failed request says about the client's body, from the failure's chain of causes (hyper
+/// keeps the body's error as the cause of the request's): 408 for a body that stalled, 413 for one
+/// over its limit; `None` when the body was not at fault.
+pub fn body_fault(error: &(dyn std::error::Error + 'static)) -> Option<http::StatusCode> {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if e.is::<StalledError>() {
+            return Some(http::StatusCode::REQUEST_TIMEOUT);
+        }
+        if e.is::<TooLargeError>() {
+            return Some(http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        cause = e.source();
+    }
+    None
 }
 
 /// A deadline that never comes (as tokio's own `far_future`: 30 years, within every clock's range).
@@ -429,7 +433,6 @@ impl http_body::Body for StalledBody {
                     this.armed = true;
                 }
                 if timer.poll(cx).is_ready() {
-                    this.stalled.0.store(true, Ordering::Release);
                     return Poll::Ready(Some(Err(Box::new(StalledError))));
                 }
                 Poll::Pending
@@ -446,23 +449,7 @@ impl http_body::Body for StalledBody {
     }
 }
 
-/// Set when a request body is over its `request_body` limit (`LimitedBody`): announced by its
-/// Content-Length, or found while it arrived. Kept in the request's extensions so that the proxy
-/// answers 413 — at once, without calling the upstream, when the length said so.
-#[derive(Debug, Clone, Default)]
-pub struct BodyTooLarge(pub Arc<AtomicBool>);
-
-impl BodyTooLarge {
-    pub fn happened(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    fn mark(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-/// The error a request body over its limit ends with.
+/// The error a request body over its limit ends with (found by `body_fault`).
 #[derive(Debug)]
 pub struct TooLargeError;
 
@@ -475,27 +462,26 @@ impl std::fmt::Display for TooLargeError {
 impl std::error::Error for TooLargeError {}
 
 /// A request body of at most `max` bytes (`request_body { max_size }`, as Caddy's): one whose
-/// length announces more is marked at once and fails when read; one that sends more fails at the
-/// frame that goes over.
+/// length announces more fails when read (`announced`: the caller answers 413 at once, without
+/// sending anything on); one that sends more fails at the frame that goes over.
 pub struct LimitedBody {
     inner: Body,
     remaining: u64,
-    too_large: BodyTooLarge,
     announced: bool,
 }
 
 impl LimitedBody {
-    pub fn new(inner: Body, max: u64, too_large: BodyTooLarge) -> LimitedBody {
-        let announced = http_body::Body::size_hint(&inner).lower() > max;
-        if announced {
-            too_large.mark();
-        }
+    pub fn new(inner: Body, max: u64) -> LimitedBody {
         LimitedBody {
+            announced: http_body::Body::size_hint(&inner).lower() > max,
             inner,
             remaining: max,
-            too_large,
-            announced,
         }
+    }
+
+    /// The body's announced length is over the limit.
+    pub fn announced(&self) -> bool {
+        self.announced
     }
 }
 
@@ -513,7 +499,6 @@ impl http_body::Body for LimitedBody {
         {
             let len = data.len() as u64;
             if len > self.remaining {
-                self.too_large.mark();
                 return Poll::Ready(Some(Err(Box::new(TooLargeError))));
             }
             self.remaining -= len;
@@ -748,28 +733,42 @@ mod tests {
     #[tokio::test]
     async fn request_bodies_over_the_limit_fail() {
         use http_body_util::BodyExt;
-        // Content-Length over the limit: marked at once, before anything is read.
-        let flag = BodyTooLarge::default();
-        let body = LimitedBody::new(crate::body::full(vec![0u8; 101]), 100, flag.clone());
-        assert!(flag.happened());
-        assert!(body.collect().await.is_err());
+        // Content-Length over the limit: known at once, before anything is read.
+        let body = LimitedBody::new(crate::body::full(vec![0u8; 101]), 100);
+        assert!(body.announced());
+        let error = body.collect().await.expect_err("fails when read");
+        assert_eq!(body_fault(&*error), Some(http::StatusCode::PAYLOAD_TOO_LARGE));
         // Within it: passes whole.
-        let flag = BodyTooLarge::default();
-        let body = LimitedBody::new(crate::body::full(vec![0u8; 100]), 100, flag.clone());
+        let body = LimitedBody::new(crate::body::full(vec![0u8; 100]), 100);
+        assert!(!body.announced());
         assert_eq!(body.collect().await.unwrap().to_bytes().len(), 100);
-        assert!(!flag.happened());
         // No length announced: the frame that goes over fails.
         let frames = vec![
             Ok::<_, BoxError>(Frame::data(Bytes::from(vec![0u8; 60]))),
             Ok(Frame::data(Bytes::from(vec![0u8; 60]))),
         ];
         let stream = http_body_util::StreamBody::new(tokio_stream::iter(frames));
-        let flag = BodyTooLarge::default();
-        let mut body = LimitedBody::new(crate::body::boxed(stream), 100, flag.clone());
-        assert!(!flag.happened(), "nothing announced");
+        let mut body = LimitedBody::new(crate::body::boxed(stream), 100);
+        assert!(!body.announced(), "nothing announced");
         assert!(body.frame().await.unwrap().is_ok(), "60 bytes: within");
-        assert!(body.frame().await.unwrap().is_err(), "120 bytes: over");
-        assert!(flag.happened());
+        let error = body.frame().await.unwrap().expect_err("120 bytes: over");
+        assert_eq!(body_fault(&*error), Some(http::StatusCode::PAYLOAD_TOO_LARGE));
+        // Wrapped the way hyper wraps a body's error (as the cause): still found; an unrelated error
+        // is not.
+        #[derive(Debug)]
+        struct Wrapped(BoxError);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("request failed")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+        assert_eq!(body_fault(&Wrapped(error)), Some(http::StatusCode::PAYLOAD_TOO_LARGE));
+        assert_eq!(body_fault(&Wrapped("connection reset".into())), None);
     }
 
     #[test]
@@ -827,22 +826,16 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(4);
         tx.send(Ok(Frame::data(Bytes::from_static(b"first")))).await.unwrap();
         let stream = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-        let stalled = BodyStalled::default();
-        let mut body = crate::body::boxed(StalledBody::new(
-            crate::body::boxed(stream),
-            Duration::from_millis(200),
-            stalled.clone(),
-        ));
+        let mut body = crate::body::boxed(StalledBody::new(crate::body::boxed(stream), Duration::from_millis(200)));
         assert!(body.frame().await.unwrap().is_ok());
         // Moving within the limit: the timer is set again, not run out.
         tokio::time::sleep(Duration::from_millis(120)).await;
         tx.send(Ok(Frame::data(Bytes::from_static(b"second")))).await.unwrap();
         assert!(body.frame().await.unwrap().is_ok());
-        assert!(!stalled.happened());
         // Then nothing: the body ends with the stall error.
         let started = Instant::now();
-        assert!(body.frame().await.unwrap().is_err());
-        assert!(stalled.happened());
+        let error = body.frame().await.unwrap().expect_err("stalled");
+        assert_eq!(body_fault(&*error), Some(http::StatusCode::REQUEST_TIMEOUT));
         assert!(started.elapsed() >= Duration::from_millis(150));
         drop(tx);
     }

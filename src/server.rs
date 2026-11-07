@@ -423,7 +423,7 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
             if !internal {
                 ctx.upstream_hooks = state.hooks.upstream.as_ref();
             }
-            let mut response = Next::start(routes).run(ctx).await;
+            let mut response = Next::start(routes).walk(ctx).await;
             let sent = response.extensions_mut().remove::<SentRequest>();
             match (kept, response.extensions().get::<Failed>(), sent) {
                 (Some((errors, conn)), Some(Failed(error)), Some(SentRequest(original))) => {
@@ -451,11 +451,7 @@ pub fn stall_limited(request: Request<Body>, stall: Duration) -> Request<Body> {
     if http_body::Body::is_end_stream(request.body()) {
         return request;
     }
-    let (mut parts, body) = request.into_parts();
-    let stalled = crate::guard::BodyStalled::default();
-    parts.extensions.insert(stalled.clone());
-    let body = boxed(crate::guard::StalledBody::new(body, stall, stalled));
-    Request::from_parts(parts, body)
+    request.map(|body| boxed(crate::guard::StalledBody::new(body, stall)))
 }
 
 /// What every response gets: `Date` from the shared clock (a proxied response keeps the upstream's,

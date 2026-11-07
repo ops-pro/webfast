@@ -52,7 +52,7 @@ pub use source::LocalFetch;
 
 use crate::body::{Body, empty};
 use crate::eventlog::{Event, EventLog, LogConfig};
-use crate::guard::{BodyTooLarge, LimitedBody, TooLargeError};
+use crate::guard::{LimitedBody, TooLargeError};
 use crate::handler::{decode_path, hostport_of, strip_port};
 use crate::matcher::{clean_path, host_matches, needs_clean};
 use anyhow::{Context, Result, anyhow, bail};
@@ -796,10 +796,8 @@ impl Api {
         }
         if media.format == BodyFormat::Unchecked {
             // Not read here: passed on under the size limit (the proxy answers 413 past it).
-            let too_large = parts.extensions.get::<BodyTooLarge>().cloned().unwrap_or_default();
-            parts.extensions.insert(too_large.clone());
-            let limited = LimitedBody::new(body, self.max_body as u64, too_large.clone());
-            if too_large.happened() {
+            let limited = LimitedBody::new(body, self.max_body as u64);
+            if limited.announced() {
                 return (
                     Err(Violation::new("request-body:too-large", "over max_body_size")
                         .with_status(StatusCode::PAYLOAD_TOO_LARGE)),

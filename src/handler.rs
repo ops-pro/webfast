@@ -156,6 +156,9 @@ pub struct Ctx {
     pub(crate) upstream_hooks: Option<&'static crate::extensions::UpstreamChecks>,
     /// The site has `handle_errors`: a failure carries the request as sent (`SentRequest`).
     pub(crate) for_errors: bool,
+    /// The request body's announced length is over a `request_body` limit: the proxy answers 413
+    /// without sending anything on.
+    pub body_too_large: bool,
     /// The request's headers as sent, kept before the routes first change them (`request_header`,
     /// `encode`'s If-None-Match), only when `for_errors`; unchanged, they are `req.headers`.
     /// Boxed: the `Ctx` is in every future of the chain, the map is rarely there.
@@ -258,6 +261,7 @@ impl Ctx {
             error: None,
             upstream_hooks: None,
             for_errors: false,
+            body_too_large: false,
             sent_headers: None,
         }
     }
@@ -1227,14 +1231,9 @@ fn limit_body(ctx: &mut Ctx, max: u64) {
     let Some(body) = ctx.body.take_if(|body| !http_body::Body::is_end_stream(body)) else {
         return;
     };
-    let too_large = ctx
-        .req
-        .extensions
-        .get::<crate::guard::BodyTooLarge>()
-        .cloned()
-        .unwrap_or_default();
-    ctx.req.extensions.insert(too_large.clone());
-    ctx.body = Some(crate::body::boxed(crate::guard::LimitedBody::new(body, max, too_large)));
+    let limited = crate::guard::LimitedBody::new(body, max);
+    ctx.body_too_large |= limited.announced();
+    ctx.body = Some(crate::body::boxed(limited));
 }
 
 fn strip_prefix(ctx: &mut Ctx, prefix: &str) {

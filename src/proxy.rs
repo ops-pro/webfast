@@ -21,7 +21,7 @@
 
 use crate::body::{Body, boxed};
 use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, UpstreamHeld};
-use crate::guard::{BodyStalled, BodyTooLarge, Place};
+use crate::guard::{Place, body_fault};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use crate::upstreams::{NoServer, Upstreams};
 use http::header::{CONNECTION, HOST, SET_COOKIE, UPGRADE};
@@ -244,8 +244,7 @@ impl ReverseProxy {
             return ctx.status(StatusCode::BAD_GATEWAY);
         }
         // `request_body`: a body whose length is over the limit is not sent anywhere.
-        let too_large = ctx.req.extensions.get::<BodyTooLarge>().cloned();
-        if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
+        if ctx.body_too_large {
             return ctx.status(StatusCode::PAYLOAD_TOO_LARGE);
         }
         // The checks bound to these upstreams (src/extensions.rs), on the request as it goes there,
@@ -292,7 +291,6 @@ impl ReverseProxy {
         };
         let path_and_query = ctx.req.uri.path_and_query().cloned();
         let method = ctx.req.method.clone();
-        let body_stalled = ctx.req.extensions.get::<BodyStalled>().cloned();
         let mut body = ctx.body.take();
         // Without a body the request can be retried on another upstream (lb_try_duration).
         let replayable = body.as_ref().is_none_or(http_body::Body::is_end_stream);
@@ -352,12 +350,15 @@ impl ReverseProxy {
             *request.headers_mut() = sending;
             let sent_at = timed.then(Instant::now);
             let sent = self.client.request(request);
+            // A failure: did the connection fail, did the response head run out of time, and was
+            // the client's body at fault (stalled, or over its limit while it was being sent).
+            let failed = |e: hyper_util::client::legacy::Error| (e.is_connect(), false, body_fault(&e));
             let result = match self.response_header_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
-                    Ok(r) => r.map_err(|e| (e.is_connect(), false)),
-                    Err(_) => Err((false, true)),
+                    Ok(r) => r.map_err(failed),
+                    Err(_) => Err((false, true, None)),
                 },
-                None => sent.await.map_err(|e| (e.is_connect(), false)),
+                None => sent.await.map_err(failed),
             };
             match result {
                 Ok(response) => {
@@ -371,16 +372,12 @@ impl ReverseProxy {
                     }
                     break Ok((response, lease, set_cookie.then_some(server)));
                 }
-                Err((connect, timed_out)) => {
-                    // The body went over its `request_body` limit while it was being sent.
-                    if too_large.as_ref().is_some_and(BodyTooLarge::happened) {
-                        tracing::debug!(upstream = %server.name, "the request body went over its limit");
-                        break Err(StatusCode::PAYLOAD_TOO_LARGE);
-                    }
-                    // The client stopped sending its body: its fault, not the upstream's.
-                    if body_stalled.as_ref().is_some_and(BodyStalled::happened) {
-                        tracing::debug!(upstream = %server.name, "the client stopped sending the request body");
-                        break Err(StatusCode::REQUEST_TIMEOUT);
+                Err((connect, timed_out, fault)) => {
+                    // The client's body was at fault (it stopped, or went over its `request_body`
+                    // limit while it was being sent): the client's failure, not the upstream's.
+                    if let Some(status) = fault {
+                        tracing::debug!(upstream = %server.name, %status, "the request body failed");
+                        break Err(status);
                     }
                     tracing::warn!(upstream = %server.name, address = %server.addr, connect, timed_out, "upstream request failed");
                     if let Some(passive) = passive {
