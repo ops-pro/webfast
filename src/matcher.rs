@@ -113,13 +113,15 @@ impl Matcher {
             Matcher::PathRegexp { name, re, names } => {
                 let path = ctx.clean_path();
                 let Some(caps) = re.captures(path) else { return false };
-                let groups = caps.iter().map(|g| g.map(|m| (m.start(), m.end()))).collect();
-                let text = path.to_string();
+                // The groups at their known count, one allocation; the path itself is not copied
+                // (the captures point into the request's, copied only before a rewrite).
+                let mut groups = Vec::with_capacity(re.captures_len());
+                groups.extend(caps.iter().map(|g| g.map(|m| (m.start(), m.end()))));
                 ctx.set_regexp(
                     name.clone(),
                     RegexCaptures {
-                        text,
-                        groups,
+                        text: None,
+                        groups: groups.into_boxed_slice(),
                         names: names.clone(),
                     },
                 );

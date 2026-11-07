@@ -26,6 +26,7 @@ use http::header::{CONTENT_TYPE, LOCATION};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, Uri};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -65,8 +66,11 @@ impl ConnInfo {
 /// Groups of a `path_regexp` match: byte ranges into the matched path.
 #[derive(Debug, Clone)]
 pub struct RegexCaptures {
-    pub text: String,
-    pub groups: Vec<Option<(usize, usize)>>,
+    /// The path matched; `None`: the request's cleaned path as it is now (no copy), made a copy
+    /// of its own before a rewrite changes the path (`Ctx::set_path_and_query`).
+    pub text: Option<String>,
+    /// One slot per group of the regexp, sized at config load (`captures_len`).
+    pub groups: Box<[Option<(usize, usize)>]>,
     pub names: Arc<[(String, usize)]>,
 }
 
@@ -98,8 +102,9 @@ enum Derived {
 pub struct HandlerError {
     pub status: StatusCode,
     /// `{err.message}`: what `error` was given; otherwise the status text (Caddy has the error's own
-    /// text where there is one, such as a proxy's network error).
-    pub message: String,
+    /// text where there is one, such as a proxy's network error). Borrowed for the status text:
+    /// a 404 costs no string.
+    pub message: Cow<'static, str>,
     /// The site root the request had when it failed: the error routes start with it (in Caddy
     /// `root` is a request variable, which they see).
     pub root: Option<Arc<FileStore>>,
@@ -140,7 +145,7 @@ pub struct Ctx {
     /// Response headers set by `header` before the handler that answers.
     pub pre_headers: HeaderMap,
     /// What deferred `header` and `encode` will do to the response, outermost first.
-    hooks: Vec<Hook>,
+    hooks: Hooks,
     /// The site's `encode` the request passed, if any: what a kept proxied answer is compressed
     /// with (src/proxy.rs, src/cache.rs). An `Arc` clone: no allocation.
     pub encode: Option<Arc<Encode>>,
@@ -177,9 +182,38 @@ enum Hook {
     },
 }
 
+/// The hooks of a request, outermost first. Two fit in the `Ctx` itself (`encode` and a deferred
+/// `header` is the usual most), so a site with `encode` allocates nothing for them; more go to a
+/// `Vec`.
+#[derive(Default)]
+struct Hooks {
+    inline: [Option<Hook>; 2],
+    more: Vec<Hook>,
+}
+
+impl Hooks {
+    fn push(&mut self, hook: Hook) {
+        for slot in &mut self.inline {
+            if slot.is_none() {
+                *slot = Some(hook);
+                return;
+            }
+        }
+        self.more.push(hook);
+    }
+
+    /// The innermost hook left.
+    fn pop(&mut self) -> Option<Hook> {
+        if let Some(hook) = self.more.pop() {
+            return Some(hook);
+        }
+        self.inline.iter_mut().rev().find_map(Option::take)
+    }
+}
+
 /// Applies the hooks to the response, innermost first.
-async fn finish(hooks: Vec<Hook>, mut response: Response<Body>) -> Response<Body> {
-    for hook in hooks.into_iter().rev() {
+async fn finish(mut hooks: Hooks, mut response: Response<Body>) -> Response<Body> {
+    while let Some(hook) = hooks.pop() {
         match hook {
             Hook::Headers { list, index } => {
                 if let Handler::Header { ops, .. } = &list[index].handler {
@@ -219,7 +253,7 @@ impl Ctx {
             regexps: Vec::new(),
             file_match: None,
             pre_headers: HeaderMap::new(),
-            hooks: Vec::new(),
+            hooks: Hooks::default(),
             encode: None,
             error: None,
             upstream_hooks: None,
@@ -283,33 +317,70 @@ impl Ctx {
         }
     }
 
-    /// Replaces path (decoded form, kept as given: no decode round trip) and query of the request
-    /// URI; the path is percent-encoded for the URI only where it has characters to escape.
-    pub fn set_path_and_query(&mut self, decoded_path: String, query: Option<&str>) {
-        let encoded: std::borrow::Cow<str> = utf8_percent_encode(&decoded_path, PATH).into();
-        let query = query.filter(|q| !q.is_empty());
-        let mut pq = String::with_capacity(encoded.len() + query.map_or(0, |q| q.len() + 1));
-        pq.push_str(&encoded);
+    /// Replaces path (decoded form, kept as given: no decode round trip; `None`: the path stays)
+    /// and query of the request URI, in one string made once: the path percent-encoded where it
+    /// has characters to escape, and the decoded form kept only where that changed it (otherwise
+    /// the URI's own path is the decoded path, without a copy).
+    pub fn set_path_and_query(&mut self, decoded_path: Option<&str>, query: Query<'_>) {
+        let uri = &self.req.uri;
+        let query = match query {
+            Query::Set(query) => Some(query),
+            Query::Keep => uri.query(),
+        }
+        .filter(|q| !q.is_empty());
+        let path = decoded_path.unwrap_or_else(|| uri.path());
+        let mut pq = String::with_capacity(path.len() + query.map_or(0, |q| q.len() + 1));
+        if decoded_path.is_some() {
+            for piece in utf8_percent_encode(path, PATH) {
+                pq.push_str(piece);
+            }
+        } else {
+            pq.push_str(path);
+        }
+        // Grew only by escapes: the URI's path is then not the decoded form.
+        let escaped = pq.len() != path.len();
         if let Some(query) = query {
             pq.push('?');
             pq.push_str(query);
         }
-        let Ok(pq) = PathAndQuery::from_maybe_shared(bytes::Bytes::from(pq)) else {
+        let Ok(pq) = PathAndQuery::from_maybe_shared(Bytes::from(pq)) else {
             return;
         };
-        let mut parts = self.req.uri.clone().into_parts();
-        parts.path_and_query = Some(pq);
-        if let Ok(uri) = Uri::from_parts(parts) {
-            self.req.uri = uri;
-            self.decoded = Some(decoded_path);
-            self.match_path = Derived::Unset;
-            self.clean_path = Derived::Unset;
+        // The regexps matched on the path as it is keep that text once it changes.
+        if decoded_path.is_some() && self.regexps.iter().any(|(_, caps)| caps.text.is_none()) {
+            let text = self.clean_path_now().to_string();
+            for (_, caps) in &mut self.regexps {
+                caps.text.get_or_insert_with(|| text.clone());
+            }
         }
+        // Taken, not cloned: the clone of a `Bytes` made from a `Vec` allocates its shared header.
+        let mut parts = std::mem::take(&mut self.req.uri).into_parts();
+        // An authority without a scheme (a CONNECT target) takes no path: `from_parts` would
+        // refuse it, so the URI stays as it is; otherwise it accepts (checked against http 1.x).
+        if parts.scheme.is_some() || parts.authority.is_none() {
+            parts.path_and_query = Some(pq);
+        }
+        self.req.uri = Uri::from_parts(parts).unwrap_or_default();
+        let Some(decoded_path) = decoded_path else {
+            return;
+        };
+        self.decoded = escaped.then(|| decoded_path.to_string());
+        self.match_path = Derived::Unset;
+        self.clean_path = Derived::Unset;
     }
 
     pub fn set_regexp(&mut self, name: Arc<str>, captures: RegexCaptures) {
         self.regexps.retain(|(n, _)| *n != name);
         self.regexps.push((name, captures));
+    }
+
+    /// The cleaned path as last computed (`clean_path`), without computing it: what a
+    /// `path_regexp` matched when its captures say `None`.
+    fn clean_path_now(&self) -> &str {
+        match &self.clean_path {
+            Derived::Own(path) => path,
+            _ => self.path(),
+        }
     }
 
     /// A group of what a regexp matcher captured, borrowed from the request.
@@ -320,7 +391,10 @@ impl Ctx {
             Err(_) => caps.names.iter().find(|(n, _)| n == group)?.1,
         };
         let (start, end) = (*caps.groups.get(index)?)?;
-        caps.text.get(start..end)
+        caps.text
+            .as_deref()
+            .unwrap_or_else(|| self.clean_path_now())
+            .get(start..end)
     }
 
     /// A response carrying the headers `header` set earlier (the response's own fields win).
@@ -369,7 +443,7 @@ impl Ctx {
 
     /// A handler failed: its bare status, marked for `handle_errors` (`message`: see
     /// `HandlerError`).
-    pub fn fail(&mut self, status: StatusCode, message: Option<String>) -> Response<Body> {
+    pub fn fail(&mut self, status: StatusCode, message: Option<Cow<'static, str>>) -> Response<Body> {
         let response = self.status(status);
         self.failed(response, message)
     }
@@ -396,18 +470,32 @@ impl Ctx {
 
     /// Marks a response as a handler's failure with its own status (and headers, such as a 405's
     /// `Allow`, which an error page keeps).
-    pub fn failed(&self, mut response: Response<Body>, message: Option<String>) -> Response<Body> {
+    pub fn failed(&self, mut response: Response<Body>, message: Option<Cow<'static, str>>) -> Response<Body> {
         self.sent_request(&mut response);
+        self.mark_failed(&mut response, message, None);
+        response
+    }
+
+    /// Whether a failure's mark is read: by the site's `handle_errors` routes (`for_errors`), or
+    /// in those routes themselves, where a failure gives the bare answer (`handle_error`).
+    fn marks_failures(&self) -> bool {
+        self.for_errors || self.error.is_some()
+    }
+
+    /// The `Failed` mark, only where something reads it: on a site without `handle_errors` a 404
+    /// costs no error, no `Arc` and no extensions map.
+    fn mark_failed(&self, response: &mut Response<Body>, message: Option<Cow<'static, str>>, zone: Option<Arc<str>>) {
+        if !self.marks_failures() {
+            return;
+        }
         let status = response.status();
-        let message = message.unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
-        let root = self.root.clone();
+        let message = message.unwrap_or_else(|| Cow::Borrowed(status.canonical_reason().unwrap_or("")));
         response.extensions_mut().insert(Failed(Arc::new(HandlerError {
             status,
             message,
-            root,
-            zone: None,
+            root: self.root.clone(),
+            zone,
         })));
-        response
     }
 
     /// A `rate_limit` zone refused the request: 429 with `Retry-After`, marked for
@@ -418,16 +506,18 @@ impl Ctx {
             .insert(http::header::RETRY_AFTER, crate::ratelimit::retry_after(wait));
         let mut response = self.status(StatusCode::TOO_MANY_REQUESTS);
         self.sent_request(&mut response);
-        let status = StatusCode::TOO_MANY_REQUESTS;
-        let message = status.canonical_reason().unwrap_or("").to_string();
-        response.extensions_mut().insert(Failed(Arc::new(HandlerError {
-            status,
-            message,
-            root: self.root.clone(),
-            zone: Some(zone),
-        })));
+        self.mark_failed(&mut response, None, Some(zone));
         response
     }
+}
+
+/// The query a rewritten URI gets (`Ctx::set_path_and_query`).
+#[derive(Debug, Clone, Copy)]
+pub enum Query<'a> {
+    /// The request's own stays.
+    Keep,
+    /// This one (empty: none).
+    Set(&'a str),
 }
 
 /// A failed request's second chance: the site's `handle_errors` routes run on the request as the
@@ -986,11 +1076,15 @@ impl Next {
         }
     }
 
+    /// The rest of the chain as a boxed future: what a handler that wraps the chain awaits
+    /// (`answer`, the file server's `pass_thru`), since a future cannot contain itself.
     pub fn run(self, ctx: Ctx) -> BoxFuture<'static, Response<Body>> {
         Box::pin(self.walk(ctx))
     }
 
-    async fn walk(mut self, mut ctx: Ctx) -> Response<Body> {
+    /// Runs the chain on the request. The outermost call: every recursive one goes through `run`,
+    /// so this future is awaited in place, in the connection's own task, without a box of its own.
+    pub async fn walk(mut self, mut ctx: Ctx) -> Response<Body> {
         loop {
             let list = self.list.clone();
             let mut found = None;
@@ -1090,22 +1184,38 @@ impl Next {
     }
 }
 
-fn rewrite(ctx: &mut Ctx, to: &Template) {
-    let mut target = to.render(ctx);
-    // The query: the target's own, or the request's (from a cheap copy of the URI).
-    let uri = ctx.req.uri.clone();
-    let query = match target.find('?') {
-        Some(i) => {
-            let query = target[i + 1..].to_string();
-            target.truncate(i);
-            Some(query)
-        }
-        None => None,
-    };
-    if target.is_empty() {
-        target = ctx.path().to_string();
+/// `f` of a string buffer the thread keeps (let go of past 1 KiB): the rewritten target is
+/// rendered into it and read from it, with no string of its own.
+fn with_scratch<R>(f: impl FnOnce(&mut String) -> R) -> R {
+    const KEPT: usize = 1024;
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     }
-    ctx.set_path_and_query(target, query.as_deref().or(uri.query()));
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut text) => {
+            text.clear();
+            let out = f(&mut text);
+            if text.capacity() > KEPT {
+                *text = String::new();
+            }
+            out
+        }
+        Err(_) => f(&mut String::new()),
+    })
+}
+
+/// `rewrite`: the target's path and query replace the request's; a target without a query keeps
+/// the request's, one with an empty path (`?q=1`) keeps the request's path, as in Caddy. The
+/// target is rendered into the thread's buffer and the URI made from it in one string.
+fn rewrite(ctx: &mut Ctx, to: &Template) {
+    with_scratch(|target| {
+        to.render_into(ctx, target);
+        let (path, query) = match target.find('?') {
+            Some(i) => (&target[..i], Query::Set(&target[i + 1..])),
+            None => (target.as_str(), Query::Keep),
+        };
+        ctx.set_path_and_query((!path.is_empty()).then_some(path), query);
+    });
 }
 
 /// The request body limited to `max` bytes (0: no limit, as in Caddy); several limits all hold.
@@ -1135,15 +1245,16 @@ fn strip_prefix(ctx: &mut Ctx, prefix: &str) {
         && path.is_char_boundary(prefix.len())
         && path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
     if has_prefix {
-        // The new path made once, from the borrowed one (no copy of the whole path first).
-        let rest = &path[prefix.len()..];
-        let mut stripped = String::with_capacity(rest.len() + 1);
-        if !rest.starts_with('/') {
-            stripped.push('/');
-        }
-        stripped.push_str(rest);
-        let uri = ctx.req.uri.clone();
-        ctx.set_path_and_query(stripped, uri.query());
+        // The rest of the path, with its leading slash, in the thread's buffer: the URI is the one
+        // string made.
+        with_scratch(|stripped| {
+            let rest = &ctx.path()[prefix.len()..];
+            if !rest.starts_with('/') {
+                stripped.push('/');
+            }
+            stripped.push_str(rest);
+            ctx.set_path_and_query(Some(stripped), Query::Keep);
+        });
     }
 }
 
@@ -1287,7 +1398,7 @@ impl Handler {
             }
             Handler::Error { status, message } => {
                 let message = message.render(&ctx);
-                ctx.fail(*status, Some(message))
+                ctx.fail(*status, Some(Cow::Owned(message)))
             }
             // The proxy's future is large: boxed on its own, so the chain's stays small.
             Handler::Proxy(proxy) => Box::pin(proxy.serve(ctx)).await,
@@ -1459,5 +1570,156 @@ mod tests {
             strip_prefix(&mut c, "/api");
             assert_eq!(c.path(), expected, "{path}");
         }
+        // `handle_path`: the query stays, escapes stay escaped in the URI and decoded in the path.
+        let mut c = ctx("/api/a%20b/caf%C3%A9?x=1&y=2");
+        strip_prefix(&mut c, "/api");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/a%20b/caf%C3%A9?x=1&y=2");
+        assert_eq!(c.path(), "/a b/café");
+        assert_eq!(c.req.uri.query(), Some("x=1&y=2"));
+        let mut c = ctx("/api/plain?q");
+        strip_prefix(&mut c, "/api");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/plain?q");
+        assert_eq!(c.path(), "/plain");
+        assert!(c.decoded.is_none(), "the URI's path is the decoded path");
+    }
+
+    #[test]
+    fn rewrites_make_the_uri_once_and_keep_what_the_target_leaves() {
+        let rewritten = |path: &str, to: &str| {
+            let mut c = ctx(path);
+            rewrite(&mut c, &Template::parse(to).unwrap());
+            c
+        };
+        // A plain target: path and query replaced, the request's query dropped.
+        let c = rewritten("/old?a=1", "/new?b=2");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/new?b=2");
+        assert_eq!(c.path(), "/new");
+        assert!(c.decoded.is_none());
+        // No query in the target: the request's stays.
+        let c = rewritten("/old?a=1", "/new");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/new?a=1");
+        // An empty query in the target drops the request's.
+        let c = rewritten("/old?a=1", "/new?");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/new");
+        // Only a query: the path stays as it was, escapes and all, and so does its decoded form.
+        let c = rewritten("/a%2Fb%20c?a=1", "?b=2");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/a%2Fb%20c?b=2");
+        assert_eq!(c.path(), "/a/b c");
+        // Placeholders: the path decoded, the query as sent.
+        let c = rewritten("/en/page?q=%22x%22", "/index.php?p={path}&{query}");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/index.php?p=/en/page&q=%22x%22");
+        assert_eq!(c.path(), "/index.php");
+        // A target that is no URI (a space in the query) leaves the request as it is.
+        let c = rewritten("/en/page%20one?q=1", "/index.php?p={path}");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/en/page%20one?q=1");
+        assert_eq!(c.path(), "/en/page one");
+        // Characters to escape in the target: escaped in the URI, kept in the path.
+        let c = rewritten("/x", "/a b/café/%7E?k=v");
+        assert_eq!(c.req.uri.path_and_query().unwrap(), "/a%20b/caf%C3%A9/%257E?k=v");
+        assert_eq!(c.path(), "/a b/café/%7E");
+        assert_eq!(c.decoded.as_deref(), Some("/a b/café/%7E"));
+        // The derived paths follow the rewrite.
+        let mut c = rewritten("/Old//x", "/New//y");
+        assert_eq!(c.match_path(), "/new/y");
+        assert_eq!(c.clean_path(), "/New/y");
+        // An absolute target keeps scheme and authority of the request.
+        let c = rewritten("http://a.test/old?a=1", "/new");
+        assert_eq!(c.req.uri.to_string(), "http://a.test/new?a=1");
+        assert_eq!(c.hostport(), "a.test");
+    }
+
+    #[test]
+    fn regexp_captures_point_into_the_path_until_a_rewrite_changes_it() {
+        let mut c = ctx("/blog/2024/hello.html");
+        let re = regex::Regex::new(r"^/blog/(\d+)/(?P<slug>[^/]+)\.html$").unwrap();
+        let m = crate::matcher::Matcher::regexp("post", re);
+        assert!(m.matches(&mut c));
+        assert_eq!(c.regexp("post", "1"), Some("2024"));
+        assert_eq!(c.regexp("post", "slug"), Some("hello"));
+        assert_eq!(c.regexp("post", "0"), Some("/blog/2024/hello.html"));
+        assert_eq!(c.regexp("post", "3"), None);
+        assert_eq!(c.regexp("other", "1"), None);
+        assert!(c.regexps[0].1.text.is_none(), "no copy while the path stays");
+        // Rewritten with the groups: they still read the path they matched.
+        rewrite(&mut c, &Template::parse("/posts/{re.post.slug}-{re.post.1}").unwrap());
+        assert_eq!(c.path(), "/posts/hello-2024");
+        assert_eq!(c.regexp("post", "1"), Some("2024"));
+        assert_eq!(c.regexp("post", "slug"), Some("hello"));
+        assert_eq!(c.regexps[0].1.text.as_deref(), Some("/blog/2024/hello.html"));
+        // Matched on a path that needed cleaning: the captures are in the cleaned one.
+        let mut c = ctx("/blog//2025/./x.html");
+        assert!(m.matches(&mut c));
+        assert_eq!(c.regexp("post", "slug"), Some("x"));
+        // `handle_path` strips from the path as sent (not cleaned), as Caddy does.
+        strip_prefix(&mut c, "/blog");
+        assert_eq!(c.path(), "//2025/./x.html");
+        assert_eq!(c.regexp("post", "1"), Some("2025"));
+        assert_eq!(c.regexp("post", "0"), Some("/blog/2025/x.html"));
+    }
+
+    #[test]
+    fn failures_are_marked_only_where_something_reads_the_mark() {
+        let mut c = ctx("/missing");
+        let plain = c.fail(StatusCode::NOT_FOUND, None);
+        assert_eq!(plain.status(), StatusCode::NOT_FOUND);
+        assert!(
+            plain.extensions().get::<Failed>().is_none(),
+            "no handle_errors: nothing reads it"
+        );
+        assert!(plain.extensions().get::<SentRequest>().is_none());
+        let mut c = ctx("/missing");
+        c.for_errors = true;
+        let marked = c.fail(StatusCode::NOT_FOUND, None);
+        let Failed(error) = marked.extensions().get::<Failed>().unwrap();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(matches!(error.message, Cow::Borrowed("Not Found")));
+        assert!(marked.extensions().get::<SentRequest>().is_some());
+        let with_text = c.fail(StatusCode::FORBIDDEN, Some("Private area".into()));
+        let Failed(error) = with_text.extensions().get::<Failed>().unwrap();
+        assert_eq!(error.message, "Private area");
+        // In the error routes themselves (`handle_error` reads the mark, the request is not kept).
+        let mut c = ctx("/404.html");
+        c.error = Some(error.clone());
+        let again = c.fail(StatusCode::NOT_FOUND, None);
+        assert!(again.extensions().get::<Failed>().is_some());
+        assert!(again.extensions().get::<SentRequest>().is_none());
+    }
+
+    #[tokio::test]
+    async fn hooks_apply_innermost_first_beyond_the_inline_two() {
+        let mut hooks = Hooks::default();
+        let op = |name: &str, value: &str| {
+            vec![RenderedOp::Set(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                Some(HeaderValue::from_str(value).unwrap()),
+            )]
+        };
+        for i in 0..4 {
+            hooks.push(Hook::Rendered(op("x-order", &i.to_string())));
+        }
+        assert!(hooks.inline.iter().all(Option::is_some) && hooks.more.len() == 2);
+        let mut order = Vec::new();
+        while let Some(Hook::Rendered(ops)) = hooks.pop() {
+            let RenderedOp::Set(_, Some(value)) = &ops[0] else {
+                panic!()
+            };
+            order.push(value.to_str().unwrap().to_string());
+        }
+        assert_eq!(order, ["3", "2", "1", "0"]);
+        // The outermost `header` is applied last, so its value is what the response has.
+        let mut hooks = Hooks::default();
+        hooks.push(Hook::Rendered(op("x-who", "outer")));
+        hooks.push(Hook::Rendered(op("x-who", "inner")));
+        let response = finish(hooks, Response::new(empty())).await;
+        assert_eq!(response.headers()["x-who"], "outer");
+        // The chain's own future is awaited unboxed by the connection: its size is what every
+        // request puts on the connection's task; the handlers that recurse box theirs (`run`).
+        let walk = Next::start(Arc::from(Vec::<Route>::new())).walk(ctx("/"));
+        assert!(
+            std::mem::size_of_val(&walk) < 16 * 1024,
+            "{} bytes",
+            std::mem::size_of_val(&walk)
+        );
+        assert_eq!(walk.await.status(), StatusCode::OK);
     }
 }
