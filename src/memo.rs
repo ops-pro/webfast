@@ -12,15 +12,21 @@
 //! prepared for each and any Accept-Encoding finds its own. Everything else goes through the chain
 //! as before: other paths or other spellings of them, ranges, If-Match, an If-None-Match that is
 //! not exactly the answer's ETag (a redirect has none), methods other than GET and HEAD.
+//!
+//! A site whose routes answer every request alike — a `respond` without placeholders, before it
+//! only `root` and fixed `header`s, none behind a matcher (a health or placeholder site) — gets
+//! that one answer, worked out by running its chain once, for any method, path and header.
 
 use crate::body::{Body, empty, full};
 use crate::encode::AcceptEncoding;
 use crate::files::{FileEntry, FileStore};
-use crate::handler::{ConnInfo, Ctx, Handler, HeaderOp, Next, Route, encode_path};
+use crate::handler::{ConnInfo, Ctx, Handler, HeaderOp, Next, Route, Value, encode_path};
 use crate::matcher::{Matcher, MatcherSet};
 use crate::static_files::AVAILABLE_DICTIONARY;
+use bytes::Bytes;
 use http::header::{ACCEPT_ENCODING, ETAG, IF_MATCH, IF_NONE_MATCH, RANGE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
+use http_body_util::BodyExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -91,6 +97,17 @@ pub struct Answers {
     paths: FxHashMap<Box<str>, PerSignature>,
     /// Bytes of the header values kept for good (interned).
     strings: usize,
+    /// The site answers every request alike (`constant`): that answer, whatever the request.
+    constant: Option<Constant>,
+}
+
+/// The one answer of a site whose routes answer every request alike: a `respond` without
+/// placeholders, before it only `root` and `header` with fixed values, none of them behind a
+/// matcher or in a `handle` group. Worked out by running the chain once.
+struct Constant {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
 }
 
 struct Answer {
@@ -124,6 +141,13 @@ impl Answer {
 impl Answers {
     /// The ready answer for this request, if there is one.
     pub fn answer(&self, request: &http::request::Parts) -> Option<Response<Body>> {
+        // Any method, any path, any header: the chain would give this whatever they are.
+        if let Some(constant) = &self.constant {
+            let mut response = Response::new(full(constant.body.clone()));
+            *response.status_mut() = constant.status;
+            *response.headers_mut() = with_room(&constant.headers);
+            return Some(response);
+        }
         let head = match request.method {
             Method::GET => false,
             Method::HEAD => true,
@@ -186,6 +210,9 @@ impl Answers {
         }
         let mut seen = FxHashSet::default();
         let mut total = self.strings;
+        if let Some(constant) = &self.constant {
+            total += size_of::<Constant>() + map(&constant.headers) + constant.body.len();
+        }
         for (path, answers) in &self.paths {
             total += path.len() + size_of::<(Box<str>, PerSignature)>() + 8;
             total += answers.len() * size_of::<Option<Arc<Answer>>>();
@@ -205,7 +232,7 @@ impl Answers {
         for answer in self.paths.values().flat_map(|answers| answers.iter().flatten()) {
             seen.insert(Arc::as_ptr(answer));
         }
-        seen.len()
+        seen.len() + usize::from(self.constant.is_some())
     }
 
     /// Works the answers out by running `routes` for every path that may serve a file, the paths
@@ -213,6 +240,14 @@ impl Answers {
     /// `None` when the routes look at more of a request than its path (then nothing can be
     /// prepared).
     pub fn prepare(routes: &Arc<[Route]>, tls: bool) -> Option<Answers> {
+        if constant(routes) {
+            return Constant::prepare(routes, tls).map(|constant| Answers {
+                signatures: Vec::new(),
+                paths: FxHashMap::default(),
+                strings: 0,
+                constant: Some(constant),
+            });
+        }
         if !decided_by_path(routes) {
             return None;
         }
@@ -265,8 +300,80 @@ impl Answers {
             signatures,
             paths,
             strings,
+            constant: None,
         })
     }
+}
+
+impl Constant {
+    /// The answer of the chain to a GET of `/`, the same as to any request (`constant`).
+    fn prepare(routes: &Arc<[Route]>, tls: bool) -> Option<Constant> {
+        let conn = Arc::new(ConnInfo {
+            remote: SocketAddr::from(([127, 0, 0, 1], 0)),
+            tls,
+            trusted: false,
+            sni: None,
+        });
+        // On a thread of its own with its own runtime, as the files' answers: this is called from
+        // the server's start, itself on a runtime.
+        let (parts, body) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    runtime.block_on(async {
+                        let response = run(routes, &conn, "/", "", None).await?;
+                        let (parts, body) = response.into_parts();
+                        let body = body.collect().await.ok()?.to_bytes();
+                        Some((parts, body))
+                    })
+                })
+                .join()
+                .ok()
+                .flatten()
+        })?;
+        let mut strings = FxHashSet::default();
+        Some(Constant {
+            status: parts.status,
+            headers: permanent(&parts.headers, &mut strings),
+            body,
+        })
+    }
+}
+
+/// Whether the routes answer every request alike (`Constant`): reached in order, each route before
+/// the `respond` has no matcher and no `handle` group (a group's run skips the rest of it) and only
+/// sets the root or fixed response headers; the `respond` has no placeholders and is not 103 (Early
+/// Hints go on to the next route).
+fn constant(routes: &[Route]) -> bool {
+    for route in routes {
+        if route.matcher.is_some() || route.group.is_some() {
+            return false;
+        }
+        match &route.handler {
+            Handler::Root(_) => {}
+            Handler::Header {
+                ops, dynamic: false, ..
+            } => {
+                let fixed = ops.iter().all(|op| match op {
+                    HeaderOp::Set(_, value) | HeaderOp::Add(_, value) | HeaderOp::Default(_, value) => {
+                        matches!(value, Value::Static(_))
+                    }
+                    HeaderOp::Delete(_) | HeaderOp::DeletePrefix(_) => true,
+                });
+                if !fixed {
+                    return false;
+                }
+            }
+            Handler::Respond { status, body, .. } => {
+                return *status != Some(StatusCode::EARLY_HINTS) && body.is_ready();
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 impl Answer {

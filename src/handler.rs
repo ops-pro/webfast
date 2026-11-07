@@ -905,6 +905,11 @@ impl RespondBody {
     pub fn is_empty(&self) -> bool {
         self.template.is_empty()
     }
+
+    /// The text has no placeholders: every request gets the same.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.is_some()
+    }
 }
 
 /// The type of a `respond` body: JSON when it is an object or an array, else plain text.

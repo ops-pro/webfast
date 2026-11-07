@@ -69,3 +69,74 @@ async fn respond_types_its_text_whether_made_once_or_per_request() {
     }
     running.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test]
+async fn a_site_that_answers_every_request_alike_answers_ready_as_the_chain_does() {
+    // The same routes, ready and through the chain (a matcher that takes every request keeps the
+    // routes from being prepared, and changes nothing else).
+    let routes = "\theader X-Fixed one\n\theader -Server\n\theader +X-Many a\n\theader +X-Many b\n\trespond `{\"ok\": true}` 202\n";
+    let ready = format!("http://ready.test:0 {{\n{routes}}}\n");
+    let chain = format!(
+        "http://chain.test:0 {{\n\t@all path *\n\theader @all X-Fixed one\n{}}}\n",
+        routes.replacen("\theader X-Fixed one\n", "", 1)
+    );
+    let load = |text: &str| {
+        let file = webfast::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
+        webfast::load_parsed(&file, 1 << 24).unwrap()
+    };
+    let config = load(&ready);
+    let prepared = webfast::memo::Answers::prepare(&config.servers[0].sites[0].routes, false).expect("ready");
+    assert_eq!(
+        (prepared.answers(), prepared.paths()),
+        (1, 0),
+        "one answer for every path"
+    );
+    assert!(
+        webfast::memo::Answers::prepare(&load(&chain).servers[0].sites[0].routes, false)
+            .is_none_or(|a| a.answers() == 0),
+        "behind a matcher: not prepared"
+    );
+    let ready = server::start(config).await.unwrap();
+    let chain = server::start(load(&chain)).await.unwrap();
+    let client: Client<HttpConnector, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let answer = |running: &server::Running, method: &'static str, path: &'static str| {
+        let port = running.bound[0].1.port();
+        let host = if std::ptr::eq(running, &ready) {
+            "ready.test"
+        } else {
+            "chain.test"
+        };
+        let client = client.clone();
+        async move {
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("http://127.0.0.1:{port}{path}"))
+                .header("host", host)
+                .header("accept-encoding", "gzip")
+                .body(Empty::new())
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            let status = response.status();
+            let mut headers = response.headers().clone();
+            headers.remove("date");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, headers, body)
+        }
+    };
+    for (method, path) in [
+        ("GET", "/"),
+        ("GET", "/a/b?c=d"),
+        ("HEAD", "/x"),
+        ("POST", "/form"),
+        ("DELETE", "/"),
+    ] {
+        let got = answer(&ready, method, path).await;
+        assert_eq!(got, answer(&chain, method, path).await, "{method} {path}");
+        assert_eq!(got.0, StatusCode::ACCEPTED);
+        assert_eq!(got.1.get("x-fixed").unwrap(), "one");
+        assert_eq!(got.1.get_all("x-many").iter().count(), 2);
+        assert_eq!(got.1.get("content-type").unwrap(), "application/json");
+    }
+    ready.shutdown(Duration::from_secs(1)).await;
+    chain.shutdown(Duration::from_secs(1)).await;
+}
