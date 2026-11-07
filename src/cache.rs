@@ -836,7 +836,10 @@ impl Entry {
         let body = encoding
             .and_then(|e| self.encoded[e as usize].as_ref())
             .unwrap_or(&self.identity);
-        let mut headers = self.headers.clone();
+        // With room for the fields added below (ETag, Vary, Age, Cache-Status, Content-Length,
+        // Content-Encoding): a clone has none, and would grow on the way.
+        let mut headers = HeaderMap::with_capacity(self.headers.len() + 6);
+        headers.extend(self.headers.iter().map(|(name, value)| (name.clone(), value.clone())));
         let etag = self.etag_for(encoding);
         if let Some(etag) = &etag {
             headers.insert(ETAG, etag.clone());
