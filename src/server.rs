@@ -12,7 +12,6 @@ use crate::config::{Config, Limits, Protocols, ReloadMode, ServerConfig, Site};
 use crate::extensions::{At, Client, Hooks, RequestCheck};
 use crate::guard::{Activity, Admission, Place, Tracked};
 use crate::handler::{ConnInfo, Ctx, Failed, Next, Route, SentRequest, hostport_of, strip_port};
-use crate::matcher::host_matches;
 use crate::tls::{self, CertResolver};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -59,6 +58,8 @@ pub struct ServerState {
 /// A port's sites, and whose word on the client's address is taken.
 pub struct Routing {
     sites: Vec<Site>,
+    /// The sites' host patterns, by name (`select`).
+    index: crate::matcher::HostIndex,
     trusted: Vec<IpNet>,
     strict: bool,
     client_ip_headers: Vec<HeaderName>,
@@ -176,6 +177,24 @@ impl ServerState {
 }
 
 impl Routing {
+    fn new(
+        sites: Vec<Site>,
+        trusted: Vec<IpNet>,
+        strict: bool,
+        client_ip_headers: Vec<HeaderName>,
+        generation: u64,
+    ) -> Routing {
+        let index = crate::matcher::HostIndex::new(sites.iter().map(|site| site.hosts.as_slice()));
+        Routing {
+            sites,
+            index,
+            trusted,
+            strict,
+            client_ip_headers,
+            generation,
+        }
+    }
+
     pub(crate) fn sites(&self) -> &[Site] {
         &self.sites
     }
@@ -184,19 +203,19 @@ impl Routing {
         self.trusted.iter().any(|n| n.contains(&peer))
     }
 
-    /// The site for the request's host; the host is looked at only when a site names hosts.
+    /// The site for the request's host: the first, in order, that takes any host or names this
+    /// one (exactly or by a wildcard). The host is looked at only when the first site names hosts.
     fn select(&self, parts: &http::request::Parts) -> Option<&Site> {
-        let mut host: Option<&str> = None;
-        for site in &self.sites {
-            if site.hosts.is_empty() {
-                return Some(site);
-            }
-            let host = *host.get_or_insert_with(|| strip_port(hostport_of(parts)));
-            if site.hosts.iter().any(|h| host_matches(h, host)) {
-                return Some(site);
-            }
+        let any = self.index.any().first().copied();
+        if any == Some(0) {
+            return self.sites.first();
         }
-        None
+        let host = strip_port(hostport_of(parts));
+        let named = self.index.lookup(host, |exact, wildcard| {
+            exact.first().into_iter().chain(wildcard.first()).min().copied()
+        });
+        let first = any.into_iter().chain(named).min()?;
+        self.sites.get(first as usize)
     }
 
     fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
@@ -600,13 +619,13 @@ impl Running {
             let port = &self.ports[i];
             let state = &port.state;
             let generation = state.routing.load().generation + 1;
-            let old = state.routing.swap(Arc::new(Routing {
-                sites: server.sites,
-                trusted: server.trusted_proxies,
-                strict: server.trusted_strict,
-                client_ip_headers: server.client_ip_headers,
+            let old = state.routing.swap(Arc::new(Routing::new(
+                server.sites,
+                server.trusted_proxies,
+                server.trusted_strict,
+                server.client_ip_headers,
                 generation,
-            }));
+            )));
             // WEB_RELOAD=lazy or drain: connections keep the old routing while they are open (also
             // one being accepted right now, which may not hold it yet: kept whatever its count).
             if state.mode.pins() {
@@ -831,13 +850,13 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
     }
     let state_tls = acceptor.is_some();
     let mut state = ServerState {
-        routing: ArcSwap::from_pointee(Routing {
+        routing: ArcSwap::from_pointee(Routing::new(
             sites,
-            trusted: trusted_proxies,
-            strict: trusted_strict,
+            trusted_proxies,
+            trusted_strict,
             client_ip_headers,
-            generation: 0,
-        }),
+            0,
+        )),
         mode: reload,
         reloads: watch::channel(0).0,
         retired: Mutex::new(Vec::new()),
@@ -1108,13 +1127,13 @@ mod tests {
     use super::*;
 
     fn routing(strict: bool) -> Routing {
-        Routing {
-            sites: Vec::new(),
-            trusted: vec!["10.0.0.0/8".parse().unwrap(), "172.16.0.0/12".parse().unwrap()],
+        Routing::new(
+            Vec::new(),
+            vec!["10.0.0.0/8".parse().unwrap(), "172.16.0.0/12".parse().unwrap()],
             strict,
-            client_ip_headers: vec![HeaderName::from_static("x-forwarded-for")],
-            generation: 0,
-        }
+            vec![HeaderName::from_static("x-forwarded-for")],
+            0,
+        )
     }
 
     #[test]

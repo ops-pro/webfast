@@ -345,6 +345,77 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     pattern.eq_ignore_ascii_case(host)
 }
 
+/// The host patterns of several owners (a port's sites, its certificates), indexed when they are
+/// loaded: for a name, which owners name it exactly, which by a `*.` wildcard, and which take any
+/// host, each list in the owners' order. What `host_matches` decides owner by owner, at the cost of
+/// one or two hash lookups however many owners there are.
+#[derive(Debug)]
+pub(crate) struct HostIndex {
+    exact: rustc_hash::FxHashMap<Box<str>, Vec<u32>>,
+    wildcard: rustc_hash::FxHashMap<Box<str>, Vec<u32>>,
+    any: Vec<u32>,
+}
+
+impl HostIndex {
+    /// `owners`: each owner's patterns; none: any host.
+    pub(crate) fn new<'a>(owners: impl IntoIterator<Item = &'a [String]>) -> HostIndex {
+        fn add(map: &mut rustc_hash::FxHashMap<Box<str>, Vec<u32>>, key: &str, owner: u32) {
+            let list = map.entry(key.to_ascii_lowercase().into_boxed_str()).or_default();
+            // An owner that names a host twice is listed once.
+            if list.last() != Some(&owner) {
+                list.push(owner);
+            }
+        }
+        let mut index = HostIndex {
+            exact: Default::default(),
+            wildcard: Default::default(),
+            any: Vec::new(),
+        };
+        for (owner, patterns) in owners.into_iter().enumerate() {
+            let owner = owner as u32;
+            if patterns.is_empty() {
+                index.any.push(owner);
+            }
+            for pattern in patterns {
+                match pattern.strip_prefix("*.") {
+                    Some(suffix) => add(&mut index.wildcard, suffix, owner),
+                    None => add(&mut index.exact, pattern, owner),
+                }
+            }
+        }
+        index
+    }
+
+    /// The owners that take any host.
+    pub(crate) fn any(&self) -> &[u32] {
+        &self.any
+    }
+
+    /// `f` of the owners that name `host` exactly and of those that name it by a wildcard (one label
+    /// before the suffix), the host compared in any ASCII case.
+    pub(crate) fn lookup<R>(&self, host: &str, f: impl FnOnce(&[u32], &[u32]) -> R) -> R {
+        let mut buffer = [0u8; 256];
+        let owned;
+        let lower: &str = if host.len() <= buffer.len() {
+            let buffer = &mut buffer[..host.len()];
+            buffer.copy_from_slice(host.as_bytes());
+            buffer.make_ascii_lowercase();
+            // ASCII lowercasing keeps the bytes valid UTF-8.
+            std::str::from_utf8(buffer).unwrap_or_default()
+        } else {
+            owned = host.to_ascii_lowercase();
+            &owned
+        };
+        let exact = self.exact.get(lower).map_or(&[][..], Vec::as_slice);
+        // `*.example.com` takes `www.example.com`: the label is everything before the first dot.
+        let wildcard = match lower.split_once('.') {
+            Some((label, suffix)) if !label.is_empty() => self.wildcard.get(suffix).map_or(&[][..], Vec::as_slice),
+            _ => &[],
+        };
+        f(exact, wildcard)
+    }
+}
+
 /// Header value with `*` wildcards at the ends.
 fn value_matches(want: &str, value: &str) -> bool {
     if want == "*" {
@@ -555,5 +626,58 @@ mod tests {
         assert!(!host_matches("*.example.com", "www.example.co"));
         assert!(glob(b"/x/[a-c]?", b"/x/bz"));
         assert!(!glob(b"/x/[^a-c]", b"/x/b"));
+    }
+
+    #[test]
+    fn the_host_index_finds_what_host_matches_finds() {
+        let owners: Vec<Vec<String>> = [
+            &["example.com", "www.example.com"][..],
+            &["*.example.com"],
+            &[],
+            &["Other.Test", "*.other.test", "other.test"],
+            &["*.example.com", "api.example.com"],
+            &["*."],
+            &["*.b.c"],
+        ]
+        .iter()
+        .map(|hosts| hosts.iter().map(|h| h.to_ascii_lowercase()).collect())
+        .collect();
+        let index = HostIndex::new(owners.iter().map(Vec::as_slice));
+        let hosts = [
+            "example.com",
+            "EXAMPLE.com",
+            "www.example.com",
+            "WWW.Example.COM",
+            "api.example.com",
+            "a.b.example.com",
+            ".example.com",
+            "example.co",
+            "other.test",
+            "x.OTHER.test",
+            "abc.",
+            "a.b.",
+            "x.b.c",
+            "a.x.b.c",
+            "",
+            ".",
+            "д.example.com",
+            &"a".repeat(300),
+        ];
+        for host in hosts {
+            let want = |exact: bool| -> Vec<u32> {
+                (0..owners.len() as u32)
+                    .filter(|&i| {
+                        owners[i as usize]
+                            .iter()
+                            .any(|p| p.starts_with("*.") != exact && host_matches(p, host))
+                    })
+                    .collect()
+            };
+            index.lookup(host, |exact, wildcard| {
+                assert_eq!(exact, want(true).as_slice(), "exact {host:?}");
+                assert_eq!(wildcard, want(false).as_slice(), "wildcard {host:?}");
+            });
+        }
+        assert_eq!(index.any(), &[2]);
     }
 }
