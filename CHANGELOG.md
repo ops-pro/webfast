@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The client's JA4 fingerprint** (FoxIO's JA4, BSD 3-Clause): over TLS on TCP the handshake
+  reads the ClientHello through a stream that keeps a copy of those first bytes (no `peek`, no
+  second read; 16 KiB at most), and the fingerprint is worked out once per connection, after the
+  handshake, into `ConnInfo::ja4` (36 characters held inline, `None` for plain HTTP, HTTP/3 and a
+  hello that cannot be read). `webfast_core::ja4` parses a hello (records joined, GREASE left out)
+  and gives JA4 and JA4_r, checked against the specification's example. A `ConnInfo` made by hand
+  needs `ja4: None`; `ServerState::connection_tls` takes the fingerprint, `connection_named` stays.
 - A new certificate set (`tls` files re-read, an ACME renewal) is indexed before the lock is
   taken: handshakes and the host check wait only for the swap, not for the index to be built.
 - A `respond` body with placeholders is checked for being JSON (its Content-Type) without

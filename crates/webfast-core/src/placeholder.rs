@@ -426,6 +426,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         let (parts, body) = http::Request::get("/a%20b/c.html?x=1+2")
             .header("host", "Example.COM:8443")

@@ -259,6 +259,7 @@ impl Answers {
             tls,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         let (signatures, accepts): (Vec<u16>, Vec<String>) = every_preference().into_iter().unzip();
         let accepts: Arc<[String]> = accepts.into();
@@ -313,6 +314,7 @@ impl Constant {
             tls,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         // On a thread of its own with its own runtime, as the files' answers: this is called from
         // the server's start, itself on a runtime.

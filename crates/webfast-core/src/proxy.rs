@@ -777,6 +777,7 @@ mod tests {
             tls: false,
             trusted,
             sni: None,
+            ja4: None,
         });
         let mut builder = Request::get("/api/x").header("host", "example.test");
         for (name, value) in headers {

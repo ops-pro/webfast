@@ -807,6 +807,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         };
         let client = Client {
             ip: conn.remote.ip(),
@@ -910,6 +911,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         let (req, body) = http::Request::get("/").body(crate::body::empty()).unwrap().into_parts();
         let mut ctx = Ctx::new(conn.clone(), req, body, conn.remote.ip());

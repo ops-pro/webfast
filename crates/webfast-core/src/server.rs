@@ -102,6 +102,7 @@ impl ConnState {
             tls: self.info.tls,
             trusted,
             sni: self.info.sni.clone(),
+            ja4: self.info.ja4,
         })
     }
 
@@ -161,6 +162,17 @@ impl ServerState {
     /// plain HTTP): its facts, worked out with the routing in use now — which it keeps with
     /// WEB_RELOAD=lazy or drain. Made once per connection, after the handshake.
     pub fn connection_named(self: &Arc<Self>, remote: SocketAddr, sni: Option<&str>) -> Arc<ConnState> {
+        self.connection_tls(remote, sni, None)
+    }
+
+    /// A new TLS connection, with what its handshake told: the name it asked for (`sni`) and the
+    /// client's fingerprint (`ja4`).
+    pub fn connection_tls(
+        self: &Arc<Self>,
+        remote: SocketAddr,
+        sni: Option<&str>,
+        ja4: Option<crate::ja4::Ja4>,
+    ) -> Arc<ConnState> {
         let current = self.routing.load();
         let info = Arc::new(
             ConnInfo {
@@ -168,6 +180,7 @@ impl ServerState {
                 tls: self.tls,
                 trusted: current.trusts(remote.ip()),
                 sni: None,
+                ja4,
             }
             .with_sni(sni),
         );
@@ -1188,16 +1201,19 @@ async fn accept_loop(
             };
             match acceptor {
                 Some(acceptor) => {
-                    let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await
-                    else {
+                    // The handshake reads the ClientHello through `Recorded`, which keeps a copy of
+                    // those first bytes for the client's fingerprint (src/ja4.rs).
+                    let accepting = acceptor.accept(crate::ja4::Recorded::new(stream));
+                    let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_secs(10), accepting).await else {
                         return;
                     };
+                    let ja4 = stream.get_mut().0.fingerprint();
                     let mode = match stream.get_ref().1.alpn_protocol() {
                         Some(b"h2") => Mode::Http2,
                         _ if protocols.h1 => Mode::Http1,
                         _ => return,
                     };
-                    let conn = state.connection_named(remote, stream.get_ref().1.server_name());
+                    let conn = state.connection_tls(remote, stream.get_ref().1.server_name(), ja4);
                     let ends = ends(&conn);
                     serve_connection(
                         builders,

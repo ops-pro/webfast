@@ -49,6 +49,9 @@ pub struct ConnInfo {
     pub trusted: bool,
     /// TLS: the name the handshake asked for (SNI), lowercase; `None`: none, or plain HTTP.
     pub sni: Option<Box<str>>,
+    /// TLS over TCP: the client's JA4 fingerprint, read from its ClientHello (src/ja4.rs);
+    /// `None`: plain HTTP, HTTP/3, or a hello that could not be read — never a signal by itself.
+    pub ja4: Option<crate::ja4::Ja4>,
 }
 
 impl ConnInfo {
@@ -59,6 +62,7 @@ impl ConnInfo {
             tls: self.tls,
             trusted: self.trusted,
             sni: sni.map(|name| name.to_ascii_lowercase().into_boxed_str()),
+            ja4: self.ja4,
         }
     }
 }
@@ -1467,6 +1471,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         let (parts, body) = http::Request::get(path).body(empty()).unwrap().into_parts();
         Ctx::new(conn, parts, body, "127.0.0.1".parse().unwrap())

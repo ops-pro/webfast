@@ -1314,6 +1314,7 @@ async fn through_chain(
         tls: false,
         trusted: false,
         sni: None,
+        ja4: None,
     });
     let (parts, body) = request_head(method, path, headers);
     let ctx = webfast_core::handler::Ctx::new(conn.clone(), parts, body, conn.remote.ip());

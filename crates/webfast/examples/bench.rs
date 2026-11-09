@@ -100,6 +100,7 @@ fn main() {
         tls: false,
         trusted: false,
         sni: None,
+        ja4: None,
     });
     let answers = if std::env::var_os("BENCH_CHAIN").is_some() {
         None

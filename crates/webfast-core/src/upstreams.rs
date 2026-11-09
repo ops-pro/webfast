@@ -708,6 +708,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         Ctx::new(conn, parts, empty(), remote.ip())
     }
@@ -930,6 +931,7 @@ mod cost {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         Ctx::new(conn, parts, crate::body::empty(), remote.ip())
     }

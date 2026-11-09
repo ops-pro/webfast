@@ -28,6 +28,7 @@ pub mod h3limit;
 pub mod handler;
 #[cfg(feature = "test-harness")]
 pub mod harness;
+pub mod ja4;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod matcher;

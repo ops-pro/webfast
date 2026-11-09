@@ -126,6 +126,7 @@ mod tests {
             tls: false,
             trusted: false,
             sni: None,
+            ja4: None,
         });
         let client = Client {
             ip: remote.ip(),

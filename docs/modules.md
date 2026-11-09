@@ -203,7 +203,8 @@ impl Check for Endpoint {
 
 A `Check` runs before the site's routes and ready answers, after the core's ACME answer and before
 its JWT and API firewall checks, with `extensions::Client` (the client's address, the connection's
-`ConnInfo`: TLS, SNI, trusted). A refusal marked `extensions::ErrorPage` goes through the site's
+`ConnInfo`: TLS, SNI, trusted, and over TLS on TCP the client's JA4 fingerprint, `ja4`, `None` when
+it could not be read). A refusal marked `extensions::ErrorPage` goes through the site's
 `handle_errors` routes, as a handler's own failure does; one without the mark goes out as it is
 (the challenge page is the answer, not an error). `head` may change the request — the request
 filter takes the headers of its `header` actions off every request and sets the geo header — and
@@ -241,6 +242,7 @@ What else the core makes available (all documented in the source):
 | --- | --- |
 | the body type, `empty()`, `full()`, `boxed()` | `webfast_core::body` |
 | the request context, `ConnInfo`, `hostport_of`, `strip_port` | `webfast_core::handler` |
+| the client's TLS fingerprint (`Ja4`, its parts, JA4_r from a parsed hello) | `webfast_core::ja4` |
 | matchers, `PathPattern`, `host_matches`, `clean_path` | `webfast_core::matcher` |
 | placeholders (`Template`, `Sole`) | `webfast_core::placeholder` |
 | an event log in the checks' JSON format, `HiddenParams` | `webfast_core::eventlog` |
