@@ -17,6 +17,23 @@ use std::fmt;
 pub struct Ja4([u8; 36]);
 
 impl Ja4 {
+    /// A fingerprint as written (`t13d1516h2_8daaf6152771_e5627efa2ab1`): 36 characters, its
+    /// parts where they belong, lowercase hex; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Ja4> {
+        let bytes: [u8; 36] = text.as_bytes().try_into().ok()?;
+        let hex = |range: std::ops::Range<usize>| bytes[range].iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let shape = matches!(bytes[0], b't' | b'q' | b'd')
+            && bytes[1..3].iter().all(u8::is_ascii_alphanumeric)
+            && matches!(bytes[3], b'd' | b'i')
+            && bytes[4..8].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_alphanumeric)
+            && bytes[10] == b'_'
+            && hex(11..23)
+            && bytes[23] == b'_'
+            && hex(24..36);
+        shape.then_some(Ja4(bytes))
+    }
+
     pub fn as_str(&self) -> &str {
         // Built from ASCII alone (`fingerprint`).
         std::str::from_utf8(&self.0).unwrap_or("")
@@ -440,6 +457,19 @@ mod tests {
         no_sigs.signature_algorithms.clear();
         assert_eq!(&fingerprint(&no_sigs, false).as_str()[24..], "6d807ffa2a79");
         assert_eq!(fingerprint(&hello, true).a(), "q13d1516h2");
+        let parsed = Ja4::parse("t13d1516h2_8daaf6152771_e5627efa2ab1").unwrap();
+        assert_eq!(parsed, fingerprint(&hello, false));
+        for bad in [
+            "",
+            "t13d1516h2_8daaf6152771_e5627efa2ab",
+            "t13d1516h2_8daaf6152771_e5627efa2ab1x",
+            "x13d1516h2_8daaf6152771_e5627efa2ab1",
+            "t13d1516h2-8daaf6152771_e5627efa2ab1",
+            "t13d1516h2_8DAAF6152771_e5627efa2ab1",
+            "t13x1516h2_8daaf6152771_e5627efa2ab1",
+        ] {
+            assert_eq!(Ja4::parse(bad), None, "{bad}");
+        }
     }
 
     #[test]
