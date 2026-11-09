@@ -121,7 +121,7 @@ address may set `X-Forwarded-For`.
 ### The Caddy-compatible image
 
 The same binary in the layout of the official `caddy` image (`Dockerfile`, target `caddy`; the
-tags with `-caddy`: `ghcr.io/ops-pro/webfast:latest-caddy`, `0.1.3-caddy`, `sha-…-caddy`), so
+tags with `-caddy`: `ghcr.io/ops-pro/webfast:latest-caddy`, `0.1.4-caddy`, `sha-…-caddy`), so
 that a Compose file or a `docker run` written for Caddy needs only its image changed:
 
 | What          | Where                                                                                                   |

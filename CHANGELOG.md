@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 — 2026-11-09
+
+A fix for the request filter, which panicked on a request with a query parameter or a cookie
+without `=`; the filter of
+[webfast-modules 0.1.1](https://github.com/ops-pro/webfast-modules/releases/tag/v0.1.1), with
+libinjection's detectors, a set for known exploited CVEs and a description of every rule; a 200
+streamed through the filter instead of held; and the module API's staged checks by value.
+
+Worth knowing when upgrading from 0.1.3:
+
+- With the request filter on (`WEB_NGFW_CONFIG`), 0.1.3 panicked in the request's head phase on
+  a query parameter or a cookie without `=` (`?a&b=1`, `Cookie: flag`), a request any client can
+  send. Upgrade if the filter is on.
+- The filter has more built-in rules: `builtin: all` now also takes libinjection's SQL injection
+  and XSS detectors (wf-942-170, wf-941-150), the rules added beside them, and the `cve` set. A
+  site that ran clean on 0.1.3 may see new refusals; `log_only` for a set or a rule, `disable`
+  or `disable_tags` turn them off (docs/ngfw.md in webfast-modules).
+- Each hit in the filter's log carries the rule's severity, confidence, tags and references, and
+  its number as `ruleId` next to `id`; a reader that took the lines as they were sees new fields.
+- A proxied 200 goes through the filter as it streams; a leak cuts it instead of turning it into
+  a 500 (`response.stream: false` keeps the 0.1.3 behaviour).
+- A module written against the core changes its `Check` and `Inspect` implementations (below).
+
+### Changes
 
 - **The module API's staged checks hand the head's state to the body by value, and a set boxes
   once** (`webfast_core::module`, docs/modules.md). `Check` has an associated
