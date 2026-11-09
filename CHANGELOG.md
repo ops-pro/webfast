@@ -1,7 +1,31 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 — 2026-11-09
 
+The client's TLS fingerprint (JA4) on every TLS connection, and the request filter of
+[webfast-modules 0.1.2](https://github.com/ops-pro/webfast-modules/releases/tag/v0.1.2), which
+logs it and flags a browser's User-Agent over a handshake no browser makes; a certificate index
+built outside its lock; JSON checked without a tree where only its validity counts.
+
+Worth knowing when upgrading from 0.1.4:
+
+- The request filter has a new built-in rule, wf-920-600, in `log_only`: a line for each request
+  whose User-Agent claims a current browser over a TLS handshake none makes (a library or script
+  borrowing the browser's User-Agent; also a TLS-inspecting proxy in front of a real browser). It
+  refuses nothing until a site arms it (`override: {wf-920-600: {mode: challenge}}`);
+  `disable: [wf-920-600]` silences it. Its log lines, and every other, carry `request.ja4`.
+- The module API: `ConnInfo` has a field more, `ja4`; a module that makes one by hand (its tests)
+  adds `ja4: None`.
+- The fingerprint is worked out once per TLS connection over TCP, after the handshake, from a copy
+  of the ClientHello's bytes (16 KiB at most, dropped once read); HTTP/3 connections have none yet.
+
+### Changes
+
+- The request filter and the browser challenge are those of webfast-modules 0.1.2 (Cargo.lock):
+  rule examples and a JSON Schema for the rules files, comparison operators beside `gt`, a corpus
+  of known evasions in its tests, the query parameters hidden from the logs shared rather than
+  copied per request, one ban list lookup, the challenge's answer length checked before its hash,
+  and the client's fingerprint as the target `tls.ja4`.
 - **The client's JA4 fingerprint** (FoxIO's JA4, BSD 3-Clause): over TLS on TCP the handshake
   reads the ClientHello through a stream that keeps a copy of those first bytes (no `peek`, no
   second read; 16 KiB at most), and the fingerprint is worked out once per connection, after the

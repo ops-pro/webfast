@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "webfast"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -2352,8 +2352,8 @@ dependencies = [
 
 [[package]]
 name = "webfast-challenge"
-version = "0.1.1"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#fbd7586a947d6e624572162c3882419559490158"
+version = "0.1.2"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#2b7c262f079de489f47994ac2a65c8134f753e4c"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "webfast-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2420,8 +2420,8 @@ dependencies = [
 
 [[package]]
 name = "webfast-ngfw"
-version = "0.1.1"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#fbd7586a947d6e624572162c3882419559490158"
+version = "0.1.2"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#2b7c262f079de489f47994ac2a65c8134f753e4c"
 dependencies = [
  "aho-corasick",
  "anyhow",
