@@ -197,8 +197,10 @@ impl CertResolver {
     /// The certificates of a reloaded configuration, in place of the current ones; handshakes
     /// under way keep the certificate they chose.
     pub fn install(&self, certificates: Certificates) {
+        // Built before the lock: handshakes and host checks wait only for the swap.
+        let new = Loaded::new(certificates.0);
         if let Ok(mut loaded) = self.loaded.write() {
-            *loaded = Loaded::new(certificates.0);
+            *loaded = new;
         }
     }
 

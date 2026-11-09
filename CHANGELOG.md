@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- A new certificate set (`tls` files re-read, an ACME renewal) is indexed before the lock is
+  taken: handshakes and the host check wait only for the swap, not for the index to be built.
+- A `respond` body with placeholders is checked for being JSON (its Content-Type) without
+  building the document, per request.
+- The API firewall checks a JSON or text request body of a media type without a schema for being
+  JSON or UTF-8 alone, without making a value of it (a form's fields are read as before).
+
 ## 0.1.4 — 2026-11-09
 
 A fix for the request filter, which panicked on a request with a query parameter or a cookie

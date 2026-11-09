@@ -786,3 +786,29 @@ async fn apis_bound_to_an_upstream_are_checked_by_its_proxy() {
     assert!(at_upstream(&fw, "app:8787", "/page").await.is_ok(), "outside base_path");
     assert!(ApiFirewall::from_yaml(&yaml.replace("app:8787", "unix/app.sock"), dir.path()).is_err());
 }
+
+/// A body of a media without a schema is checked for being JSON or UTF-8 text, with no value
+/// made of it; a form's fields are still read.
+#[test]
+fn a_body_without_a_schema_is_checked_for_its_format_alone() {
+    let media = |format: BodyFormat| spec::Media {
+        range: "application/json".to_string(),
+        format,
+        validator: None,
+        fields: Vec::new(),
+    };
+    let body = |text: &'static [u8]| Bytes::from_static(text);
+    assert!(validate_body(&media(BodyFormat::Json), &body(br#"{"a":[1,2,{"b":null}]}"#)).is_ok());
+    assert!(
+        validate_body(&media(BodyFormat::Json), &body(b"{\"a\":")).is_err(),
+        "cut JSON"
+    );
+    assert!(validate_body(&media(BodyFormat::Json), &body(b"not json")).is_err());
+    assert!(validate_body(&media(BodyFormat::Text), &body("caf\u{e9}".as_bytes())).is_ok());
+    assert!(
+        validate_body(&media(BodyFormat::Text), &body(b"\xff\xfe")).is_err(),
+        "not UTF-8"
+    );
+    assert!(validate_body(&media(BodyFormat::Form), &body(b"a=1&b=2")).is_ok());
+    assert!(validate_body(&media(BodyFormat::Unchecked), &body(b"\xff")).is_ok());
+}

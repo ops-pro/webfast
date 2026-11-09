@@ -1023,7 +1023,8 @@ fn body_type(text: &str) -> &'static str {
     let json = trimmed.len() > 2
         && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
             || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+        // Parsed for its validity alone: no tree is built.
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok();
     if json {
         "application/json"
     } else {
@@ -1746,5 +1747,19 @@ mod tests {
             std::mem::size_of_val(&walk)
         );
         assert_eq!(walk.await.status(), StatusCode::OK);
+    }
+
+    /// A `respond` body's type: JSON when it is an object or an array that parses, text else.
+    #[test]
+    fn a_respond_body_is_json_only_when_it_parses() {
+        assert_eq!(body_type(r#"{"ok":true,"items":[1,2]}"#), "application/json");
+        assert_eq!(body_type(" [1, 2] "), "application/json");
+        assert_eq!(body_type("{not json}"), "text/plain; charset=utf-8");
+        assert_eq!(
+            body_type("{}"),
+            "text/plain; charset=utf-8",
+            "too short to be taken for JSON"
+        );
+        assert_eq!(body_type("ok"), "text/plain; charset=utf-8");
     }
 }

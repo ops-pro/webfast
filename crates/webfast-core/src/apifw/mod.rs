@@ -853,6 +853,23 @@ async fn read_body(mut body: Body, max: usize) -> std::result::Result<Bytes, Vio
 
 fn validate_body(media: &spec::Media, bytes: &Bytes) -> std::result::Result<(), Violation> {
     let reason = || format!("request-body:{}", media.range);
+    // Without a schema, a JSON or text body is checked for what it must be and no value is made
+    // of it (a form's fields are still read: their types are checked).
+    if media.validator.is_none() {
+        match media.format {
+            BodyFormat::Json => {
+                return serde_json::from_slice::<serde::de::IgnoredAny>(bytes)
+                    .map(|_| ())
+                    .map_err(|_| Violation::new(reason(), "not JSON"));
+            }
+            BodyFormat::Text => {
+                return std::str::from_utf8(bytes)
+                    .map(|_| ())
+                    .map_err(|_| Violation::new(reason(), "not UTF-8"));
+            }
+            BodyFormat::Form | BodyFormat::Unchecked => {}
+        }
+    }
     let value = match media.format {
         BodyFormat::Json => serde_json::from_slice::<Value>(bytes).map_err(|_| Violation::new(reason(), "not JSON"))?,
         BodyFormat::Text => Value::String(
