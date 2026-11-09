@@ -22,6 +22,14 @@
 - The request filter (webfast-modules) streams a proxied 200 instead of holding it: its body is
   scanned as it goes out and the response is cut (the connection closed, the HTTP/2 stream reset)
   at a leak; a 5xx is held and replaced as before (`response.stream: false` holds a 200 too).
+- The request filter comes with libinjection's SQL injection and XSS detectors: the `ngfw`
+  feature turns on webfast-ngfw's `libinjection` feature (the `barbacane-libinjection` crate, pure
+  Rust, BSD-3-Clause), so the operators `detect_sqli` and `detect_xss` and the built-in rules
+  wf-942-170 and wf-941-150 are in the binary. From webfast-modules 0.1.1 the filter also has the
+  `cve` set (known exploited vulnerabilities of web products), a severity, confidence, CWE and
+  CVE references and a description for every rule (written with each hit, together with the
+  rule's number as `ruleId`), `disable_tags`, and no longer panics on a query parameter or cookie
+  without `=`.
 
 ## 0.1.3 — 2026-11-07
 

@@ -34,8 +34,10 @@ rate-limit = ["webfast-core/rate-limit"]
 mimalloc = ["webfast-core/mimalloc", "dep:mimalloc"]
 # The modules, crates of https://github.com/ops-pro/webfast-modules (src/compose.rs): the request
 # filter, on when WEB_NGFW_CONFIG names its file, and the browser challenge (the `challenge`
-# directive). The filter's own `challenge` feature follows this crate's.
-ngfw = ["dep:webfast-ngfw"]
+# directive). The filter's own `challenge` feature follows this crate's; its `libinjection`
+# feature (the `detect_sqli` and `detect_xss` operators and the built-in rules wf-942-170 and
+# wf-941-150) comes with the filter.
+ngfw = ["dep:webfast-ngfw", "webfast-ngfw/libinjection"]
 challenge = ["dep:webfast-challenge", "webfast-ngfw?/challenge"]
 
 [dependencies]

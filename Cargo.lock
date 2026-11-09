@@ -183,6 +183,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "barbacane-libinjection"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f53a7bc87cc063c13a8059eec7284e82774856d10425ac1374c274da0dae1562"
+dependencies = [
+ "bitflags",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2341,8 +2352,8 @@ dependencies = [
 
 [[package]]
 name = "webfast-challenge"
-version = "0.1.0"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#e37c4b63bc5256dfc173b7c7a1c3cc1474662ec5"
+version = "0.1.1"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#fbd7586a947d6e624572162c3882419559490158"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2409,12 +2420,13 @@ dependencies = [
 
 [[package]]
 name = "webfast-ngfw"
-version = "0.1.0"
-source = "git+https://github.com/ops-pro/webfast-modules?branch=main#e37c4b63bc5256dfc173b7c7a1c3cc1474662ec5"
+version = "0.1.1"
+source = "git+https://github.com/ops-pro/webfast-modules?branch=main#fbd7586a947d6e624572162c3882419559490158"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "arc-swap",
+ "barbacane-libinjection",
  "bytes",
  "http",
  "http-body",

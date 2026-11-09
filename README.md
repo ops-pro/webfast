@@ -126,9 +126,11 @@ documentation:
 
 - **Request filter (NGFW)** (`webfast-ngfw`, [docs/ngfw.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw.md)):
   rules over the request's head and body and over proxied responses — scanners, probes, path
-  traversal, SQL, command, PHP, template and script injection, bad uploads, leaking error pages —
-  and access by country, ASN and address lists, with a ban list for repeat offenders. On when
-  `WEB_NGFW_CONFIG` names its file.
+  traversal, SQL, command, PHP, template and script injection (with libinjection's SQL injection
+  and XSS detectors), bad uploads, leaking error pages, known exploited CVEs of web products —
+  and access by country, ASN and address lists, with a ban list for repeat offenders. Every rule
+  is described in its [reference](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-rules.md).
+  On when `WEB_NGFW_CONFIG` names its file.
 - **Browser challenge** (`webfast-challenge`, [docs/challenge.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/challenge.md)):
   a client proves it is a browser — a cookie, a script, a proof-of-work or a CAPTCHA — before a
   site answers, for every request or only once a client is over a rate; a signed cookie, no state
