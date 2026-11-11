@@ -131,6 +131,11 @@ documentation:
   and access by country, ASN and address lists, with a ban list for repeat offenders. Every rule
   is described in its [reference](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-rules.md).
   On when `WEB_NGFW_CONFIG` names its file.
+- **OWASP CRS in the filter** (`webfast-ngfw-crs`, the cargo feature `ngfw-crs`, not a default;
+  [docs/ngfw-crs.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-crs.md)): the
+  Core Rule Set v4 as released, in SecLang, interpreted inside the request filter as a rule
+  engine of its own — one decision, one log line, one ban list with the filter's rules. With it,
+  the filter's built-in sets are off but `cve` unless its file names them.
 - **Browser challenge** (`webfast-challenge`, [docs/challenge.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/challenge.md)):
   a client proves it is a browser — a cookie, a script, a proof-of-work or a CAPTCHA — before a
   site answers, for every request or only once a client is over a rate; a signed cookie, no state

@@ -5,7 +5,8 @@
 //!
 //! The modules are crates of https://github.com/ops-pro/webfast-modules, each behind a cargo
 //! feature of this crate: the request filter `webfast-ngfw` (`ngfw`) and the browser challenge
-//! `webfast-challenge` (`challenge`). A module is added here with a dependency in Cargo.toml, its
+//! `webfast-challenge` (`challenge`). The filter's rule engines are registered with it here too:
+//! the OWASP CRS, `webfast-ngfw-crs` (`ngfw-crs`). A module is added here with a dependency in Cargo.toml, its
 //! `MODULE` in `MODULES`, its checks and inspectors in their slots of `Checks` and `Inspectors`,
 //! and `hooks` filling them from the loaded configuration.
 //!
@@ -87,8 +88,11 @@ fn hooks(config: &Config) -> (Checks, Inspectors) {
     )
 }
 
-/// What the binary runs and the tests boot servers with.
+/// What the binary runs and the tests boot servers with; the filter's rule engines registered
+/// before its file is read.
 pub fn composition() -> Composition<Checks, Inspectors> {
+    #[cfg(feature = "ngfw-crs")]
+    webfast_ngfw::plugin::register(&webfast_ngfw_crs::ENGINE);
     Composition {
         modules: MODULES,
         hooks,

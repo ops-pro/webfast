@@ -39,11 +39,16 @@ mimalloc = ["webfast-core/mimalloc", "dep:mimalloc"]
 # wf-941-150) comes with the filter.
 ngfw = ["dep:webfast-ngfw", "webfast-ngfw/libinjection"]
 challenge = ["dep:webfast-challenge", "webfast-ngfw?/challenge"]
+# The OWASP Core Rule Set as a rule engine of the filter (webfast-ngfw-crs, its docs/ngfw-crs.md):
+# with it the filter runs the bundled CRS (`engines.crs` in its file), and its built-in sets are off
+# but `cve` unless `rules.builtin` names them.
+ngfw-crs = ["ngfw", "dep:webfast-ngfw-crs"]
 
 [dependencies]
 webfast-core.workspace = true
 webfast-ngfw = { git = "https://github.com/ops-pro/webfast-modules", branch = "main", version = "0.1", default-features = false, optional = true }
 webfast-challenge = { git = "https://github.com/ops-pro/webfast-modules", branch = "main", version = "0.1", optional = true }
+webfast-ngfw-crs = { git = "https://github.com/ops-pro/webfast-modules", branch = "main", version = "0.1", optional = true }
 mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

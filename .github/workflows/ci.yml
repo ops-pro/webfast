@@ -47,9 +47,9 @@ jobs:
             cargo clippy --locked -p webfast-core --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
           done
-      - name: each of the binary's modules alone
+      - name: each of the binary's modules alone, and the filter with the CRS engine
         run: |
-          for feature in ngfw challenge; do
+          for feature in ngfw challenge ngfw-crs; do
             echo "::group::$feature"
             cargo clippy --locked -p webfast --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
