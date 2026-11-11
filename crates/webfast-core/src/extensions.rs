@@ -460,12 +460,12 @@ impl ProxyObserver for ModuleInspectors {
 // The slots: a feature's type where it is on, `()` where it is off.
 
 #[cfg(feature = "jwt")]
-type Jwt = Option<Arc<crate::jwt::JwtAuth>>;
+type Jwt = Option<Arc<crate::checkfile::Reloadable<crate::jwt::JwtAuth>>>;
 #[cfg(not(feature = "jwt"))]
 type Jwt = ();
 
 #[cfg(feature = "api-firewall")]
-type ApiFirewall = Option<Arc<crate::apifw::ApiFirewall>>;
+type ApiFirewall = Option<Arc<crate::checkfile::Reloadable<crate::apifw::ApiFirewall>>>;
 #[cfg(not(feature = "api-firewall"))]
 type ApiFirewall = ();
 
@@ -545,6 +545,96 @@ impl Hooks {
             upstream: upstream.bound().then_some(upstream),
             modules,
         }))
+    }
+
+    /// SIGHUP, before the server takes the new Caddyfile: the files of the JWT check and the API
+    /// firewall read again and staged (src/checkfile.rs), so the Caddyfile is checked against
+    /// their bindings; what was read, one line each. A file that does not load is the reload's
+    /// error: nothing is staged then.
+    pub fn stage_checks(&self) -> Result<Vec<String>> {
+        let mut lines = Vec::new();
+        let staged = self.stage_each(&mut lines);
+        if staged.is_err() {
+            self.discard_checks();
+        }
+        staged.map(|()| lines)
+    }
+
+    fn stage_each(&self, lines: &mut Vec<String>) -> Result<()> {
+        let _ = &lines;
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.request.1.1.0
+            && let Some(staged) = jwt.stage(crate::jwt::JwtAuth::load)?
+        {
+            let (providers, rules) = staged.counts();
+            let path = jwt.path().map(|p| p.display().to_string()).unwrap_or_default();
+            lines.push(format!(
+                "JWT: {path}, {providers} provider(s), {rules} rule(s){}",
+                bound_to(crate::jwt::JwtAuth::upstreams(&staged))
+            ));
+            if staged.hidden_params() != jwt.current().hidden_params() {
+                lines.push(format!(
+                    "warning: JWT: the query parameters a token may come in changed ({}); every log's URIs follow, but the request filter's hits (`matched`) hide the values of the ones read at startup until a restart",
+                    staged.hidden_params().join(", ")
+                ));
+            }
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.request.1.1.1.0
+            && let Some(staged) = firewall.stage(crate::apifw::ApiFirewall::load)?
+        {
+            let (apis, operations, later) = staged.counts();
+            let path = firewall.path().map(|p| p.display().to_string()).unwrap_or_default();
+            let later = if later > 0 {
+                format!(", {later} spec(s) read once it is in place")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "API firewall: {path}, {apis} API(s), {operations} operation(s){later}{}",
+                bound_to(crate::apifw::ApiFirewall::upstreams(&staged))
+            ));
+        }
+        Ok(())
+    }
+
+    /// The reload went through: the staged checks put in place for the next request, their
+    /// background work started. A check whose start failed is a line (it is in place: its keys or
+    /// specs are read again as at startup).
+    pub fn commit_checks(&self) -> Vec<String> {
+        #[allow(unused_mut)]
+        let mut lines = Vec::new();
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.request.1.1.0 {
+            match jwt.commit() {
+                // Every log's URIs follow the new file's token parameters.
+                Ok(true) => crate::eventlog::set_token_params(jwt.current().hidden_params()),
+                Ok(false) => {}
+                Err(e) => {
+                    crate::eventlog::set_token_params(jwt.current().hidden_params());
+                    lines.push(format!("warning: JWT: {e:#}"));
+                }
+            }
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.request.1.1.1.0
+            && let Err(e) = firewall.commit()
+        {
+            lines.push(format!("warning: API firewall: {e:#}"));
+        }
+        lines
+    }
+
+    /// The reload failed: the staged checks dropped, the running ones stay.
+    pub fn discard_checks(&self) {
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.request.1.1.0 {
+            jwt.discard();
+        }
+        #[cfg(feature = "api-firewall")]
+        if let Some(firewall) = &self.request.1.1.1.0 {
+            firewall.discard();
+        }
     }
 
     /// A module's hook by its type, among the composed checks and inspectors: how a zero-sized
@@ -715,9 +805,14 @@ pub fn load_checks(config: &mut Config) -> std::result::Result<Vec<String>, Stri
         let (providers, rules) = jwt.counts();
         let bound = bound_to(jwt.upstreams());
         loaded.push(format!("JWT: {path}, {providers} provider(s), {rules} rule(s){bound}"));
-        // A module that logs before the JWT check runs is told which parameters to hide.
+        // A module that logs before the JWT check runs is told which parameters to hide; every
+        // log hides them in its URIs (src/eventlog.rs `set_token_params`).
         config.hidden_params = jwt.hidden_params().to_vec();
-        config.jwt = Some(Arc::new(jwt));
+        crate::eventlog::set_token_params(jwt.hidden_params());
+        config.jwt = Some(Arc::new(crate::checkfile::Reloadable::from_file(
+            std::path::Path::new(&path),
+            jwt,
+        )));
     }
     #[cfg(feature = "api-firewall")]
     if let Some(path) = file("WEB_API_FIREWALL_CONFIG") {
@@ -732,7 +827,10 @@ pub fn load_checks(config: &mut Config) -> std::result::Result<Vec<String>, Stri
             "API firewall: {path}, {apis} API(s), {operations} operation(s){later}{}",
             bound_to(firewall.upstreams())
         ));
-        config.api_firewall = Some(Arc::new(firewall));
+        config.api_firewall = Some(Arc::new(crate::checkfile::Reloadable::from_file(
+            std::path::Path::new(&path),
+            firewall,
+        )));
     }
     check_bindings(config).map_err(|e| format!("{e:#}"))?;
     for module in crate::module::registry().modules() {
@@ -776,9 +874,9 @@ fn bound_to<'a>(upstreams: impl Iterator<Item = &'a Authority>) -> String {
 /// files).
 pub struct Started {
     #[cfg(feature = "jwt")]
-    jwt: Option<Arc<crate::jwt::JwtAuth>>,
+    jwt: Jwt,
     #[cfg(feature = "api-firewall")]
-    firewall: Option<Arc<crate::apifw::ApiFirewall>>,
+    firewall: ApiFirewall,
 }
 
 impl Started {
@@ -789,9 +887,10 @@ impl Started {
         for module in crate::module::registry().modules() {
             module.start(config)?;
         }
+        // The JWT keys read, now and for every file a reload puts in place.
         #[cfg(feature = "jwt")]
         if let Some(jwt) = &config.jwt {
-            jwt.start()?;
+            jwt.start_with(&jwt.current(), |check| check.start())?;
         }
         Ok(Started {
             #[cfg(feature = "jwt")]
@@ -803,9 +902,11 @@ impl Started {
 
     pub fn finish(self, states: &[Arc<crate::server::ServerState>]) -> Result<()> {
         let _ = states;
+        // The specs read, now and for every file a reload puts in place, through the first port.
         #[cfg(feature = "api-firewall")]
         if let Some(firewall) = &self.firewall {
-            firewall.start(states.first().cloned().map(local_fetch))?;
+            let local = states.first().cloned().map(local_fetch);
+            firewall.start_with(&firewall.current(), move |check| check.start(local.clone()))?;
         }
         #[cfg(feature = "compress-files")]
         {

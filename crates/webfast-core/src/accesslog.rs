@@ -269,7 +269,9 @@ impl AccessLog {
     fn line(&self, info: &RequestInfo, status: u16, size: u64) -> String {
         let duration = info.started.elapsed();
         let host = info.host.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
-        let uri = info.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        // The values of the parameters a token may come in, hidden (the JWT check's, as loaded now).
+        let uri = crate::eventlog::redact_uri(info.uri.path_and_query().map_or("/", |pq| pq.as_str()), &[]);
+        let uri = uri.as_ref();
         // The fixed part of a JSON line is about 300 bytes; host and URI on top (escaping may
         // still grow it, which is rare).
         let mut line = String::with_capacity(320 + host.len() + uri.len());
@@ -397,6 +399,42 @@ impl Drop for Logged {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The values of the parameters a token may come in (the JWT check's) are hidden in both
+    /// formats, by the name as the server reads it, every time the parameter is given; the rest of
+    /// the URI is as sent.
+    #[test]
+    fn token_parameters_are_hidden() {
+        crate::eventlog::set_token_params(&["wf_test_token".to_string()]);
+        let info = RequestInfo {
+            remote: "10.0.0.2:4000".parse().unwrap(),
+            client_ip: "203.0.113.9".parse().unwrap(),
+            proto: "HTTP/1.1",
+            method: Method::GET,
+            host: Some(HeaderValue::from_static("example.com")),
+            uri: Uri::from_static("/api/x?a=1&wf_test_token=eyJ.secret.one&wf%5Ftest%5Ftoken=eyJ.secret.two&b=2"),
+            started: Instant::now(),
+        };
+        for format in [Format::Json, Format::Console] {
+            let line = AccessLog {
+                output: Output::Discard,
+                format,
+            }
+            .line(&info, 200, 0);
+            assert!(!line.contains("secret"), "{line}");
+            assert!(
+                line.contains("/api/x?a=1&wf_test_token=REDACTED&wf%5Ftest%5Ftoken=REDACTED&b=2"),
+                "{line}"
+            );
+        }
+        crate::eventlog::set_token_params(&[]);
+        let line = AccessLog {
+            output: Output::Discard,
+            format: Format::Console,
+        }
+        .line(&info, 200, 0);
+        assert!(line.contains("eyJ.secret.one"), "no JWT check: the URI as sent");
+    }
 
     #[test]
     fn json_lines_are_valid_and_escaped() {

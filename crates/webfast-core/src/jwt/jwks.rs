@@ -271,8 +271,9 @@ pub(super) struct Keys {
     digest: std::sync::Mutex<[u8; 32]>,
     /// Counts finished reads, for requests waiting for one.
     reads: watch::Sender<u64>,
-    /// Asks the background task for an early read.
-    wanted: Notify,
+    /// Asks the background task for an early read (shared with the task, which holds the keys
+    /// weakly).
+    wanted: Arc<Notify>,
     /// Milliseconds since the Unix epoch of the last read asked for by a request.
     last_wanted: AtomicU64,
     pub cache_duration: Duration,
@@ -288,7 +289,7 @@ impl Keys {
             generation: AtomicU64::new(1),
             digest: std::sync::Mutex::new([0; 32]),
             reads: watch::channel(0).0,
-            wanted: Notify::new(),
+            wanted: Arc::new(Notify::new()),
             last_wanted: AtomicU64::new(0),
             cache_duration,
             fetch_timeout,
@@ -362,10 +363,12 @@ impl Keys {
 }
 
 /// Keeps `keys` current: a read every `cache_duration`, after a failure again sooner (1 s,
-/// doubling up to a minute), and early when a request asks.
-pub(super) async fn refresh(keys: Arc<Keys>, client: Client) {
+/// doubling up to a minute), and early when a request asks. Ends once the keys are gone (a reload
+/// put another JWT file in place and its last request is done).
+pub(super) async fn refresh(keys: std::sync::Weak<Keys>, client: Client) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        let Some(keys) = keys.upgrade() else { return };
         let wait = match keys.load(&client).await {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
@@ -378,9 +381,12 @@ pub(super) async fn refresh(keys: Arc<Keys>, client: Client) {
                 wait
             }
         };
+        // Not held while waiting: the keys may go meanwhile.
+        let wanted = Arc::clone(&keys.wanted);
+        drop(keys);
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
-            () = keys.wanted.notified() => {}
+            () = wanted.notified() => {}
         }
     }
 }

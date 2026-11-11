@@ -538,9 +538,9 @@ async fn checks_bound_to_the_upstream_hold_for_what_the_cache_keeps() {
     let yaml = format!(
         "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\nrules:\n  - match: {{upstreams: ['{addr}']}}\n    providers: [id]\n    allow_missing: true\n"
     );
-    config.jwt = Some(Arc::new(
+    config.jwt = Some(Arc::new(webfast_core::checkfile::Reloadable::new(
         webfast_core::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap(),
-    ));
+    )));
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
 

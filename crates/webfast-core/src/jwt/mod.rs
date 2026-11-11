@@ -365,7 +365,9 @@ impl JwtAuth {
         let client = jwks::client()?;
         for provider in &self.providers {
             if provider.keys.refreshed() {
-                tokio::spawn(jwks::refresh(provider.keys.clone(), client.clone()));
+                // Held weakly: once a reload has put another file in place and the last request of
+                // this one is done, the task ends.
+                tokio::spawn(jwks::refresh(Arc::downgrade(&provider.keys), client.clone()));
             }
         }
         Ok(())

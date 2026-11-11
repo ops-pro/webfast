@@ -263,7 +263,8 @@ impl ApiFirewall {
         };
         for api in &self.apis {
             if api.source.refresh.is_some() {
-                tokio::spawn(refresh(api.clone(), client.clone(), local.clone()));
+                // Held weakly: once a reload has put another file in place, the task ends.
+                tokio::spawn(refresh(Arc::downgrade(api), client.clone(), local.clone()));
             }
         }
         Ok(())
@@ -447,10 +448,17 @@ fn api(config: ApiConfig, source: source::Source) -> Result<Api> {
 
 /// Keeps an API's spec current: a look every `refresh`, sooner after a failure (1 s, doubling
 /// up to a minute, never later than `refresh`).
-async fn refresh(api: Arc<Api>, client: Option<crate::fetch::Client>, local: Option<LocalFetch>) {
-    let every = api.source.refresh.unwrap_or(Duration::from_secs(60));
+async fn refresh(api: std::sync::Weak<Api>, client: Option<crate::fetch::Client>, local: Option<LocalFetch>) {
+    let Some(every) = api
+        .upgrade()
+        .map(|a| a.source.refresh.unwrap_or(Duration::from_secs(60)))
+    else {
+        return;
+    };
     let mut backoff = Duration::from_secs(1);
     loop {
+        // Gone: a reload put another file in place.
+        let Some(api) = api.upgrade() else { return };
         let wait = match api.reload(client.as_ref(), local.as_ref()).await {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
@@ -463,6 +471,7 @@ async fn refresh(api: Arc<Api>, client: Option<crate::fetch::Client>, local: Opt
                 wait
             }
         };
+        drop(api);
         tokio::time::sleep(wait).await;
     }
 }

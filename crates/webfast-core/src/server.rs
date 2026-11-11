@@ -655,6 +655,12 @@ pub struct Ready {
 }
 
 impl Running {
+    /// The hooks every port shares (one set per process): a reload stages and commits the checks
+    /// read from their own files through them (src/checkfile.rs).
+    pub fn hooks(&self) -> Option<&'static Hooks> {
+        self.ports.first().map(|p| p.state.hooks)
+    }
+
     /// The certificate resolvers of the TLS ports (the ACME thread tells them of new files).
     #[cfg(feature = "acme")]
     pub(crate) fn resolvers(&self) -> Vec<Arc<CertResolver>> {

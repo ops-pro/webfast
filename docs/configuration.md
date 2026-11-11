@@ -367,9 +367,10 @@ can meet one of each kind.
 With `cache` (Proxy cache), a stored answer goes only to a request that passes the checks bound
 to the upstream it came from, and the answer to a request whose token was verified is kept only
 when it says it may be shared (`public`, `s-maxage`, `must-revalidate`), as for a request with
-`Authorization`: the token may not reach the upstream. The checks are read at startup; a reload
-(SIGHUP) keeps them, and refuses a Caddyfile whose routes no longer send to an upstream they are
-bound to.
+`Authorization`: the token may not reach the upstream. A reload (SIGHUP) reads both files again
+with the Caddyfile and takes the three together or none (docs/operations.md "Reloading"): a file
+that does not load, or a check bound to an upstream the new Caddyfile's routes no longer send to,
+refuses the reload, and the checks running stay.
 
 **JWT** (`WEB_JWT_CONFIG`), after Istio's RequestAuthentication and Envoy's jwt_authn:
 
@@ -519,8 +520,10 @@ read-only container a file needs a writable mount for its directory.
   `request-parameter:query:limit`, `request-body:application/json` or `spec:unavailable`, with
   the particulars in `detail`.
 - Tokens are not written: the values of the query parameters a JWT may come in show as
-  `REDACTED`. A schema error says where and which keyword failed, such as `/password: minLength`,
-  never the value. The rest of the URI is as the access log has it.
+  `REDACTED` — in the event logs and in the access log, by the names as the JWT file is loaded
+  now (a reload that changes `from_params` changes them), on every request whether the JWT check
+  ran on it or not. A schema error says where and which keyword failed, such as
+  `/password: minLength`, never the value. The rest of the URI is as sent.
 
 ## Differences from Caddy
 

@@ -48,6 +48,25 @@ enum Sink {
 #[derive(Debug, Clone)]
 pub struct HiddenParams(pub Arc<[String]>);
 
+/// The query parameters a token may come in, as the JWT check is loaded now (at startup, then by
+/// each reload that put its file in place, src/checkfile.rs): every log hides their values — the
+/// access log, which takes the request before the JWT check runs (or on a request it never
+/// checks), and the event logs of the modules that log before it, whatever list they put on the
+/// request. docs/logging.md, step 1.
+static TOKEN_PARAMS: arc_swap::ArcSwapOption<Vec<String>> = arc_swap::ArcSwapOption::const_empty();
+
+/// The JWT check's token parameters (`JwtAuth::hidden_params`), now: what every log hides.
+pub fn set_token_params(names: &[String]) {
+    TOKEN_PARAMS.store((!names.is_empty()).then(|| Arc::new(names.to_vec())));
+}
+
+/// `uri` with the values of the hidden query parameters as `REDACTED`: those `on_request` names
+/// (`HiddenParams`) and the JWT check's token parameters.
+pub fn redact_uri<'a>(uri: &'a str, on_request: &[String]) -> Cow<'a, str> {
+    let tokens = TOKEN_PARAMS.load();
+    redacted(uri, on_request, tokens.as_deref().map_or(&[][..], |t| t.as_slice()))
+}
+
 pub struct Event<'a> {
     /// Refused (answered with `status`), or let through (`log_only`).
     pub refused: bool,
@@ -81,7 +100,7 @@ impl EventLog {
             }
         };
         let Some(writer) = writer else { return };
-        let uri = redacted(
+        let uri = redact_uri(
             event.parts.uri.path_and_query().map_or("/", |pq| pq.as_str()),
             event.parts.extensions.get::<HiddenParams>().map_or(&[][..], |h| &h.0),
         );
@@ -164,7 +183,7 @@ impl EventLog {
             }
         };
         let Some(writer) = writer else { return };
-        let uri = redacted(
+        let uri = redact_uri(
             parts.uri.path_and_query().map_or("/", |pq| pq.as_str()),
             parts.extensions.get::<HiddenParams>().map_or(&[][..], |h| &h.0),
         );
@@ -185,15 +204,20 @@ impl EventLog {
 
 /// `uri` with the values of the `hidden` query parameters written as `REDACTED`. Names are
 /// compared percent-decoded, as the JWT module reads them, so `access%5Ftoken` is hidden too.
-fn redacted<'a>(uri: &'a str, hidden: &[String]) -> Cow<'a, str> {
+fn redacted<'a>(uri: &'a str, hidden: &[String], also: &[String]) -> Cow<'a, str> {
     let Some((path, query)) = uri.split_once('?') else {
         return Cow::Borrowed(uri);
     };
+    if hidden.is_empty() && also.is_empty() {
+        return Cow::Borrowed(uri);
+    }
     let hide = |pair: &str| {
-        pair.split_once('=')
-            .is_some_and(|(key, _)| hidden.iter().any(|h| *h == percent_decode_str(key).decode_utf8_lossy()))
+        pair.split_once('=').is_some_and(|(key, _)| {
+            let key = percent_decode_str(key).decode_utf8_lossy();
+            hidden.iter().chain(also).any(|h| *h == key)
+        })
     };
-    if hidden.is_empty() || !query.split('&').any(hide) {
+    if !query.split('&').any(hide) {
         return Cow::Borrowed(uri);
     }
     let mut out = String::with_capacity(uri.len());

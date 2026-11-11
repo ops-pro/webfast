@@ -506,7 +506,28 @@ async fn reload_config(running: &mut server::Running, reload: &Reload) -> anyhow
     let ports = config.servers.len();
     let sites: usize = config.servers.iter().map(|s| s.sites.len()).sum();
     let files = config.files;
-    let ready = running.reload(config).await?;
+    // The JWT's and the API firewall's files read again and staged: the new Caddyfile is checked
+    // against their bindings, and they take effect with it, or not at all (src/checkfile.rs).
+    let hooks = running.hooks();
+    if let Some(hooks) = hooks {
+        for line in hooks.stage_checks()? {
+            tracing::info!("request checks: {line}");
+        }
+    }
+    let ready = match running.reload(config).await {
+        Ok(ready) => ready,
+        Err(e) => {
+            if let Some(hooks) = hooks {
+                hooks.discard_checks();
+            }
+            return Err(e);
+        }
+    };
+    if let Some(hooks) = hooks {
+        for line in hooks.commit_checks() {
+            tracing::warn!("request checks: {line}");
+        }
+    }
     crate::release_free_memory();
     tracing::info!(
         ports,

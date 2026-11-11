@@ -13,6 +13,7 @@ pub mod body;
 #[cfg(feature = "proxy-cache")]
 pub mod cache;
 pub mod caddyfile;
+pub mod checkfile;
 pub mod config;
 pub mod date;
 pub mod dns;

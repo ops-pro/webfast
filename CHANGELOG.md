@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **The access log hides tokens in the URI**: the values of the query parameters a JWT may come
+  in (`from_params`) are `REDACTED` there, as the event logs have shown them; it wrote them as
+  sent (a `?access_token=…` in clear on every request). The names are the JWT check's as loaded
+  now, for the access log and for every event log's URI, so a reload that adds a parameter to
+  `from_params` hides it in the request filter's lines too (they kept the startup list; its hits'
+  `matched` still do, until docs/logging.md's later steps). `eventlog::set_token_params` and
+  `eventlog::redact_uri` are the shared list and its use.
+- docs/logging.md: the design of one log service with one privacy policy (value classes, sources,
+  the event API for modules, the policy and its reload, the request's id), step 1 of it built.
+- **A reload (SIGHUP) reads the request checks' files again**: the JWT check's (`WEB_JWT_CONFIG`)
+  and the API firewall's (`WEB_API_FIREWALL_CONFIG`), with the Caddyfile and taken with it or not
+  at all. A file that does not load, or a check bound to an upstream the new Caddyfile no longer
+  sends to, refuses the reload and the running checks stay; otherwise the next request is
+  checked by the new files (one under way finishes with the old). They were read at startup only.
+  The checks are held as `checkfile::Reloadable` (staged, committed after the server took the
+  Caddyfile, or discarded); the JWKS and spec refresh tasks hold their check weakly and end with
+  it. `Config::jwt` and `Config::api_firewall` are `Reloadable`s: a check given by hand is
+  `Reloadable::new(check)`. A test of the binary (`tests/reload.rs`) sends it SIGHUP with both
+  files changed, with a broken one, with a broken Caddyfile and with a binding no route has.
+
 ## 0.1.6 — 2026-11-11
 
 The OWASP Core Rule Set v4 in the request filter, as an option: the cargo feature `ngfw-crs` builds

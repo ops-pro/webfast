@@ -1,7 +1,8 @@
 //! A configuration put in place while the server runs (`Running::reload`, SIGHUP): the sites
 //! change for the next request, also on a connection that stays open; site roots that stay are
 //! taken over, not read again; certificates are read again; what only a restart can change is
-//! refused, and the running configuration stays.
+//! refused, and the running configuration stays. The binary: SIGHUP reads the Caddyfile and the
+//! request checks' files again (WEB_JWT_CONFIG, WEB_API_FIREWALL_CONFIG), all or none.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -535,4 +536,230 @@ fn an_envfile_fills_the_placeholders() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("line 1: not KEY=VALUE"));
+}
+
+/// base64url without padding, for a test JWK.
+#[cfg(target_os = "linux")]
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// The binary with the JWT check and the API firewall (WEB_JWT_CONFIG, WEB_API_FIREWALL_CONFIG):
+/// SIGHUP reads their files again and the next request is checked by the new ones; a file that
+/// does not load refuses the reload, and the checks running stay.
+#[cfg(target_os = "linux")]
+#[test]
+fn sighup_reads_the_jwt_and_api_firewall_files_again() {
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let caddyfile = dir.path().join("Caddyfile");
+    // The access log on stdout: the token parameters' values hidden in it.
+    std::fs::write(
+        &caddyfile,
+        ":0 {\n\tlog {\n\t\toutput stdout\n\t}\n\trespond \"ok\"\n}\n",
+    )
+    .unwrap();
+
+    // JWT: a token needed under the paths of the rule.
+    let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+    let point = key.public_key().as_ref().to_vec();
+    let jwks = serde_json::json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k",
+        "x": base64url(&point[1..33]), "y": base64url(&point[33..65])}]});
+    let jwt_file = dir.path().join("jwt.yaml");
+    let params = std::cell::Cell::new("access_token");
+    let jwt = |paths: &str| {
+        let params = params.get();
+        format!(
+            "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\n    from_params: [{params}]\nrules:\n  - match: {{paths: [\"{paths}\"]}}\n    providers: [id]\n"
+        )
+    };
+    std::fs::write(&jwt_file, jwt("/api/*")).unwrap();
+
+    // The API firewall: the spec's operations under its base path, nothing else there.
+    std::fs::write(
+        dir.path().join("spec.yaml"),
+        "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths:\n  /items:\n    get:\n      responses: {'200': {description: ok}}\n",
+    )
+    .unwrap();
+    let firewall_file = dir.path().join("apifw.yaml");
+    let firewall = |base: &str| format!("apis:\n  - spec: spec.yaml\n    base_path: {base}\n");
+    std::fs::write(&firewall_file, firewall("/v1")).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_webfast"))
+        .args(["run", "--config"])
+        .arg(&caddyfile)
+        .env("WEB_WORKERS", "1")
+        .env("WEB_JWT_CONFIG", &jwt_file)
+        .env("WEB_API_FIREWALL_CONFIG", &firewall_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    // The access log, line by line, from a thread of its own.
+    let (access_lines, access) = std::sync::mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if access_lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // The access log's line of a request to `path`.
+    let access_line = |path: &str| -> String {
+        loop {
+            let line = access
+                .recv_timeout(Duration::from_secs(20))
+                .expect("an access log line");
+            if line.contains(path) {
+                return line;
+            }
+        }
+    };
+    let (lines, log) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // The log's lines up to one with `message`: that one, and the messages before it.
+    let wait_for = |message: &str| -> (serde_json::Value, Vec<String>) {
+        let mut before = Vec::new();
+        loop {
+            let line = log.recv_timeout(Duration::from_secs(20)).expect("the log line");
+            let json: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            if json["message"] == message {
+                return (json, before);
+            }
+            before.push(json["message"].as_str().unwrap_or("").to_string());
+        }
+    };
+    let address = wait_for("listening").0["address"].as_str().unwrap().to_string();
+    let port: u16 = address.rsplit(':').next().unwrap().parse().unwrap();
+    wait_for("started");
+    let status = |path: &str| -> u16 {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    };
+    let hangup = || {
+        // SAFETY: a signal to the child this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    };
+
+    // The access log hides the values of the parameters a token may come in, on a path no rule
+    // covers too (the JWT check does not run there).
+    assert_eq!(status("/open?access_token=eyJ.canary.one&x=1"), 200);
+    let line = access_line("/open?");
+    assert!(!line.contains("canary"), "{line}");
+    assert!(line.contains("/open?access_token=REDACTED&x=1"), "{line}");
+
+    // As started: a token under /api, the spec's operations under /v1.
+    assert_eq!(status("/api/x"), 401);
+    assert_eq!(status("/admin/x"), 200);
+    assert_eq!(status("/v1/items"), 200);
+    assert_eq!(status("/v1/other"), 403);
+    assert_eq!(status("/v2/other"), 200);
+
+    // Both files changed: the next request is checked by the new ones, and the access log hides
+    // the token parameter the new JWT file added.
+    params.set("access_token, token");
+    std::fs::write(&jwt_file, jwt("/admin/*")).unwrap();
+    std::fs::write(&firewall_file, firewall("/v2")).unwrap();
+    hangup();
+    let (_, before) = wait_for("configuration reloaded");
+    assert!(
+        before
+            .iter()
+            .any(|m| m.starts_with("request checks: JWT: ") && m.contains("1 rule(s)")),
+        "{before:?}"
+    );
+    assert!(
+        before.iter().any(|m| m.starts_with("request checks: API firewall: ")),
+        "{before:?}"
+    );
+    assert_eq!(status("/api/x"), 200);
+    assert_eq!(status("/admin/x"), 401);
+    assert_eq!(status("/v1/other"), 200);
+    assert_eq!(status("/v2/other"), 403);
+    assert_eq!(status("/v2/items"), 200);
+    assert_eq!(status("/open2?token=eyJ.canary.two"), 200);
+    let line = access_line("/open2?");
+    assert!(!line.contains("canary"), "{line}");
+    assert!(line.contains("/open2?token=REDACTED"), "{line}");
+
+    // A JWT file that does not load: the reload is refused, both checks stay as they are (the
+    // API firewall's file, changed too, is not taken either).
+    std::fs::write(&jwt_file, "providers: [not, a, map]\n").unwrap();
+    std::fs::write(&firewall_file, firewall("/v3")).unwrap();
+    hangup();
+    let (refused, _) = wait_for("configuration not reloaded; the running one stays");
+    assert!(refused["error"].as_str().unwrap().contains("JWT"), "{refused}");
+    assert_eq!(status("/admin/x"), 401);
+    assert_eq!(status("/api/x"), 200);
+    assert_eq!(status("/v2/other"), 403);
+    assert_eq!(status("/v3/other"), 200);
+
+    // A Caddyfile that does not load, the check files good: nothing changes either.
+    std::fs::write(&jwt_file, jwt("/api/*")).unwrap();
+    std::fs::write(&caddyfile, ":0 {\n\tnot_a_directive\n}\n").unwrap();
+    hangup();
+    wait_for("configuration not reloaded; the running one stays");
+    assert_eq!(status("/admin/x"), 401, "the JWT file was not taken alone");
+    assert_eq!(status("/api/x"), 200);
+
+    // Both good again: taken.
+    std::fs::write(&caddyfile, ":0 {\n\trespond \"ok\"\n}\n").unwrap();
+    hangup();
+    wait_for("configuration reloaded");
+    assert_eq!(status("/api/x"), 401);
+    assert_eq!(status("/admin/x"), 200);
+    assert_eq!(status("/v3/other"), 403);
+
+    // A JWT file bound to an upstream no reverse_proxy sends to: refused as at startup, checked
+    // against the staged file's bindings.
+    std::fs::write(
+        &jwt_file,
+        format!(
+            "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\nrules:\n  - match: {{upstreams: ['127.0.0.1:9']}}\n    providers: [id]\n"
+        ),
+    )
+    .unwrap();
+    hangup();
+    let (refused, _) = wait_for("configuration not reloaded; the running one stays");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("bound to upstreams no reverse_proxy sends to"),
+        "{refused}"
+    );
+    assert_eq!(status("/api/x"), 401, "the running JWT check stays");
+
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(child.wait().unwrap().success());
 }

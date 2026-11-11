@@ -166,8 +166,12 @@ once the server does: `begin` before the servers take the configuration (the JWT
 read, the modules' `start`), `finish` with the ports' states (API specs given as a path are read
 through the first port's routes; the variants get the callback that redoes ready answers).
 `extensions::reload_checks()` is the SIGHUP's: each module's `reload` (a file read again, and one
-that does not load keeps the running state). `server.rs` and `run.rs` call these five and name no
-extension.
+that does not load keeps the running state). The JWT check and the API firewall are held as
+`checkfile::Reloadable`: on a SIGHUP `Hooks::stage_checks` reads their files again and stages
+them (the new Caddyfile is checked against the staged bindings), then `commit_checks` puts them
+in place once the server has taken the Caddyfile, or `discard_checks` drops them when it did not;
+their background tasks hold them weakly and end with them. `server.rs` and `run.rs` call these
+and name no extension.
 
 The hooks are `&'static`, so an extension whose configuration must change on a reload keeps its
 state behind an `ArcSwap` and swaps it in place; the zero-sized proxy observer of such an

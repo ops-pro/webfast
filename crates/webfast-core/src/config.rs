@@ -53,12 +53,14 @@ pub struct Config {
     /// Query parameters the core's checks hide from the logs (the JWT's token parameters): a
     /// module that logs requests before them hides them too.
     pub hidden_params: Vec<String>,
-    /// JWT validation (WEB_JWT_CONFIG, src/jwt): every request is checked by it first.
+    /// JWT validation (WEB_JWT_CONFIG, src/jwt): every request is checked by it first. Read
+    /// again by a reload (src/checkfile.rs).
     #[cfg(feature = "jwt")]
-    pub jwt: Option<Arc<crate::jwt::JwtAuth>>,
-    /// OpenAPI request validation (WEB_API_FIREWALL_CONFIG, src/apifw), after the JWT check.
+    pub jwt: Option<Arc<crate::checkfile::Reloadable<crate::jwt::JwtAuth>>>,
+    /// OpenAPI request validation (WEB_API_FIREWALL_CONFIG, src/apifw), after the JWT check. Read
+    /// again by a reload.
     #[cfg(feature = "api-firewall")]
-    pub api_firewall: Option<Arc<crate::apifw::ApiFirewall>>,
+    pub api_firewall: Option<Arc<crate::checkfile::Reloadable<crate::apifw::ApiFirewall>>>,
     /// Certificates to obtain (src/acme): `None` when no site needs one.
     #[cfg(feature = "acme")]
     pub acme: Option<Arc<crate::acme::Settings>>,

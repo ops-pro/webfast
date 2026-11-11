@@ -940,7 +940,7 @@ async fn jwts_are_checked_before_the_routes() {
         "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\n    output_claim_to_headers: [{{header: X-User, claim: sub}}]\nrules:\n  - match: {{paths: [\"/api/*\"]}}\n    providers: [id]\n"
     );
     let jwt = webfast_core::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap();
-    let h = start_with(|config| config.jwt = Some(Arc::new(jwt))).await;
+    let h = start_with(|config| config.jwt = Some(Arc::new(webfast_core::checkfile::Reloadable::new(jwt)))).await;
 
     let missing = h.get("/api/echo", &[]).await;
     assert_eq!(missing.status, 401);
@@ -987,7 +987,9 @@ async fn jwts_are_checked_before_the_routes() {
 async fn api_requests_are_checked_against_the_spec() {
     let spec = "openapi: 3.0.3\ninfo: {title: t, version: '1'}\npaths:\n  /slurp:\n    post:\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {type: object, required: [n], properties: {n: {type: integer}}}\n      responses: {'200': {description: ok}}\n  /echo:\n    get:\n      parameters: [{name: q, in: query, schema: {type: integer}}]\n      responses: {'200': {description: ok}}\n";
     let firewall = webfast_core::apifw::ApiFirewall::from_spec(spec, "spec: inline\nbase_path: /api\n").unwrap();
-    let h = start_with(|config| config.api_firewall = Some(Arc::new(firewall))).await;
+    let h =
+        start_with(|config| config.api_firewall = Some(Arc::new(webfast_core::checkfile::Reloadable::new(firewall))))
+            .await;
     let post = |body: &'static str| {
         let request = Request::post(format!("{}/api/slurp", h.base))
             .header("content-type", "application/json")
@@ -1036,7 +1038,9 @@ async fn an_api_spec_from_behind_the_proxy_is_read_and_kept_current() {
     let yaml =
         "apis:\n  - spec: {uri: /api/openapi.json, refresh: 100ms}\n    base_path: /api\n    reason_header: true\n";
     let firewall = webfast_core::apifw::ApiFirewall::from_yaml(yaml, Path::new(".")).unwrap();
-    let h = start_with(|config| config.api_firewall = Some(Arc::new(firewall))).await;
+    let h =
+        start_with(|config| config.api_firewall = Some(Arc::new(webfast_core::checkfile::Reloadable::new(firewall))))
+            .await;
     let reason = |got: &Got| header(got, "apifw-validation-status").to_string();
 
     // No spec yet (the upstream answers 404): the API waits, the rest of the site does not.
@@ -1845,8 +1849,10 @@ async fn checks_bound_to_an_upstream_cover_what_goes_there() {
         let yaml = format!(
             "providers:\n  id:\n    issuer: https://id.test\n    jwks: '{jwks}'\nrules:\n  - match: {{upstreams: ['{ai}']}}\n    providers: [id]\n"
         );
-        config.api_firewall = Some(Arc::new(firewall));
-        config.jwt = Some(Arc::new(webfast_core::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap()));
+        config.api_firewall = Some(Arc::new(webfast_core::checkfile::Reloadable::new(firewall)));
+        config.jwt = Some(Arc::new(webfast_core::checkfile::Reloadable::new(
+            webfast_core::jwt::JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap(),
+        )));
     })
     .await;
     let reason = |got: &Got| header(got, "apifw-validation-status").to_string();
@@ -1883,7 +1889,7 @@ async fn checks_bound_to_an_upstream_no_route_sends_to_stop_the_start() {
         "spec: inline\nupstreams: ['127.0.0.1:19']\n",
     )
     .unwrap();
-    config.api_firewall = Some(Arc::new(firewall));
+    config.api_firewall = Some(Arc::new(webfast_core::checkfile::Reloadable::new(firewall)));
     let err = match server::start(config).await {
         Ok(_) => panic!("started"),
         Err(e) => format!("{e:#}"),

@@ -64,10 +64,19 @@ with, and no connection is cut by a reload. What the connections already open ge
   must fit `WEB_MAX_MEMORY`.
 - What only a restart can change is refused: other ports, TLS on or off on a port, `protocols`,
   `timeouts`, `strict_sni_host`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at
-  startup); the request checks (`WEB_JWT_CONFIG`, `WEB_API_FIREWALL_CONFIG`) are read at startup
-  and kept, and a Caddyfile whose routes no longer send to an upstream they are bound to is
-  refused. A module's own file (the request filter's, say) is read again by a reload; one that does
-  not load keeps its running state and says so. The `debug` option takes effect on a restart.
+  startup: the files they name are read again, the names are not). The `debug` option takes
+  effect on a restart.
+- The request checks' files — the JWT check's (`WEB_JWT_CONFIG`) and the API firewall's
+  (`WEB_API_FIREWALL_CONFIG`) — are read again with the Caddyfile and taken with it, or not at
+  all: one that does not load refuses the reload, the new Caddyfile is checked against the new
+  files' bindings (a check bound to an upstream no `reverse_proxy` sends to is refused, as at
+  startup), and the next request is checked by the new files once the reload went through. A
+  request under way finishes with the check it began with; the new file's keys (`jwks_uri`) and
+  specs (a `uri` or a path) are read as at startup. The query parameters a token may come in
+  (`from_params`) are hidden from the request filter's log as read at startup until a restart
+  (the reload says so when they changed).
+- A module's own file (the request filter's, say) is read again by a reload; one that does not
+  load keeps its running state and says so.
 - A reload that fails — a syntax error, a root that is missing, a certificate that cannot be read,
   one of the above — changes nothing: the log says `configuration not reloaded; the running one
   stays` with the reason. A reload that succeeds says `configuration reloaded`.
