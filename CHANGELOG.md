@@ -1,9 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.1.7 — 2026-11-11
+
+One log policy for every log line about a request: the access log, the JWT check's and the API
+firewall's event logs, and the request filter's of
+[webfast-modules 0.1.4](https://github.com/ops-pro/webfast-modules/releases/tag/v0.1.4). A
+credential is no longer written anywhere — not in a URI, not in a rule's matched text — and every
+line carries the request's id (docs/configuration.md, Log privacy; the design in
+docs/logging.md).
+
+Worth knowing when upgrading from 0.1.6:
+
+- With nothing configured the lines are as they were, with `REDACTED` where a credential was: the
+  query parameters a JWT may come in, in the access log's URI too; in the request filter's hits,
+  what a rule matched in `Authorization`, a cookie, a password field, a token's parameter or a
+  query, `Referer` or JSON body that carries one.
+- `request.id` is new in the access log's JSON line and in every event line, the same in all;
+  `{http.request.id}` gives it to an upstream (`header_up X-Request-Id {http.request.id}`). An
+  `X-Request-Id` and a `traceparent` are taken from a peer in `trusted_proxies` only.
+- New: the global option `log_policy` (webfast's own, not Caddy's: a Caddyfile with it does not
+  load in Caddy), `privacy` in a site's `log` and in a check's or the filter's `log:`, and
+  `WEB_LOG_HASH_KEY` for `hash` across replicas and restarts.
+- The access log's JSON line costs about 15% more to make (the id); the console line is as it was.
 
 ### Changes
 
+- The modules of webfast-modules 0.1.4: the request filter's lines on the event API, each hit's
+  matched text classed by where it came from, `log.privacy`, `request.id`.
 - **The access log hides tokens in the URI**: the values of the query parameters a JWT may come
   in (`from_params`) are `REDACTED` there, as the event logs have shown them; it wrote them as
   sent (a `?access_token=…` in clear on every request). The names are the JWT check's as loaded
