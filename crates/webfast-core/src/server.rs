@@ -414,8 +414,15 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
         common_headers(state, version, &mut response);
         return (response, None);
     };
+    // The request's id (src/reqid.rs), when a line may name it: the site logs, or a check may.
+    // In the request's extensions for the checks, the modules and `{http.request.id}`.
+    let id = (log.is_some() || state.hooks.ids).then(|| crate::reqid::RequestId::next(&parts.headers, conn.trusted));
+    if let Some(id) = &id {
+        parts.extensions.insert(id.clone());
+    }
     // What the access log needs, as cheap copies, and only when the site logs.
     let info = log.as_ref().map(|_| RequestInfo {
+        id,
         remote,
         client_ip,
         proto: proto_name(version),
@@ -692,6 +699,7 @@ impl Running {
             stores,
             watch,
             max_memory,
+            log_policy,
             ..
         } = config;
         let ports: Vec<u16> = self.ports.iter().map(|p| p.shape.port).collect();
@@ -762,6 +770,7 @@ impl Running {
         self.watcher = crate::watch::start(watch, &stores, &states, max_memory);
         self.stores = stores;
         self.ready = ready;
+        crate::privacy::install(log_policy);
         #[cfg(feature = "acme")]
         if let Some(settings) = acme {
             crate::acme::start(settings, self.resolvers());
@@ -800,6 +809,7 @@ impl Running {
 
 pub async fn start(config: Config) -> Result<Running> {
     crate::date::start();
+    crate::privacy::install(config.log_policy.clone());
     let (stop, _) = watch::channel(false);
     let mut running = Running {
         bound: Vec::new(),

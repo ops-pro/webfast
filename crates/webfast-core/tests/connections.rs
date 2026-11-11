@@ -207,6 +207,7 @@ async fn a_response_leaves_its_access_log_line_when_its_body_ends() {
     config.servers[0].sites[0].log = Some(std::sync::Arc::new(webfast_core::accesslog::AccessLog {
         output: webfast_core::accesslog::Output::parse("access.log", dir.path()),
         format: webfast_core::accesslog::Format::Console,
+        privacy: Default::default(),
     }));
     let running = server::start(config).await.unwrap();
     let port = running.bound[0].1.port();
@@ -231,5 +232,69 @@ async fn a_response_leaves_its_access_log_line_when_its_body_ends() {
         line.contains(" HTTP/1.1 GET example.test /logged?x=1 200 11 "),
         "{line}"
     );
+    running.shutdown(Duration::from_secs(1)).await;
+}
+
+/// `{http.request.id}` sent to the upstream is the id of the request's access log line; a client
+/// that is no trusted proxy cannot give its own.
+#[tokio::test]
+async fn the_upstream_and_the_access_log_share_the_request_id() {
+    // An upstream that answers with the `X-Request-Id` it was sent.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let id = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("x-request-id: "))
+                    .unwrap_or("")
+                    .to_string();
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{id}", id.len());
+                let _ = stream.write_all(answer.as_bytes()).await;
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("access.log");
+    let mut config = load(&format!(
+        ":0 {{\n\tlog\n\treverse_proxy {echo} {{\n\t\theader_up X-Request-Id {{http.request.id}}\n\t}}\n}}\n"
+    ));
+    config.servers[0].sites[0].log = Some(std::sync::Arc::new(webfast_core::accesslog::AccessLog {
+        output: webfast_core::accesslog::Output::parse("access.log", dir.path()),
+        format: webfast_core::accesslog::Format::Json,
+        privacy: Default::default(),
+    }));
+    let running = server::start(config).await.unwrap();
+    let port = running.bound[0].1.port();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let response = ask(
+        &mut stream,
+        "GET /up HTTP/1.1\r\nHost: example.test\r\nX-Request-Id: chosen-by-the-client\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let sent = response.split("\r\n\r\n").nth(1).unwrap().to_string();
+    assert_eq!(sent.len(), 32, "{sent:?}: the server's own id, not the client's");
+    let mut lines = String::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        webfast_core::accesslog::flush_all(Duration::from_secs(1));
+        lines = std::fs::read_to_string(&log).unwrap_or_default();
+        if !lines.is_empty() {
+            break;
+        }
+    }
+    let line: serde_json::Value = serde_json::from_str(lines.lines().next().expect("a log line")).unwrap();
+    assert_eq!(line["request"]["id"], sent.as_str(), "{line}");
     running.shutdown(Duration::from_secs(1)).await;
 }

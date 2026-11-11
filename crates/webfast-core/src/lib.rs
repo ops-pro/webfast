@@ -36,9 +36,11 @@ pub mod matcher;
 pub mod memo;
 pub mod module;
 pub mod placeholder;
+pub mod privacy;
 pub mod proxy;
 #[cfg(feature = "rate-limit")]
 pub mod ratelimit;
+pub mod reqid;
 pub mod run;
 pub mod server;
 pub mod sockets;

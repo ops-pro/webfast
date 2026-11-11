@@ -711,6 +711,22 @@ fn sighup_reads_the_jwt_and_api_firewall_files_again() {
     assert!(!line.contains("canary"), "{line}");
     assert!(line.contains("/open2?token=REDACTED"), "{line}");
 
+    // A `log_policy` in the new Caddyfile: in place for the next line (its secret parameter
+    // hidden, the address truncated), the JWT's still hidden beside it.
+    std::fs::write(
+        &caddyfile,
+        "{\n\tlog_policy {\n\t\tsecret_params sid\n\t\tpersonal truncate\n\t}\n}\n:0 {\n\tlog {\n\t\toutput stdout\n\t}\n\trespond \"ok\"\n}\n",
+    )
+    .unwrap();
+    hangup();
+    wait_for("configuration reloaded");
+    assert_eq!(status("/open3?sid=canary-three&token=eyJ.canary.four&q=1"), 200);
+    let line = access_line("/open3?");
+    assert!(!line.contains("canary"), "{line}");
+    assert!(line.contains("/open3?sid=REDACTED&token=REDACTED&q=1"), "{line}");
+    let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(json["request"]["client_ip"], "127.0.0.0", "{line}");
+
     // A JWT file that does not load: the reload is refused, both checks stay as they are (the
     // API firewall's file, changed too, is not taken either).
     std::fs::write(&jwt_file, "providers: [not, a, map]\n").unwrap();

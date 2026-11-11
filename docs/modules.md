@@ -245,7 +245,9 @@ What else the core makes available (all documented in the source):
 | the client's TLS fingerprint (`Ja4`, its parts, JA4_r from a parsed hello) | `webfast_core::ja4` |
 | matchers, `PathPattern`, `host_matches`, `clean_path` | `webfast_core::matcher` |
 | placeholders (`Template`, `Sole`) | `webfast_core::placeholder` |
-| an event log in the checks' JSON format, `HiddenParams` | `webfast_core::eventlog` |
+| an event log in the checks' JSON format: `EventKind`, `Field`, `EventLog::event` and `event_with` (a module's fields inside `request` too), `Fields` (`str`, `u64`, `value` with its source, `strs`, `numbers`, `object`, `list`), `CheckLog` (an output with its `privacy`), `record_with` (fields as JSON, until step 4 of docs/logging.md), `HiddenParams` | `webfast_core::eventlog` |
+| the log policy: classes, sources, actions (`Class`, `Source`, `Policy`; a composite value's part by `query_class`, `path_class`, `uri_class`), `Overrides` for a module's `log.privacy` | `webfast_core::privacy` |
+| the request's id (`RequestId`, in the request's extensions) | `webfast_core::reqid` |
 | HTTPS fetches with the built-in roots (`get`, `post_form`; cargo feature `fetch`) | `webfast_core::fetch` |
 | a worker thread with a current-thread runtime, a memory budget | `webfast_core::background` |
 | the client key the connection limits count by (`/64` for IPv6) | `webfast_core::guard::address_key` |

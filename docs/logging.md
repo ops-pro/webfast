@@ -1,7 +1,19 @@
 # Logging: one service, one privacy policy (design, proposed)
 
 Status: a proposal; step 1 is built (the access log and every event log's URI hide the JWT's
-token parameters as loaded now), the rest is not. It describes how every log line of the server — the access log,
+token parameters as loaded now), and step 2: the policy (classes, sources, actions,
+`log_policy`, `privacy` per output, `hash`, `path_classes`), the event API (src/eventlog.rs) with
+the JWT check and the API firewall on it, and the request's id (src/reqid.rs) in the access log's
+JSON line and in every event line; and step 3: the request filter of webfast-modules on the
+event API, its hits classed by their sources (its src/source.rs), its `log.privacy`. Step 4 is
+not. Where the build differs from the text below: an `EventKind` has no `logger` (the `EventLog` has it, as the output is configured there);
+a payload field written with `str` is not refused at compile time but taken as a secret, and a
+debug build panics, as on a field not declared; the head of a line has no User-Agent (the access
+log never wrote one, and the event logs' lines keep their fields); the request filter's
+User-Agent stays inside `request` as its own field. A module's fields inside `request` are
+declared apart (`EventKind::request`) and written by `EventLog::event_with`. `Config::hidden_params`
+and `HiddenParams` stay in the core until step 4, unused by the modules: the policy holds the
+JWT's parameters. It describes how every log line of the server — the access log,
 the request checks' event logs (JWT, API firewall), the modules' (the request filter, the browser
 challenge) — would be made, filtered and written by one service of the core, with the modules
 saying only *what happened* and *what each value is*, never where it goes or what to hide.
@@ -244,7 +256,6 @@ leaves today closes by itself.
 			/s/*/     secret
 			/users/*  personal
 		}
-		hash_key {$WEB_LOG_HASH_KEY}
 
 		personal show                          # the defaults below, for every output
 		payload show 200                       # cut to 200 bytes
@@ -264,7 +275,10 @@ SOC's event log shows more. The bounds are the classes', not the policy's: no ou
 example.com {
 	log {
 		output file /var/log/web/access.log
-		privacy { personal hash; payload drop }      # this output only
+		privacy {                                    # this output only
+			personal hash
+			payload drop
+		}
 	}
 }
 ```
@@ -275,6 +289,9 @@ log:
   output: /var/log/web/ngfw.log
   privacy: { personal: show, payload: show, secret: hash }
 ```
+
+The key of `hash` is `WEB_LOG_HASH_KEY`, else derived from `WEB_TLS_TICKET_SEED`, never written in
+the Caddyfile (a key in a file that is shown and versioned is no secret).
 
 **The defaults are today's lines minus the leaks:** `secret` redacted everywhere (the access log
 too), `personal` shown, `payload` shown and cut as now (`log.matched`, 200 bytes). A deployment

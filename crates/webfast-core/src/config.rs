@@ -53,6 +53,9 @@ pub struct Config {
     /// Query parameters the core's checks hide from the logs (the JWT's token parameters): a
     /// module that logs requests before them hides them too.
     pub hidden_params: Vec<String>,
+    /// The global `log_policy` (src/privacy.rs): what every log shows of a request. Put in place
+    /// at startup and by a reload that went through.
+    pub log_policy: crate::privacy::Policy,
     /// JWT validation (WEB_JWT_CONFIG, src/jwt): every request is checked by it first. Read
     /// again by a reload (src/checkfile.rs).
     #[cfg(feature = "jwt")]
@@ -315,6 +318,8 @@ struct Globals {
     email: Option<String>,
     acme_ca: Option<String>,
     acme_ca_root: Option<PathBuf>,
+    /// `log_policy { … }`.
+    log_policy: crate::privacy::Policy,
 }
 
 impl Default for Globals {
@@ -337,6 +342,7 @@ impl Default for Globals {
             email: None,
             acme_ca: None,
             acme_ca_root: None,
+            log_policy: Default::default(),
         }
     }
 }
@@ -726,6 +732,7 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         debug: globals.debug,
         modules: Default::default(),
         hidden_params: Vec::new(),
+        log_policy: globals.log_policy.clone(),
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "api-firewall")]
@@ -887,6 +894,7 @@ fn parse_globals(lines: &[Line]) -> Result<Globals> {
                 };
                 g.servers.push((listener, parse_server_opts(line)?));
             }
+            "log_policy" => g.log_policy = crate::privacy::Policy::parse(line)?,
             other => bail!(at_err(&line.at, format!("unsupported global option {other:?}"))),
         }
     }
@@ -1034,8 +1042,13 @@ fn parse_log(line: &Line) -> Result<AccessLog> {
     let mut log = AccessLog {
         output: Output::Stderr,
         format: Format::Json,
+        privacy: Default::default(),
     };
     for sub in line.block.as_deref().unwrap_or(&[]) {
+        if sub.name() == "privacy" {
+            log.privacy = crate::privacy::Overrides::parse_block(sub)?;
+            continue;
+        }
         let value = one_arg(sub)?;
         match (sub.name(), value.as_str()) {
             ("output", "stdout") => log.output = Output::Stdout,
@@ -2800,6 +2813,73 @@ mod tests {
                 _ => "other".to_string(),
             })
             .collect()
+    }
+
+    /// The global `log_policy` and a site log's `privacy`, with their bounds.
+    #[test]
+    fn log_policy_and_privacy() {
+        use crate::privacy::{Action, Privacy};
+        let config = compile_text(
+            "{
+	log_policy {
+		secret_params sid
+		personal truncate
+		payload show 64
+	}
+}
+:8080 {
+	log {
+		output discard
+		privacy {
+			personal hash
+		}
+	}
+	respond \"x\"
+}
+",
+        )
+        .unwrap();
+        assert_eq!(config.log_policy.secret_params, ["sid"]);
+        assert_eq!(config.log_policy.privacy.personal, Action::Truncate);
+        assert_eq!(config.log_policy.privacy.payload_len, 64);
+        let log = config.servers[0].sites[0].log.as_ref().unwrap();
+        assert_eq!(log.privacy.personal, Some(Action::Hash));
+        assert_eq!(
+            log.privacy.over(config.log_policy.privacy),
+            Privacy {
+                personal: Action::Hash,
+                payload: Action::Show,
+                secret: Action::Redact,
+                payload_len: 64
+            }
+        );
+        let refused = compile_text(
+            ":8080 {
+	log {
+		privacy {
+			secret show
+		}
+	}
+}
+",
+        );
+        let Err(error) = refused else {
+            panic!("secret show taken")
+        };
+        assert!(error.to_string().contains("secret cannot be show"), "{error}");
+        assert!(
+            compile_text(
+                "{
+	log_policy {
+		payload hash
+	}
+}
+:8080 {
+}
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]

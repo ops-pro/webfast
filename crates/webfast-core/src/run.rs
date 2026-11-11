@@ -29,7 +29,8 @@
 //! ends, src/tls.rs); WEB_TLS_TICKET_SEED, or WEB_TLS_TICKET_SEED_FILE naming a file that holds it:
 //! a secret of at least 32 bytes from which the TLS session ticket keys are made, the same on every
 //! replica given it and across restarts (src/tickets.rs; unset: keys of the process alone), and
-//! which the modules are given (`Module::seed`).
+//! which the modules are given (`Module::seed`), and from which the key of the hashes in the logs
+//! is derived unless WEB_LOG_HASH_KEY gives one (src/privacy.rs).
 //! With the cargo feature rate-limit: WEB_RATE_LIMIT_KEYS (1000000), the keys a `rate_limit` zone
 //! holds, WEB_RATE_LIMIT_DRY_RUN (off): count and log only, and WEB_MAX_UPSTREAM_REQUESTS_PER_IP
 //! (256; 0: no limit): a client's requests at the upstreams at once (src/ratelimit.rs).
@@ -354,6 +355,13 @@ fn limits_from_env(config: &mut config::Config, workers: Option<usize>) -> Resul
     for module in crate::module::registry().modules() {
         module.seed(ticket_keys.as_deref());
     }
+    // The key of the hashes in the logs (src/privacy.rs): WEB_LOG_HASH_KEY, else derived from the
+    // seed (the replicas hash alike), else drawn at the first hash.
+    let log_hash_key = std::env::var("WEB_LOG_HASH_KEY").ok().map(|k| k.trim().to_string());
+    if log_hash_key.as_deref().is_some_and(|k| k.len() < 16) {
+        return Err("WEB_LOG_HASH_KEY: at least 16 bytes".to_string());
+    }
+    crate::privacy::set_hash_key(log_hash_key.as_deref().map(str::as_bytes), ticket_keys.as_deref());
     let ticket_keys = match ticket_keys {
         Some(seed) => match crate::tickets::TicketKeys::new(&seed) {
             Ok(keys) => Some(std::sync::Arc::new(keys)),

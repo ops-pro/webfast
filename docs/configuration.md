@@ -14,13 +14,13 @@ Docker image starts with it.
 | Kind           | Supported                                                                                                                                                                                                                                                                                                                                      |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Syntax         | blocks, quotes and backticks, comments, `\` line continuation, `{$ENV}` / `{$ENV:default}`, snippets `(name)`, `import <snippet>` / `import <file or glob>`                                                                                                                                                                                    |
-| Global options | `auto_https off|disable_redirects|disable_certs`, `email`, `acme_ca`, `acme_ca_root` (Automatic certificates), `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host [on|insecure_off], timeouts { read_header, idle }, max_header_size <size> }`, `cache { … }` (Proxy cache)                                                                           |
-| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify), `tls <email>`, or no `tls` at all: the certificate is obtained (Automatic certificates); `log { output stdout\|stderr\|discard; format json\|console }`; `handle_errors [<status codes>] { … }`                                                                                                                                |
+| Global options | `auto_https off|disable_redirects|disable_certs`, `email`, `acme_ca`, `acme_ca_root` (Automatic certificates), `admin off`, `http_port`, `https_port`, `grace_period`, `debug`, `order`, `servers [:port] { trusted_proxies static …, trusted_proxies_strict, client_ip_headers, protocols, strict_sni_host [on|insecure_off], timeouts { read_header, idle }, max_header_size <size> }`, `cache { … }` (Proxy cache), `log_policy { … }` (Log privacy)                                                                           |
+| Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify), `tls <email>`, or no `tls` at all: the certificate is obtained (Automatic certificates); `log { output stdout\|stderr\|discard; format json\|console; privacy { … } }` (Log privacy); `handle_errors [<status codes>] { … }`                                                                                                                                |
 | Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `request_body { max_size }`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
 | reverse_proxy  | upstreams by address or name (resolved at start, refreshed at their TTL), `to`, every `lb_policy` (`random`, `random_choose`, `first`, `round_robin`, `weighted_round_robin`, `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`, `cookie`), `lb_retries`, `lb_try_duration`, `lb_try_interval`, passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`), `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }` (Upstreams) |
 | file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
-| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms; `{http.rate_limit.exceeded.name}` |
+| Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms; `{http.rate_limit.exceeded.name}`; `{http.request.id}` (Log privacy) |
 
 Semantics follow Caddy: the directive order and path-specificity sorting outside `route`, mutually
 exclusive `handle` blocks, deferred `header` operations, `try_files` matching directories only for
@@ -334,6 +334,84 @@ Caddy's directive has more. What is read, what is meant to come, and what is not
 
 A setting that is not read is an error at start, never ignored.
 
+### Log privacy
+
+What every log shows of a request — the access logs, the request checks' event logs — is set by
+one policy, the global option `log_policy`, read again by a reload (docs/logging.md has the
+model). Each value has a class: `secret` (credentials), `personal` (the client's address),
+`payload` (what the request carried, the URI's query values), `public` (what the server decided).
+Where a value came from may raise its class: a query parameter named in `secret_params`, or one
+a JWT may come in (`from_params`, as the JWT file is loaded now), is a secret; so are the
+`Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` headers and the ones
+`secret_headers` adds, and body fields named `password`, `secret`, `token`, `api_key`… and the
+ones `secret_fields` adds. `path_classes` gives a class to the path segments a `*` covers.
+
+```caddyfile
+{
+	log_policy {
+		secret_params sid sessionid
+		secret_headers x-api-key
+		secret_fields pincode
+		path_classes {
+			/reset/* secret
+			/users/*/orders personal
+		}
+		personal show      # show, truncate (/24, /48), hash, redact, drop
+		payload show 200   # show (cut to bytes), redact, drop
+		secret redact      # redact, hash
+	}
+}
+```
+
+The defaults are those above without the lists: the lines as before, with `REDACTED` for each
+secret. A site's `log` and a check's `log:` may set their own action for a class, in either
+direction, within the bounds of the class (a secret is never shown, and a body's password is never
+hashed even under `secret hash`):
+
+```caddyfile
+example.com {
+	log {
+		output stdout
+		privacy {
+			personal hash
+		}
+	}
+}
+```
+
+```yaml
+log: { output: /var/log/web/jwt.log, privacy: { personal: truncate } }
+```
+
+`hash` is an HMAC-SHA256, 16 hexadecimal characters after `h:`: the same value hashes alike in
+every line and every replica given the same key, `WEB_LOG_HASH_KEY` (at least 16 bytes), or, without
+it, one derived from `WEB_TLS_TICKET_SEED`; with neither, a key of the process alone. A reload
+keeps the key. A dropped address leaves its key out of a JSON line and is `-` in a console one.
+**The request's id.** Every line about a request — the access log's JSON line and every event
+log's — has `request.id`, the same in all of them whatever each hides: 32 hexadecimal
+characters, unique within the process by construction and across processes by 64 random bits
+drawn at start (not unguessable, nor need it be: it ties lines together, it grants nothing).
+`{http.request.id}` gives it to an upstream or an error page:
+
+```caddyfile
+example.com {
+	log
+	reverse_proxy app:8080 {
+		header_up X-Request-Id {http.request.id}
+	}
+}
+```
+
+From a peer in `trusted_proxies` an `X-Request-Id` (visible ASCII, at most 128 bytes) is taken as
+the id, and a W3C `traceparent` gives `request.trace_id` (a trace covers many requests, so it is
+never the id); from any other client both are ignored. A site that neither logs nor runs a request
+check carries no id, and `{http.request.id}` makes one at each use there. The console format
+of the access log is as it was.
+
+The modules' event lines (the request filter's) take the policy in their address and URI, with
+the policy's own privacy (their `log:` gets a `privacy` with step 3 of docs/logging.md); the
+values in their hits (`matched`) keep the module's own hiding until then.
+
 ### Request checks: JWT and OpenAPI
 
 
@@ -376,7 +454,7 @@ refuses the reload, and the checks running stay.
 
 ```yaml
 mode: block # block | log_only; a rule may set its own
-log: { output: /var/log/web/jwt.log } # see "Event logs" below; none: the server's log
+log: { output: /var/log/web/jwt.log } # see "Event logs" below; none: the server's log; privacy: Log privacy
 providers:
   keycloak:
     issuer: https://id.example.com/realms/main
@@ -425,7 +503,7 @@ cache: { tokens: 10000 }
 **OpenAPI** (`WEB_API_FIREWALL_CONFIG`), after Wallarm API Firewall:
 
 ```yaml
-log: { output: /var/log/web/api-firewall.log } # see "Event logs" below; none: the server's log
+log: { output: /var/log/web/api-firewall.log } # see "Event logs" below; none: the server's log; privacy: Log privacy
 apis:
   - spec: openapi.yaml # relative to this file; YAML or JSON, OpenAPI 3.0 or 3.1; or a source, below
     upstreams: [app:8787] # what the routes send to the app; none: checked before the routes
@@ -500,6 +578,7 @@ read-only container a file needs a writable mount for its directory.
   "logger": "jwt",
   "msg": "request refused",
   "request": {
+    "id": "6f0c2a9e41d3b7580000000000000001",
     "client_ip": "203.0.113.7",
     "method": "GET",
     "host": "api.example.com",
@@ -528,6 +607,9 @@ read-only container a file needs a writable mount for its directory.
 ## Differences from Caddy
 
 Those an answer shows are checked by `compat/`:
+
+- `log_policy` (a global option) and `privacy` in a site's `log` are webfast's own (Log privacy):
+  what the logs show of a request, by the class of each value.
 
 - ETags are hashes of the content (48 bits of BLAKE3 as 8 characters of base64url; a ninth
   character, `b`, `g` or `z`, for a representation `encode` made on the fly, `d` and 8 characters
@@ -627,6 +709,7 @@ its own, documented there; a variable of a module the binary was built without s
 | `WEB_TLS_STRICT_SNI`               | `off`       | `on`: a TLS handshake without SNI, or for a name no site names exactly or by a wildcard, gets no certificate and ends with an alert (docs/operations.md, TLS and HTTP/3) |
 | `WEB_TLS_TICKET_SEED`              | unset       | A secret of at least 32 bytes from which the TLS session ticket keys are made: replicas given the same seed resume each other's sessions, also after a restart (docs/operations.md, TLS and HTTP/3). Unset: keys of the process alone |
 | `WEB_TLS_TICKET_SEED_FILE`         | unset       | A file holding that secret (a mounted secret), in place of `WEB_TLS_TICKET_SEED`; not both |
+| `WEB_LOG_HASH_KEY`                 | unset       | The key of `hash` in the logs (Log privacy), at least 16 bytes. Unset: derived from `WEB_TLS_TICKET_SEED`, else a key of the process alone |
 | `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
 | `WEB_ACME_DIR`                     | `/data/acme` | where the obtained certificates, their keys and the ACME account are kept (Automatic certificates) |

@@ -11,6 +11,32 @@
   `from_params` hides it in the request filter's lines too (they kept the startup list; its hits'
   `matched` still do, until docs/logging.md's later steps). `eventlog::set_token_params` and
   `eventlog::redact_uri` are the shared list and its use.
+- **Log privacy** (docs/configuration.md, Log privacy; docs/logging.md step 2, its first part):
+  the global option `log_policy` sets what every log shows of a request by the class of each value
+  (`secret`, `personal`, `payload`, `public`) and where it came from (a query parameter, a header,
+  a cookie, a body field): `secret_params`, `secret_headers`, `secret_fields`, `path_classes`, and
+  per class `show`, `truncate`, `hash`, `redact` or `drop`, within the class's bounds. A site's
+  `log { privacy { … } }` and a JWT or API firewall file's `log: {privacy: …}` set their own. A
+  reload puts a new policy in place. `hash` is a keyed HMAC (`WEB_LOG_HASH_KEY`, else derived from
+  the ticket seed). The defaults keep the lines as they were. In the API: `privacy` (the policy,
+  `privacy::policy()`), `AccessLog::privacy`, `Config::log_policy`, `eventlog::CheckLog` and
+  `EventLog::of_check` for the core checks' `log:`; `eventlog::LogConfig` is as it was.
+- **The request's id** in every log line about a request: `request.id` in the access log's JSON
+  line and in every event log's, the same in all; `{http.request.id}` for `header_up` and error
+  pages; an `X-Request-Id` taken, and a `traceparent`'s trace id as `request.trace_id`, from a
+  trusted proxy only (docs/configuration.md, Log privacy). The id is made from a reference the
+  request carries (`reqid::RequestId`, in its extensions when its site logs or a request check
+  is loaded), its text at the line. The access log's JSON line costs about 15% more to make with
+  it (one core: 525 → 611 ns); the console line is as it was.
+- **The event API** (docs/logging.md, Events): a check declares its kinds of event and their
+  fields with their classes (`eventlog::EventKind`, `Field`) and gives each event through
+  `EventLog::event`; payload values come with their source (`Fields::value`), a hit raised to
+  secret by its source is hidden whole, and nothing is made for an output that does not want the
+  line. The JWT check and the API firewall write through it (the lines as before, with the id);
+  `EventLog::record` and the modules' `record_with` stay. For the modules (docs/logging.md,
+  step 3): `EventLog::event_with` and `EventKind::request` (fields inside `request`),
+  `Fields::strs`, `numbers`, `object` and `policy`, `Source::Personal`, and `Policy::query_class`,
+  `path_class` and `uri_class` (the class of the part of a query, path or URI a match touched).
 - docs/logging.md: the design of one log service with one privacy policy (value classes, sources,
   the event API for modules, the policy and its reload, the request's id), step 1 of it built.
 - **A reload (SIGHUP) reads the request checks' files again**: the JWT check's (`WEB_JWT_CONFIG`)

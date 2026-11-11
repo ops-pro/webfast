@@ -68,6 +68,8 @@ enum Var {
     ErrorMessage,
     /// In `handle_errors` routes: the `rate_limit` zone that refused the request.
     RateLimitZone,
+    /// `{http.request.id}`: the id the request's log lines carry (src/reqid.rs).
+    RequestId,
 }
 
 /// A template that is a client address and nothing else.
@@ -275,6 +277,7 @@ fn var_of(key: &str) -> Option<Var> {
         "http.request.remote.host" => Var::RemoteHost,
         "http.request.remote.port" => Var::RemotePort,
         "http.vars.client_ip" => Var::ClientIp,
+        "http.request.id" => Var::RequestId,
         "http.request.orig_uri" => Var::OrigUri,
         "http.request.orig_uri.path" => Var::OrigPath,
         "http.matchers.file.relative" => Var::FileRelative,
@@ -338,6 +341,12 @@ fn write_value(var: &Var, ctx: &Ctx, out: &mut String) {
         Var::ClientIp => {
             let _ = write!(out, "{}", ctx.client_ip);
         }
+        // The id the lines of the request carry; a site that neither logs nor runs a check has
+        // none on the request, and gets one of its own here (no line names it).
+        Var::RequestId => match ctx.req.extensions.get::<crate::reqid::RequestId>() {
+            Some(id) => id.write(out),
+            None => crate::reqid::RequestId::next(&ctx.req.headers, ctx.conn.trusted).write(out),
+        },
         Var::OrigUri => out.push_str(path_and_query(&ctx.orig_uri)),
         Var::OrigPath => {
             out.push_str(&percent_encoding::percent_decode_str(ctx.orig_uri.path()).decode_utf8_lossy());

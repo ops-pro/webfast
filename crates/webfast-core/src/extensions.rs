@@ -530,6 +530,9 @@ pub const REPRESENTATIONS: Representations = (
 /// keeps them), so a request copies a pointer at most.
 pub struct Hooks {
     pub request: RequestChecks,
+    /// Whether a request check or a module may write a line about a request: then every request
+    /// carries its id (src/reqid.rs), not only those of the sites that log.
+    pub ids: bool,
     /// `None` when no check has anything to do at a proxy: requests carry nothing for them.
     pub upstream: Option<UpstreamChecks>,
     /// The modules' sets (src/module.rs), as the binary composed them from this configuration.
@@ -540,7 +543,18 @@ impl Hooks {
     pub fn new(config: &Config) -> &'static Hooks {
         let upstream = compose_upstream(config);
         let modules = crate::module::registry().hooks(config);
+        #[allow(unused_mut)]
+        let mut ids = !config.modules.is_empty();
+        #[cfg(feature = "jwt")]
+        {
+            ids |= config.jwt.is_some();
+        }
+        #[cfg(feature = "api-firewall")]
+        {
+            ids |= config.api_firewall.is_some();
+        }
         Box::leak(Box::new(Hooks {
+            ids,
             request: compose_request(config, modules),
             upstream: upstream.bound().then_some(upstream),
             modules,

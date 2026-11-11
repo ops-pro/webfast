@@ -51,7 +51,7 @@ mod spec;
 pub use source::LocalFetch;
 
 use crate::body::{Body, empty};
-use crate::eventlog::{Event, EventLog, LogConfig};
+use crate::eventlog::{CheckLog, EventLog};
 use crate::guard::{LimitedBody, TooLargeError};
 use crate::handler::{decode_path, hostport_of, strip_port};
 use crate::matcher::{clean_path, host_matches, needs_clean};
@@ -84,7 +84,7 @@ pub enum Mode {
 struct FileConfig {
     apis: Vec<ApiConfig>,
     /// Where violations are written (src/eventlog.rs); none: the server's log.
-    log: Option<LogConfig>,
+    log: Option<CheckLog>,
 }
 
 #[derive(Deserialize)]
@@ -216,7 +216,7 @@ impl ApiFirewall {
         }
         Ok(ApiFirewall {
             apis,
-            log: EventLog::new("api-firewall", file.log.as_ref(), base),
+            log: EventLog::of_check("api-firewall", file.log.as_ref(), base),
         })
     }
 
@@ -341,13 +341,11 @@ impl ApiFirewall {
         let status = violation.status.unwrap_or(api.block_status);
         // A body over the limit or not readable cannot be passed on: refused in any mode.
         let refused = mode == Mode::Block || matches!(status, StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST);
-        self.log.record(&Event {
-            refused,
-            status: status.as_u16(),
-            client_ip,
-            parts,
-            reason: &violation.reason,
-            detail: &violation.detail,
+        let (kind, level) = crate::eventlog::check_kind(refused);
+        self.log.event(kind, level, parts, client_ip, |e| {
+            e.str("reason", &violation.reason);
+            e.str("detail", &violation.detail);
+            e.u64("status", u64::from(status.as_u16()));
         });
         if !refused {
             return Ok(body);

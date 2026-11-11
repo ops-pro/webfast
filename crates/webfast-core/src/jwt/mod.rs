@@ -73,7 +73,7 @@ struct FileConfig {
     #[serde(default)]
     mode: Mode,
     /// Where failed checks are written (src/eventlog.rs); none: the server's log.
-    log: Option<crate::eventlog::LogConfig>,
+    log: Option<crate::eventlog::CheckLog>,
 }
 
 /// What a failed check does: `block` answers 401 / 403; `log_only` writes the failure down and
@@ -355,7 +355,7 @@ impl JwtAuth {
             reserved,
             hidden_params: Arc::from(hidden_params),
             cache: cache::TokenCache::new(file.cache.tokens),
-            log: crate::eventlog::EventLog::new("jwt", file.log.as_ref(), base),
+            log: crate::eventlog::EventLog::of_check("jwt", file.log.as_ref(), base),
         })
     }
 
@@ -456,13 +456,11 @@ impl JwtAuth {
             },
         };
         let refused = rule.mode == Mode::Block;
-        self.log.record(&crate::eventlog::Event {
-            refused,
-            status: failure.answer().0.as_u16(),
-            client_ip,
-            parts,
-            reason: failure.code(),
-            detail: "",
+        let (kind, level) = crate::eventlog::check_kind(refused);
+        self.log.event(kind, level, parts, client_ip, |e| {
+            e.str("reason", failure.code());
+            e.str("detail", "");
+            e.u64("status", u64::from(failure.answer().0.as_u16()));
         });
         if refused { Err(refusal(failure)) } else { Ok(()) }
     }

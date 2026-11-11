@@ -52,11 +52,15 @@ pub enum Format {
 pub struct AccessLog {
     pub output: Output,
     pub format: Format,
+    /// The site log's `privacy { … }` over the global `log_policy` (src/privacy.rs).
+    pub privacy: crate::privacy::Overrides,
 }
 
 /// What is known about a request when it arrives (cheap copies: no strings are built until the
 /// line is written).
 pub struct RequestInfo {
+    /// The request's id (src/reqid.rs).
+    pub id: Option<crate::reqid::RequestId>,
     pub remote: SocketAddr,
     pub client_ip: IpAddr,
     pub proto: &'static str,
@@ -269,22 +273,38 @@ impl AccessLog {
     fn line(&self, info: &RequestInfo, status: u16, size: u64) -> String {
         let duration = info.started.elapsed();
         let host = info.host.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
-        // The values of the parameters a token may come in, hidden (the JWT check's, as loaded now).
-        let uri = crate::eventlog::redact_uri(info.uri.path_and_query().map_or("/", |pq| pq.as_str()), &[]);
+        // The policy in place (src/privacy.rs): the secret parameters' values hidden (the JWT
+        // check's, as loaded now, among them), the path's classed segments, the addresses.
+        let policy = crate::privacy::policy();
+        let privacy = self.privacy.over(policy.privacy);
+        let uri = policy.uri(info.uri.path_and_query().map_or("/", |pq| pq.as_str()), &privacy);
         let uri = uri.as_ref();
-        // The fixed part of a JSON line is about 300 bytes; host and URI on top (escaping may
+        // The fixed part of a JSON line is about 300 bytes, the id 40 more; host and URI on top (escaping may
         // still grow it, which is rare).
-        let mut line = String::with_capacity(320 + host.len() + uri.len());
+        let mut line = String::with_capacity(360 + host.len() + uri.len());
         match self.format {
             Format::Json => {
                 line.push_str(r#"{"level":"info","ts":"#);
                 write_timestamp(&mut line);
-                line.push_str(r#","logger":"http.log.access","msg":"handled request","request":{"remote_ip":""#);
-                let _ = write!(line, "{}", info.remote.ip());
-                line.push_str(r#"","remote_port":""#);
+                line.push_str(r#","logger":"http.log.access","msg":"handled request","request":{"#);
+                if let Some(id) = &info.id {
+                    write_id(&mut line, id);
+                }
+                // An address dropped by the privacy leaves its key out.
+                let mark = line.len();
+                line.push_str(r#""remote_ip":""#);
+                if crate::privacy::write_ip(&mut line, info.remote.ip(), &privacy) {
+                    line.push_str(r#"","#);
+                } else {
+                    line.truncate(mark);
+                }
+                line.push_str(r#""remote_port":""#);
                 let _ = write!(line, "{}", info.remote.port());
+                let mark = line.len();
                 line.push_str(r#"","client_ip":""#);
-                let _ = write!(line, "{}", info.client_ip);
+                if !crate::privacy::write_ip(&mut line, info.client_ip, &privacy) {
+                    line.truncate(mark);
+                }
                 line.push_str(r#"","proto":""#);
                 line.push_str(info.proto);
                 line.push_str(r#"","method":""#);
@@ -298,17 +318,36 @@ impl AccessLog {
                 let _ = writeln!(line, r#","size":{size},"status":{status}}}"#);
             }
             Format::Console => {
-                let _ = write!(
-                    line,
-                    "{} {} {} {host} {uri} {status} {size} ",
-                    info.client_ip, info.proto, info.method
-                );
+                if !crate::privacy::write_ip(&mut line, info.client_ip, &privacy) {
+                    line.push('-');
+                }
+                let _ = write!(line, " {} {} {host} {uri} {status} {size} ", info.proto, info.method);
                 // Milliseconds to three places, rounded, from the microseconds.
                 let micros = (duration.as_nanos() + 500) / 1000;
                 let _ = writeln!(line, "{}.{:03}ms", micros / 1000, micros % 1000);
             }
         }
         line
+    }
+}
+
+/// `"id":"…",` and, from a trusted `traceparent`, `"trace_id":"…",` (src/reqid.rs).
+pub(crate) fn write_id(line: &mut String, id: &crate::reqid::RequestId) {
+    line.push_str(r#""id":""#);
+    let start = line.len();
+    id.write(line);
+    // A given id is visible ASCII: only `"` and `\` need escaping, and rarely.
+    if id.is_given() && line[start..].contains(['"', '\\']) {
+        let given = line.split_off(start);
+        json_escape(line, &given);
+    }
+    line.push_str(r#"","#);
+    let mark = line.len();
+    line.push_str(r#""trace_id":""#);
+    if id.write_trace(line) {
+        line.push_str(r#"","#);
+    } else {
+        line.truncate(mark);
     }
 }
 
@@ -405,8 +444,9 @@ mod tests {
     /// the URI is as sent.
     #[test]
     fn token_parameters_are_hidden() {
-        crate::eventlog::set_token_params(&["wf_test_token".to_string()]);
+        crate::privacy::set_token_params(&["wf_test_token".to_string()]);
         let info = RequestInfo {
+            id: None,
             remote: "10.0.0.2:4000".parse().unwrap(),
             client_ip: "203.0.113.9".parse().unwrap(),
             proto: "HTTP/1.1",
@@ -419,6 +459,7 @@ mod tests {
             let line = AccessLog {
                 output: Output::Discard,
                 format,
+                privacy: Default::default(),
             }
             .line(&info, 200, 0);
             assert!(!line.contains("secret"), "{line}");
@@ -427,13 +468,100 @@ mod tests {
                 "{line}"
             );
         }
-        crate::eventlog::set_token_params(&[]);
+        crate::privacy::set_token_params(&[]);
         let line = AccessLog {
             output: Output::Discard,
             format: Format::Console,
+            privacy: Default::default(),
         }
         .line(&info, 200, 0);
         assert!(line.contains("eyJ.secret.one"), "no JWT check: the URI as sent");
+    }
+
+    /// An output's privacy: the addresses hashed, truncated or left out, in both formats.
+    #[test]
+    fn the_privacy_of_an_output() {
+        use crate::privacy::{Action, Overrides};
+        let info = RequestInfo {
+            id: None,
+            remote: "10.0.0.2:4000".parse().unwrap(),
+            client_ip: "203.0.113.9".parse().unwrap(),
+            proto: "HTTP/1.1",
+            method: Method::GET,
+            host: Some(HeaderValue::from_static("example.com")),
+            uri: Uri::from_static("/x?q=1"),
+            started: Instant::now(),
+        };
+        let line = |personal, format| {
+            AccessLog {
+                output: Output::Discard,
+                format,
+                privacy: Overrides {
+                    personal: Some(personal),
+                    ..Overrides::default()
+                },
+            }
+            .line(&info, 200, 0)
+        };
+        let json =
+            |personal| -> serde_json::Value { serde_json::from_str(line(personal, Format::Json).trim_end()).unwrap() };
+        let truncated = json(Action::Truncate);
+        assert_eq!(truncated["request"]["client_ip"], "203.0.113.0");
+        assert_eq!(truncated["request"]["remote_ip"], "10.0.0.0");
+        let hashed = json(Action::Hash);
+        assert!(
+            hashed["request"]["client_ip"].as_str().unwrap().starts_with("h:"),
+            "{hashed}"
+        );
+        let dropped = json(Action::Drop);
+        assert!(dropped["request"].get("client_ip").is_none(), "{dropped}");
+        assert!(dropped["request"].get("remote_ip").is_none(), "{dropped}");
+        assert_eq!(dropped["request"]["remote_port"], "4000");
+        assert_eq!(dropped["request"]["uri"], "/x?q=1");
+        assert!(line(Action::Drop, Format::Console).starts_with("- HTTP/1.1 GET example.com /x?q=1 200 0 "));
+        assert!(line(Action::Redact, Format::Console).starts_with("REDACTED HTTP/1.1 GET "));
+    }
+
+    /// The request's id first in `request`, a trusted one escaped; the console line as it was.
+    #[test]
+    fn the_request_id_is_in_the_json_line() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static(r#"lb-"7"\x"#));
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let info = |id| RequestInfo {
+            id: Some(id),
+            remote: "10.0.0.2:4000".parse().unwrap(),
+            client_ip: "203.0.113.9".parse().unwrap(),
+            proto: "HTTP/1.1",
+            method: Method::GET,
+            host: Some(HeaderValue::from_static("example.com")),
+            uri: Uri::from_static("/"),
+            started: Instant::now(),
+        };
+        let log = |format| AccessLog {
+            output: Output::Discard,
+            format,
+            privacy: Default::default(),
+        };
+        let own = crate::reqid::RequestId::next(&headers, false);
+        let line = log(Format::Json).line(&info(own.clone()), 200, 0);
+        assert!(line.contains(r#""request":{"id":""#), "{line}");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["request"]["id"], own.text());
+        assert!(parsed["request"].get("trace_id").is_none());
+        let given = crate::reqid::RequestId::next(&headers, true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(log(Format::Json).line(&info(given), 200, 0).trim_end()).unwrap();
+        assert_eq!(parsed["request"]["id"], r#"lb-"7"\x"#);
+        assert_eq!(parsed["request"]["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert!(
+            log(Format::Console)
+                .line(&info(own), 200, 0)
+                .starts_with("203.0.113.9 HTTP/1.1 GET example.com / 200 0 ")
+        );
     }
 
     #[test]
@@ -442,6 +570,7 @@ mod tests {
         json_escape(&mut out, "a\"b\\c\nd\u{1}");
         assert_eq!(out, "a\\\"b\\\\c\\nd\\u0001");
         let info = RequestInfo {
+            id: None,
             remote: "10.0.0.2:4000".parse().unwrap(),
             client_ip: "203.0.113.9".parse().unwrap(),
             proto: "HTTP/1.1",
@@ -453,6 +582,7 @@ mod tests {
         let log = AccessLog {
             output: Output::Discard,
             format: Format::Json,
+            privacy: Default::default(),
         };
         let line = log.line(&info, 200, 1234);
         assert!(line.ends_with('\n'));
@@ -472,6 +602,7 @@ mod tests {
         let console = AccessLog {
             output: Output::Discard,
             format: Format::Console,
+            privacy: Default::default(),
         };
         let line = console.line(&info, 200, 1234);
         let rest = line
