@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.6 — 2026-11-11
+
+The OWASP Core Rule Set v4 in the request filter, as an option: the cargo feature `ngfw-crs` builds
+in [webfast-modules 0.1.3](https://github.com/ops-pro/webfast-modules/releases/tag/v0.1.3)'s
+`webfast-ngfw-crs`, which runs the CRS as released, in SecLang, as a rule engine of the filter —
+one decision, one log line and one ban list with its built-in rules. How it differs from
+ModSecurity, Coraza and CrowdSec: [the CRS's documentation](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-crs.md#compared-with-modsecurity-coraza-and-crowdsec).
+
+Worth knowing when upgrading from 0.1.5:
+
+- The default build is unchanged: `ngfw-crs` is not a default feature, and the images are built
+  without it.
+- Built with it, the CRS is on in every filter file (`engines.crs` configures it, `engines: { crs:
+  false }` turns it off), and `rules.builtin` left out means the `cve` set alone — the `leakage`
+  set too is off then unless the file names it (`rules.builtin: [cve, leakage]`).
+- The filter's `log.passed` writes every request let through with hits, those that only log
+  included; a filter file may have `engines` (`engines.<name>: false` is no error in a build
+  without that engine).
+
+### Changes
+
+- The feature `ngfw-crs` (`ngfw` and `webfast-ngfw-crs`); `src/compose.rs` registers the CRS
+  engine with the filter before its file is read.
+- The request filter and the browser challenge are those of webfast-modules 0.1.3 (Cargo.lock):
+  the rule engine API of the filter, the CRS engine, and a body of a type the filter does not list
+  read for an engine that has rules for it.
+- CI's clippy builds the binary with `ngfw-crs` too; README and docs/overview.md name the feature.
+
 ## 0.1.5 — 2026-11-09
 
 The client's TLS fingerprint (JA4) on every TLS connection, and the request filter of
