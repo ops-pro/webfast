@@ -157,6 +157,26 @@ line (`docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" …:latest-ca
 --config /etc/caddy/Caddyfile` says so before anything is replaced), `LOG_LEVEL` and the `WEB_*`
 variables as for the other image. The access log is JSON on stdout as Caddy's is.
 
+### The full images
+
+The images and binaries above are built with the default cargo features. The `-full` builds add
+every module that is not a default — today the OWASP CRS in the request filter (`ngfw-crs`,
+[docs/ngfw-crs.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-crs.md)):
+
+| Build                  | Tags                                                 | Binary in the release            |
+| ---------------------- | ---------------------------------------------------- | -------------------------------- |
+| webfast                | `latest`, `<version>`, `sha-…`                       | `webfast-<version>-<target>`     |
+| Caddy-compatible       | `latest-caddy`, `<version>-caddy`, `sha-…-caddy`     |                                  |
+| full                   | `latest-full`, `<version>-full`, `sha-…-full`        | `webfast-full-<version>-<target>` |
+| full, Caddy-compatible | `latest-full-caddy`, `<version>-full-caddy`, `sha-…-full-caddy` |                       |
+
+The layouts are the same as without `-full`. One difference in behaviour: with the CRS built in,
+the request filter (on when `WEB_NGFW_CONFIG` names its file) runs the CRS, and its own built-in
+rule sets are off but `cve` unless `rules.builtin` in its file names them — the same file filters
+differently on the two images; `engines: { crs: false }` in the file turns the CRS off. Locally: `docker build --build-arg WEBFAST_FEATURES=ngfw-crs .`
+(`--target caddy` for the Caddy layout, `--target binary --output type=local,dest=out` for the
+binary alone).
+
 ## TLS and HTTP/3
 
 Give a site host names and `tls <cert.pem> <key.pem>`, and publish 443/tcp and 443/udp:

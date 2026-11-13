@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **The `-full` images and binaries**: the build with every module, the OWASP CRS in the request
+  filter too (the cargo feature `ngfw-crs`), as the tags `-full` and `-full-caddy`
+  (`latest-full`, `<version>-full`, `sha-…-full`) and the release assets `webfast-full-*`
+  (docs/operations.md, The full images). With the CRS the filter's built-in sets are off but `cve`
+  unless its file names them. `WEBFAST_FEATURES` in the Dockerfile, `FEATURES` in pgo/build.sh,
+  the Dockerfile's `binary` target.
+- The release notes list the images, with their links on ghcr.io and `docker pull`.
+
 ## 0.1.7 — 2026-11-11
 
 One log policy for every log line about a request: the access log, the JWT check's and the API

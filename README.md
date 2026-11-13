@@ -135,7 +135,9 @@ documentation:
   [docs/ngfw-crs.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/ngfw-crs.md)): the
   Core Rule Set v4 as released, in SecLang, interpreted inside the request filter as a rule
   engine of its own — one decision, one log line, one ban list with the filter's rules. With it,
-  the filter's built-in sets are off but `cve` unless its file names them.
+  the filter's built-in sets are off but `cve` unless its file names them. Built into the `-full`
+  images (`ghcr.io/ops-pro/webfast:latest-full`, `latest-full-caddy`) and `webfast-full-*`
+  binaries.
 - **Browser challenge** (`webfast-challenge`, [docs/challenge.md](https://github.com/ops-pro/webfast-modules/blob/main/docs/challenge.md)):
   a client proves it is a browser — a cookie, a script, a proof-of-work or a CAPTCHA — before a
   site answers, for every request or only once a client is over a rate; a signed cookie, no state
@@ -196,8 +198,8 @@ scripts/check.sh          # formatting, lints, tests, the minimum Rust version, 
 ```
 
 The same jobs run in CI ([`ci.yml`](.github/workflows/ci.yml)); [`release.yml`](.github/workflows/release.yml)
-builds the images for x86-64 and arm64 (`ghcr.io/ops-pro/webfast`, and `-caddy`) and the static
-binaries, with provenance attestations.
+builds the images for x86-64 and arm64 (`ghcr.io/ops-pro/webfast`, `-caddy`, and with every
+module `-full` and `-full-caddy`) and the static binaries, with provenance attestations.
 
 ## License
 

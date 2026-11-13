@@ -4,7 +4,8 @@
 # to scan or to exploit besides the server itself. Built with profile-guided optimisation
 # (pgo/build.sh: an instrumented build serves the sample site under a training load, without
 # network, and the release build is optimised by the profile it writes — about twice the build
-# time; --build-arg WEBFAST_PGO=0 builds without it). It starts with sample/Caddyfile and serves
+# time; --build-arg WEBFAST_PGO=0 builds without it). --build-arg WEBFAST_FEATURES=ngfw-crs adds
+# cargo features to the defaults: the -full images, with every module (the OWASP CRS too). It starts with sample/Caddyfile and serves
 # /srv: mount or copy a site there, and a Caddyfile of your own at /etc/webfast/Caddyfile
 # (docs/operations.md). The roots for HTTPS fetches (JWKS, API specs) are built in (webpki-roots).
 
@@ -30,14 +31,20 @@ COPY pgo ./pgo
 COPY sample ./sample
 RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch --locked
 ARG WEBFAST_PGO=1
+ARG WEBFAST_FEATURES=
 RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=webfast-target-${TARGETARCH},target=/src/target \
     CARGO_NET_OFFLINE=true TARGET="$(cat /target)" RUSTFLAGS="-Ctarget-feature=+crt-static" \
-    sh pgo/build.sh /out \
+    FEATURES="$WEBFAST_FEATURES" sh pgo/build.sh /out \
  && mkdir -p /srv /etc/webfast /data /config /caddy/etc /caddy/share && chown 10002:10002 /srv /data /config \
  && cp sample/Caddyfile sample/headers.caddy /etc/webfast/ \
  && cp sample/caddy/Caddyfile /caddy/etc/ && cp sample/caddy/index.html /caddy/share/
+
+# The binary alone (`--target binary --output type=local,dest=…`): the release's archive of a
+# build that has no binary of its own outside Docker (the -full one).
+FROM scratch AS binary
+COPY --from=build /out/webfast /webfast
 
 # The Caddy-compatible image (`--target caddy`; published as the `-caddy` tags): the same binary
 # laid out as the official caddy image, so `image: caddy` can become `image: …/webfast:…-caddy`

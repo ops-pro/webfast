@@ -3,7 +3,9 @@
 # unrepresentative). The image goes to ghcr.io/<owner>/webfast as one multi-arch manifest: tagged
 # sha-<commit> on every push to main, and on a tag vX.Y.Z also X.Y.Z and latest. The binaries are
 # static (musl) and, on a tag, published as release assets with checksums. The same build in the
-# layout of the official caddy image goes out as the -caddy tags. Every artifact gets a
+# layout of the official caddy image goes out as the -caddy tags. The build with every module (the
+# cargo feature ngfw-crs on top of the defaults: the OWASP CRS in the request filter) goes out as
+# the -full and -full-caddy tags and, on a tag, as webfast-full-* binaries. Every artifact gets a
 # provenance attestation (SLSA, Sigstore); a release also an SBOM attestation.
 name: Release
 
@@ -21,6 +23,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/${{ github.repository }}
+  # The cargo features the -full build adds to the defaults: every module that is not one.
+  FULL_FEATURES: ngfw-crs
 
 jobs:
   build:
@@ -63,6 +67,7 @@ jobs:
           tar -C out -czf "$name.tar.gz" webfast
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ steps.binary.outputs.name }}.tar.gz
@@ -111,22 +116,98 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.caddy.outputs.digest }}
           push-to-registry: true
+
+      # The build with every module (-full): the image, its Caddy-compatible layout and its binary,
+      # the last two from the build stage the first one filled (a cache scope of its own, so the
+      # default build's is not replaced).
+      - name: build and push the full image by digest
+        id: full
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: WEBFAST_FEATURES=${{ env.FULL_FEATURES }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}-full
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-full
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.full.outputs.digest }}
+          push-to-registry: true
+      - name: build and push the full caddy image by digest
+        id: full_caddy
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: caddy
+          build-args: WEBFAST_FEATURES=${{ env.FULL_FEATURES }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}-full
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.full_caddy.outputs.digest }}
+          push-to-registry: true
+      - name: the full binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: binary
+          build-args: WEBFAST_FEATURES=${{ env.FULL_FEATURES }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=out-full
+          cache-from: type=gha,scope=${{ matrix.arch }}-full
+      - name: name and check the full binary
+        id: full_binary
+        run: |
+          name="webfast-full-${{ steps.binary.outputs.version }}-${{ matrix.target }}"
+          ./out-full/webfast --version
+          file out-full/webfast
+          tar -C out-full -czf "$name.tar.gz" webfast
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.full_binary.outputs.name }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-full-${{ matrix.arch }}
+          path: |
+            ${{ steps.full_binary.outputs.name }}.tar.gz
+            ${{ steps.full_binary.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
       - name: keep the digests for the manifests
         run: |
-          mkdir -p digests/webfast digests/caddy
           # Named by the hex alone: upload-artifact refuses a colon in a file name.
-          digest="${{ steps.image.outputs.digest }}"
-          touch "digests/webfast/${digest#sha256:}"
-          digest="${{ steps.caddy.outputs.digest }}"
-          touch "digests/caddy/${digest#sha256:}"
+          keep() { mkdir -p "digests/$1"; touch "digests/$1/${2#sha256:}"; }
+          keep webfast "${{ steps.image.outputs.digest }}"
+          keep caddy "${{ steps.caddy.outputs.digest }}"
+          keep webfast-full "${{ steps.full.outputs.digest }}"
+          keep caddy-full "${{ steps.full_caddy.outputs.digest }}"
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
           path: digests/
           if-no-files-found: error
 
+  # One multi-arch manifest per variant, tagged as the header says with the variant's suffix.
   manifest:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: webfast
+            suffix: ''
+          - variant: caddy
+            suffix: -caddy
+          - variant: webfast-full
+            suffix: -full
+          - variant: caddy-full
+            suffix: -full-caddy
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -145,39 +226,19 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          flavor: suffix=${{ matrix.suffix }}
           tags: |
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: one manifest for both architectures
-        working-directory: digests/webfast
+        working-directory: digests/${{ matrix.variant }}
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
       - name: what was published
         run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
-      # The same tags with -caddy for the Caddy-compatible layout.
-      - name: the caddy tags
-        id: meta_caddy
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: suffix=-caddy
-          tags: |
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-      - name: one caddy manifest for both architectures
-        working-directory: digests/caddy
-        env:
-          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta_caddy.outputs.json }}
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
-      - name: what was published as caddy
-        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta_caddy.outputs.version }}"
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -212,8 +273,21 @@ jobs:
           awk -v head="## $version " 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' \
             CHANGELOG.md > notes.md
           grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
-          printf '\n---\n\nImage: `%s:%s` (linux/amd64, linux/arm64). Binaries: static (musl), with provenance and SBOM attestations (`gh attestation verify`).\n' \
-            "${{ env.IMAGE }}" "$version" >> notes.md
+          image="${{ env.IMAGE }}"
+          page="https://github.com/$GITHUB_REPOSITORY/pkgs/container/${image##*/}"
+          {
+            printf '\n---\n\n### Images\n\n'
+            printf 'linux/amd64 and linux/arm64, on [ghcr.io](%s):\n\n' "$page"
+            printf -- '- webfast: [`%s:%s`](%s)\n' "$image" "$version" "$page"
+            printf -- '- in the layout of the official caddy image: [`%s:%s-caddy`](%s)\n' "$image" "$version" "$page"
+            printf -- '- with every module, the OWASP CRS in the request filter too: [`%s:%s-full`](%s), [`%s:%s-full-caddy`](%s)\n\n' \
+              "$image" "$version" "$page" "$image" "$version" "$page"
+            printf '```sh\n'
+            for suffix in '' -caddy -full -full-caddy; do printf 'docker pull %s:%s%s\n' "$image" "$version" "$suffix"; done
+            printf '```\n\n'
+            printf 'With the CRS (the -full images and webfast-full-* binaries) the filter runs it, and its built-in sets are off but `cve` unless its file names them.\n\n'
+            printf 'Binaries: static (musl), with provenance and SBOM attestations (`gh attestation verify`); webfast-full-* with every module.\n'
+          } >> notes.md
           gh release create "${{ github.ref_name }}" assets/* \
             --title "webfast ${{ github.ref_name }}" \
             --notes-file notes.md \
