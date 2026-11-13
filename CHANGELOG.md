@@ -11,6 +11,8 @@
   unless its file names them. `WEBFAST_FEATURES` in the Dockerfile, `FEATURES` in pgo/build.sh,
   the Dockerfile's `binary` target.
 - The release notes list the images, with their links on ghcr.io and `docker pull`.
+- Dependencies: the week's compatible releases (rustls-webpki 0.103.17, webpki-roots 1.0.12,
+  zstd 0.14.4, flate2 1.1.11 and others).
 
 ## 0.1.7 — 2026-11-11
 
