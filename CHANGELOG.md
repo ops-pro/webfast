@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-11-13
+
+A build with every module active: the `-full` images (`ghcr.io/ops-pro/webfast:0.1.8-full`,
+`0.1.8-full-caddy`, `latest-full`, `latest-full-caddy`) and the `webfast-full-*` binaries carry
+the OWASP CRS in the request filter too, next to the default build, which is as it was.
+
+Worth knowing when choosing:
+
+- On the `-full` images the request filter (on when `WEB_NGFW_CONFIG` names its file) runs the
+  CRS, and its built-in rule sets are off but `cve` unless `rules.builtin` in its file names them:
+  the same filter file filters differently than on the default image. `engines: { crs: false }`
+  turns the CRS off.
+- The default images, tags and binaries are unchanged.
 
 ### Changes
 
