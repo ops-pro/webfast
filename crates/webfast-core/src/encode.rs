@@ -6,7 +6,10 @@
 //! it is produced. As in Caddy: the encoding with the client's highest q-value wins,
 //! ties go to the order the directive lists; strong ETags get `-<encoding>` appended (and that
 //! suffix is taken off If-None-Match on the way in); `Cache-Control: no-transform`, an existing
-//! Content-Encoding, 1xx/204/304 and bodies shorter than `minimum_length` are left alone.
+//! Content-Encoding, 1xx/204/206/304 and bodies shorter than `minimum_length` are left alone.
+//! `Vary: Accept-Encoding` goes on every response that could have been encoded, whether or not
+//! this client asked for an encoding, and on a 304 (as Caddy 2.11.9): a shared cache must know
+//! that the answer to the next client may differ.
 //! Unlike Caddy, `text/event-stream` is never compressed, nor a response with `Incremental: ?1`
 //! (RFC 10036; Caddy compresses it frame by frame).
 
@@ -250,11 +253,25 @@ impl Encode {
         Some(encoding)
     }
 
-    /// Compresses the response if it qualifies.
-    pub async fn apply(&self, encoding: Encoding, head_request: bool, response: Response<Body>) -> Response<Body> {
-        if head_request || !self.qualifies(&response) {
+    /// Compresses the response if it qualifies and the client takes `encoding`. A response that
+    /// qualifies says `Vary: Accept-Encoding` also when it goes out as it is (no encoding the
+    /// client takes, a HEAD), and so does a 304, which stands for a response that said it.
+    pub async fn apply(
+        &self,
+        encoding: Option<Encoding>,
+        head_request: bool,
+        mut response: Response<Body>,
+    ) -> Response<Body> {
+        if response.status() != StatusCode::NOT_MODIFIED && !self.qualifies(&response) {
             return response;
         }
+        let headers = response.headers_mut();
+        if !has_vary(headers, "accept-encoding") {
+            headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
+        let Some(encoding) = encoding.filter(|_| !head_request && response.status() != StatusCode::NOT_MODIFIED) else {
+            return response;
+        };
         let (mut parts, body) = response.into_parts();
         // No longer the stored file's bytes (src/memo.rs keeps no answer for it).
         parts.extensions.remove::<crate::memo::FromFile>();
@@ -266,9 +283,6 @@ impl Encode {
             .filter(|len| *len <= BUFFER_LIMIT);
         headers.remove(CONTENT_LENGTH);
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.name()));
-        if !has_vary(headers, "accept-encoding") {
-            headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
-        }
         headers.remove(ACCEPT_RANGES);
         if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok())
             && !etag.starts_with("W/")
@@ -323,7 +337,13 @@ impl Encode {
 
     fn qualifies(&self, response: &Response<Body>) -> bool {
         let status = response.status();
-        if status.is_informational() || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        // A part of a representation is not made into another one (its Content-Range would no
+        // longer describe it).
+        if status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED
+            || status == StatusCode::PARTIAL_CONTENT
+        {
             return false;
         }
         if !self.statuses.is_empty()
@@ -960,7 +980,7 @@ mod tests {
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         response.headers_mut().insert(ETAG, HeaderValue::from_static("\"abc\""));
-        let response = config.apply(encoding, false, response).await;
+        let response = config.apply(Some(encoding), false, response).await;
         assert_eq!(response.headers()[CONTENT_ENCODING], encoding.name());
         assert_eq!(
             response.headers()[ETAG],
@@ -981,7 +1001,7 @@ mod tests {
         response
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from(text.len()));
-        let response = config.apply(encoding, false, response).await;
+        let response = config.apply(Some(encoding), false, response).await;
         let length: usize = response.headers()[CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(length, body.len());
@@ -1047,7 +1067,7 @@ mod tests {
         response
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from(text.len()));
-        let response = config.apply(Encoding::Br, false, response).await;
+        let response = config.apply(Some(Encoding::Br), false, response).await;
         let length: usize = response.headers()[CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(length, body.len());
@@ -1056,6 +1076,75 @@ mod tests {
             .read_to_end(&mut plain)
             .unwrap();
         assert_eq!(plain, text.as_bytes());
+    }
+
+    /// What could have been encoded says `Vary: Accept-Encoding` whether or not it was: a shared
+    /// cache must not give one client's answer to the next without looking. What could not, does
+    /// not say it.
+    #[tokio::test]
+    async fn an_answer_that_could_be_encoded_says_it_varies() {
+        let config = Encode::default();
+        let page = |status: StatusCode, len: usize| {
+            let mut response = Response::new(crate::body::full("a".repeat(len)));
+            *response.status_mut() = status;
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+            response
+        };
+        let vary = |response: &Response<Body>| {
+            response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        // No encoding the client takes: the page as it is, and the header.
+        let identity = config.apply(None, false, page(StatusCode::OK, 2000)).await;
+        assert_eq!(vary(&identity), ["Accept-Encoding"]);
+        assert!(!identity.headers().contains_key(CONTENT_ENCODING));
+        assert_eq!(identity.headers()[CONTENT_LENGTH], "2000");
+        assert_eq!(identity.into_body().collect().await.unwrap().to_bytes().len(), 2000);
+        // A HEAD is not encoded either, and says it too.
+        let head = config
+            .apply(Some(Encoding::Gzip), true, page(StatusCode::OK, 2000))
+            .await;
+        assert_eq!(vary(&head), ["Accept-Encoding"]);
+        assert!(!head.headers().contains_key(CONTENT_ENCODING));
+        // Encoded: said once.
+        let encoded = config
+            .apply(Some(Encoding::Gzip), false, page(StatusCode::OK, 2000))
+            .await;
+        assert_eq!(vary(&encoded), ["Accept-Encoding"]);
+        assert_eq!(encoded.headers()[CONTENT_ENCODING], "gzip");
+        // A 304 stands for a response that said it, whatever else it carries.
+        let not_modified = config.apply(None, false, page(StatusCode::NOT_MODIFIED, 0)).await;
+        assert_eq!(vary(&not_modified), ["Accept-Encoding"]);
+        let encoded_304 = config
+            .apply(Some(Encoding::Gzip), false, page(StatusCode::NOT_MODIFIED, 0))
+            .await;
+        assert_eq!(vary(&encoded_304), ["Accept-Encoding"]);
+        assert!(!encoded_304.headers().contains_key(CONTENT_ENCODING));
+        // Already there (a file with precompressed siblings, an upstream's own): not said twice.
+        let mut already = page(StatusCode::OK, 2000);
+        already
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static("Origin, accept-encoding"));
+        assert_eq!(
+            vary(&config.apply(None, false, already).await),
+            ["Origin, accept-encoding"]
+        );
+        // Too short, a part of a representation, an image: never encoded, nothing to vary by.
+        for response in [page(StatusCode::OK, 100), page(StatusCode::PARTIAL_CONTENT, 2000)] {
+            let response = config.apply(Some(Encoding::Gzip), false, response).await;
+            assert!(vary(&response).is_empty() && !response.headers().contains_key(CONTENT_ENCODING));
+        }
+        let mut image = page(StatusCode::OK, 2000);
+        image
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+        assert!(vary(&config.apply(None, false, image).await).is_empty());
     }
 
     #[test]

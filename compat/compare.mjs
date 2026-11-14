@@ -9,8 +9,7 @@
 // compressed bytes of on-the-fly encoding (different compressors; the decoded bodies must match),
 // deferred site headers on failed requests (ours keep them), Retry-After values (the plugin's
 // sliding window and our GCRA count differently), the values of Cache-Status (the cache's name
-// and key) and Age, and ours' Vary and Age on the answers it gives from the cache in identity and
-// to HEAD.
+// and key) and Age, and ours' Age on the answers it gives from the cache to HEAD.
 import http from 'node:http';
 import zlib from 'node:zlib';
 
@@ -251,19 +250,11 @@ for (const [method, path, headers, body] of cases) {
       known.set(kind, (known.get(kind) ?? 0) + 1);
       continue;
     }
-    // Ours answers HEAD from what GET stored (Souin passes it on), and says that it chose the
-    // encoding by Accept-Encoding also when it chose none.
-    if (scenario === 'cache' && !va && vb) {
-      const kind =
-        name === 'age' && method === 'HEAD'
-          ? 'HEAD answered from what GET stored (ours)'
-          : name === 'vary' && vb === 'Accept-Encoding'
-            ? 'Vary on an identity answer from the cache (ours)'
-            : null;
-      if (kind) {
-        known.set(kind, (known.get(kind) ?? 0) + 1);
-        continue;
-      }
+    // Ours answers HEAD from what GET stored (Souin passes it on).
+    if (scenario === 'cache' && !va && vb && name === 'age' && method === 'HEAD') {
+      const kind = 'HEAD answered from what GET stored (ours)';
+      known.set(kind, (known.get(kind) ?? 0) + 1);
+      continue;
     }
     // How long to wait: a sliding window (the plugin) and GCRA (ours) count differently.
     if (name === 'retry-after' && va && vb) {

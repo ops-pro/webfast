@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`Vary: Accept-Encoding` on what `encode` could have compressed**, as Caddy 2.11.9: a response
+  that qualifies (its type, its length, no `no-transform`) says it also when it goes out as it is
+  — the client asked for no encoding, or a HEAD — and so does every 304 that passes `encode`.
+  Before, only a compressed response said it, so a shared cache in front could keep the identity
+  answer it gave a client without `Accept-Encoding` and serve it to everyone. With this the
+  `sample` and `cache` scenarios of compat/run.sh match Caddy 2.11.9 again.
+- A 206 is no longer compressed on the fly (its `Content-Range` would describe other bytes), as
+  in Caddy.
+
 ## 0.1.9 — 2026-11-14
 
 WebSocket through `reverse_proxy`: over HTTP/2 as well as HTTP/1.1; tunnels that the server ends

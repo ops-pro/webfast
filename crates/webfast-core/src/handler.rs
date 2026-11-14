@@ -186,9 +186,10 @@ enum Hook {
     Headers { list: Arc<[Route]>, index: usize },
     /// A deferred `header` with placeholders, filled in when it was reached.
     Rendered(Vec<RenderedOp>),
+    /// `encode`; `encoding`: the one the client takes, if any.
     Encode {
         encode: Arc<Encode>,
-        encoding: Encoding,
+        encoding: Option<Encoding>,
         head: bool,
     },
 }
@@ -1169,14 +1170,15 @@ impl Next {
                     if ctx.req.headers.contains_key(http::header::IF_NONE_MATCH) {
                         ctx.keep_sent_headers();
                     }
-                    if let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) {
-                        let head = ctx.req.method == http::Method::HEAD;
-                        ctx.hooks.push(Hook::Encode {
-                            encode: encode.clone(),
-                            encoding,
-                            head,
-                        });
-                    }
+                    // Recorded also when the client takes no encoding: a response that could have
+                    // been encoded still says that it varies by Accept-Encoding.
+                    let encoding = encode.choose(accept, &mut ctx.req.headers);
+                    let head = ctx.req.method == http::Method::HEAD;
+                    ctx.hooks.push(Hook::Encode {
+                        encode: encode.clone(),
+                        encoding,
+                        head,
+                    });
                     continue;
                 }
                 #[cfg(feature = "rate-limit")]
@@ -1379,9 +1381,7 @@ impl Handler {
                 if ctx.req.headers.contains_key(http::header::IF_NONE_MATCH) {
                     ctx.keep_sent_headers();
                 }
-                let Some(encoding) = encode.choose(accept, &mut ctx.req.headers) else {
-                    return next.run(ctx).await;
-                };
+                let encoding = encode.choose(accept, &mut ctx.req.headers);
                 let head = ctx.req.method == http::Method::HEAD;
                 let response = next.run(ctx).await;
                 encode.apply(encoding, head, response).await

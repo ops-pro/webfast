@@ -716,6 +716,10 @@ Those an answer shows are checked by `compat/`:
   modification time (as Caddy's), and answers at most one range: several get the whole file (Caddy:
   multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
+- As in Caddy 2.11.9, a response that `encode` could have compressed says `Vary:
+  Accept-Encoding` also when it goes out as it is (the client asked for no encoding, or a HEAD),
+  and so does a 304: a shared cache in front must not give one client's answer to the next
+  without looking. A 206 is never compressed on the fly, nor says it.
 - No automatic certificates (ACME): `tls` takes PEM files, which are re-read when they change.
 - `strict_sni_host` is on by default and answers 421 to a request whose Host is served with
   another certificate than the connection's (RFC 9110 §15.5.20); Caddy's `on` wants the Host to
@@ -746,8 +750,7 @@ Those an answer shows are checked by `compat/`:
   Accept-Encoding, each from the upstream); stored after the first client has its answer, so a
   miss's `Cache-Status` says `stored` before it is (Souin answers once stored); `stale` lets every
   answer be served stale (Souin: those whose Cache-Control allows it); HEAD is answered from what
-  GET stored (Souin passes it on), and an identity answer from the cache carries `Vary:
-  Accept-Encoding` too. `Cache-Status` names `webfast` and shows no key, and its values and `Age`
+  GET stored (Souin passes it on). `Cache-Status` names `webfast` and shows no key, and its values and `Age`
   differ; only memory as storage.
 
 ## Environment
