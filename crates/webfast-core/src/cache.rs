@@ -412,6 +412,8 @@ struct Fetch {
     headers: HeaderMap,
     /// The proxy's `header_down`, as it was filled in for that request.
     header_down: Vec<RenderedOp>,
+    /// The name that request's TLS handshake asked the upstream for, when it was its own.
+    server_name: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -531,6 +533,7 @@ enum Fetching {
         path_and_query: Option<Box<str>>,
         headers: HeaderMap,
         header_down: Vec<RenderedOp>,
+        server_name: Option<Box<str>>,
     },
 }
 
@@ -543,11 +546,13 @@ impl Fetching {
                 path_and_query,
                 headers,
                 header_down,
+                server_name,
             } => Arc::new(Fetch {
                 proxy,
                 path_and_query: path_and_query.unwrap_or_else(|| key.uri.clone()),
                 headers: background_headers(headers),
                 header_down,
+                server_name,
             }),
         }
     }
@@ -703,15 +708,15 @@ async fn refused(ctx: &mut Ctx, entry: &Entry) -> Option<Response<Body>> {
 impl Miss {
     /// The upstream answered: `Cache-Status` and `default_cache_control` on its response, and when
     /// it may be kept, its body passes through a tee that hands it to the worker once whole.
-    pub fn tee(
-        self,
-        proxy: &Arc<ReverseProxy>,
-        path_and_query: &str,
-        sent: &HeaderMap,
-        header_down: &[RenderedOp],
-        parts: &mut http::response::Parts,
-        body: Body,
-    ) -> Body {
+    /// `sent`: what the proxy sent, and how.
+    pub fn tee(self, sent: crate::extensions::Sent<'_>, parts: &mut http::response::Parts, body: Body) -> Body {
+        let crate::extensions::Sent {
+            proxy,
+            path_and_query,
+            headers: sent,
+            header_down,
+            server_name,
+        } = sent;
         if !parts.headers.contains_key(CACHE_CONTROL)
             && let Some(value) = &self.settings.default_cache_control
         {
@@ -746,6 +751,7 @@ impl Miss {
                 path_and_query: (path_and_query != self.key.uri()).then(|| path_and_query.into()),
                 headers: sent.clone(),
                 header_down: header_down.to_vec(),
+                server_name: server_name.map(Into::into),
             },
             miss: self,
         };
@@ -1355,7 +1361,11 @@ fn decode(encoding: Encoding, data: &[u8], cap: usize, expected: usize) -> Optio
 async fn fetch_encoded(fetch: &Fetch, encoding: Encoding, identity: &Bytes, cap: usize) -> Option<Bytes> {
     let mut headers = fetch.headers.clone();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(encoding.name()));
-    let response = fetch.proxy.fetch(&fetch.path_and_query, headers).await.ok()?;
+    let response = fetch
+        .proxy
+        .fetch(&fetch.path_and_query, headers, fetch.server_name.as_deref())
+        .await
+        .ok()?;
     let theirs = response
         .headers()
         .get(CONTENT_ENCODING)
@@ -1408,7 +1418,11 @@ async fn revalidate(entry: Arc<Entry>) {
             entry.revalidating.store(false, Ordering::Release);
         });
     };
-    let response = match fetch.proxy.fetch(&fetch.path_and_query, headers).await {
+    let response = match fetch
+        .proxy
+        .fetch(&fetch.path_and_query, headers, fetch.server_name.as_deref())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             tracing::debug!(uri = %entry.key.uri, %error, "revalidation failed; the stored response stays");
@@ -1542,14 +1556,7 @@ impl crate::extensions::ProxyObserver for Observer {
         body: Body,
     ) -> Body {
         match pending {
-            Some(miss) => miss.tee(
-                sent.proxy,
-                sent.path_and_query,
-                sent.headers,
-                sent.header_down,
-                parts,
-                body,
-            ),
+            Some(miss) => miss.tee(sent, parts, body),
             None => body,
         }
     }

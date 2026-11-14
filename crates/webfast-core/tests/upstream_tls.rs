@@ -14,8 +14,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use webfast_core::server;
 
-/// A certificate authority of the test's own, a server certificate for `backend.test` and
-/// 127.0.0.1, and a client certificate; `dir` holds `ca.pem`, `client.pem` and `client.key`.
+/// A certificate authority of the test's own, a server certificate for `backend.test`,
+/// `second.test` and 127.0.0.1, and a client certificate; `dir` holds `ca.pem`, `client.pem` and `client.key`.
 struct Pki {
     dir: tempfile::TempDir,
     server: Arc<rustls::ServerConfig>,
@@ -33,10 +33,14 @@ impl Pki {
         let issuer = Issuer::new(ca, ca_key);
 
         let server_key = KeyPair::generate().unwrap();
-        let server_cert = CertificateParams::new(vec!["backend.test".to_string(), "127.0.0.1".to_string()])
-            .unwrap()
-            .signed_by(&server_key, &issuer)
-            .unwrap();
+        let server_cert = CertificateParams::new(vec![
+            "backend.test".to_string(),
+            "second.test".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap()
+        .signed_by(&server_key, &issuer)
+        .unwrap();
         let client_key = KeyPair::generate().unwrap();
         let client_cert = CertificateParams::new(vec!["webfast.test".to_string()])
             .unwrap()
@@ -430,6 +434,11 @@ fn what_the_caddyfile_may_say_of_tls_to_an_upstream() {
         ),
     )
     .unwrap();
+    // The name may be the request's: any placeholder a request fills in.
+    for name in ["{host}", "{http.request.host}", "{header.X-Tenant}.backend.test"] {
+        loads("10.0.0.5:8443", &transport(&format!("\t\t\ttls_server_name {name}")))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
     let missing = loads(
         "10.0.0.5:8443",
         &transport("\t\t\ttls_trusted_ca_certs /nonexistent/ca.pem"),
@@ -438,10 +447,7 @@ fn what_the_caddyfile_may_say_of_tls_to_an_upstream() {
     assert!(missing.contains("/nonexistent/ca.pem"), "{missing}");
     for (lines, says) in [
         ("\t\t\ttls yes", "tls takes no arguments"),
-        (
-            "\t\t\ttls_server_name {http.request.host}",
-            "placeholders are not allowed",
-        ),
+        ("\t\t\ttls_server_name {nope}", "unknown placeholder"),
         (
             "\t\t\ttls_client_auth backend.test",
             "a certificate file and its key file",
@@ -854,4 +860,92 @@ fn what_the_caddyfile_may_say_of_versions() {
     let excepted = "\t\ttransport http {\n\t\t\tversions 3\n\t\t\ttls_except_ports 8080\n\t\t}";
     let error = loads("https://backend.test", excepted).unwrap_err();
     assert!(error.contains("cannot be combined"), "{error}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// `tls_server_name` with a placeholder: the name is the request's.
+
+/// One GET as `host`, on a connection of its own: the status, and of the upstream's account of
+/// it the name its handshake was asked for and which of its connections the request came on.
+async fn as_host(port: u16, host: &str) -> (u16, String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).await.unwrap();
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    let status = text[9..12].parse().unwrap();
+    let said = |key: &str| {
+        text.split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .unwrap_or("-")
+            .to_string()
+    };
+    assert!(status != 200 || said("xfh=") == host, "{text}");
+    (status, said("sni="), said("connection="))
+}
+
+#[tokio::test]
+async fn the_name_asked_for_can_be_the_request_s() {
+    let pki = Pki::new();
+    let both = [b"h2".as_slice(), b"http/1.1".as_slice()];
+    // The same over HTTP/1.1, HTTP/2 and HTTP/3: the handshake asks for the request's host, the
+    // certificate is verified for it, and each name has its connections to itself.
+    for (addr, versions) in [
+        (upstream(Some(pki.server.clone())).await, ""),
+        (upstream_h2(Some(pki.offering(&both)), false).await, ""),
+        (upstream_h3(&pki).await, "\t\t\tversions 3\n"),
+    ] {
+        let named = trusting(&pki, &format!("{versions}\t\t\ttls_server_name {{host}}\n"));
+        let (running, port) = start(&proxying(&format!("https://{addr}"), &named)).await;
+        let (status, name, first) = as_host(port, "backend.test").await;
+        assert_eq!((status, name.as_str()), (200, "backend.test"), "{addr} {versions}");
+        let (_, _, again) = as_host(port, "backend.test").await;
+        assert_eq!(again, first, "the name's connection is kept for it");
+        // Another name: a handshake of its own, so a connection of its own.
+        let (status, name, second) = as_host(port, "second.test").await;
+        assert_eq!((status, name.as_str()), (200, "second.test"));
+        assert_ne!(second, first, "a connection made for one name is not another's");
+        // Written in another case it is the same name.
+        let (status, name, back) = as_host(port, "Backend.TEST").await;
+        assert_eq!((status, name.as_str(), back), (200, "backend.test", first));
+        // A name the certificate is not for: no connection.
+        assert_eq!(as_host(port, "other.test").await.0, 502);
+        running.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_websocket_handshake_asks_for_the_request_s_name_too() {
+    let pki = Pki::new();
+    let addr = upstream(Some(pki.server.clone())).await;
+    let named = trusting(&pki, "\t\t\ttls_server_name {host}\n");
+    let (running, port) = start(&proxying(&format!("https://{addr}"), &named)).await;
+    let handshake = |host: &'static str| async move {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let request = format!(
+            "GET /ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let head = tokio::time::timeout(Duration::from_secs(5), read_head(&mut stream))
+            .await
+            .expect("an answer to the handshake")
+            .expect("an answer, not a closed connection");
+        (head, stream)
+    };
+    let (head, mut stream) = handshake("second.test").await;
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    stream.write_all(b"through").await.unwrap();
+    let mut back = [0u8; 7];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+        .await
+        .expect("the echo came back")
+        .unwrap();
+    assert_eq!(&back, b"through");
+    drop(stream);
+    // A name the upstream's certificate is not for: no tunnel.
+    let (head, _) = handshake("other.test").await;
+    assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
+    running.shutdown(Duration::from_secs(1)).await;
 }

@@ -371,7 +371,7 @@ reverse_proxy app-1:8080 app-2:8080 app-3:8080 {
 | `stream_close_delay <d>` | after a reload the tunnels opened under the configuration it replaced are closed with a Close frame, each at a moment of its own within this long, so that their clients come back spread over it (`0`: at once); unset: a reload closes, at once, only the tunnels to an upstream that the port's new configuration no longer names (the instance was taken out), and leaves the others open |
 | `https://host[:port]` upstreams, `transport http { tls }` | TLS to the upstreams (port 443 for `https://` without one). The scheme sets the transport of the whole proxy: `https://`, `http://` and `h2c://` upstreams cannot be mixed, and a port, 443 too, says nothing without a scheme. Any `tls_*` option turns TLS on as well |
 | `transport http { versions <1.1\|2\|h2c\|3 …> }`, `h2c://host:port` upstreams | the versions of HTTP the upstreams are spoken to in (`1.1 2` unless set; `h2c 2` for `h2c://` upstreams): see HTTP/2 and HTTP/3 to the upstream |
-| `transport http { tls_server_name <name> }` | the name asked for in the handshake and verified in the certificate, in place of the upstream's own host |
+| `transport http { tls_server_name <name> }` | the name asked for in the handshake and verified in the certificate, in place of the upstream's own host. With a placeholder (`{host}`) it is each request's own |
 | `transport http { tls_trusted_ca_certs <pem…> }`, `tls_trust_pool file <pem…>` | the authorities an upstream's certificate must come from, in place of the built-in roots |
 | `transport http { tls_client_auth <cert> <key> }` | the certificate shown to the upstream (mutual TLS) |
 | `transport http { tls_insecure_skip_verify }` | the upstream's certificate is not verified at all: for a test, not for production |
@@ -403,6 +403,31 @@ HTTP/2 when it takes it in the handshake and in HTTP/1.1 otherwise (the next sec
   host as written, a name or an address, which is also the name the handshake asks for (SNI; an
   address asks for none); `tls_server_name` gives another. The files are read when the
   configuration is loaded, and again at a reload; one that cannot be read stops the start.
+- **A name from the request.** `tls_server_name {host}` (any placeholder a request fills in)
+  asks for, and verifies, a name of the request's own: for an upstream that serves many names
+  at one address and chooses its certificate by the name asked for.
+
+  ```caddyfile
+  *.shop.example {
+  	reverse_proxy https://10.0.0.5 {
+  		header_up Host {hostport}
+  		transport http {
+  			tls_server_name {host}
+  		}
+  	}
+  }
+  ```
+
+  (`header_up Host {hostport}`: such an upstream nearly always chooses the site by Host as
+  well, and over TLS the Host it gets is otherwise the upstream as written — below.)
+
+  A connection is made for one name, so each name has its connections at the upstream apart
+  (one made for `a.shop.example` never carries a request of `b.shop.example`): 1024 names per
+  upstream address are remembered, those that keep no connection any more making room, and a
+  request with a name past them makes a connection for itself. The names are the requests', so
+  let only the names of your own through — a site address as the one above does, a site for
+  any host does not. A request that fills the name in with nothing asks for the upstream's own.
+  Caddy makes a transport for every request there instead.
 - **The Host the upstream gets** is the upstream as written, `host:port`, as Caddy sets it
   since 2.11: a server behind TLS nearly always answers under the name its certificate is for.
   The client's own Host is in `X-Forwarded-Host`; `header_up Host {hostport}` sends it as Host
@@ -469,7 +494,7 @@ Caddy's directive has more. What is read, what is meant to come, and what is not
 
 | Not meant to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `request_buffers`, `response_buffers` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_curves, tls_renegotiation, a tls_trust_pool other than file, tls_client_auth with a name for Caddy to obtain a certificate for, a placeholder in tls_server_name }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
+| `request_buffers`, `response_buffers` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_curves, tls_renegotiation, a tls_trust_pool other than file, tls_client_auth with a name for Caddy to obtain a certificate for }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
 
 A setting that is not read is an error at start, never ignored.
 
@@ -792,8 +817,8 @@ Those an answer shows are checked by `compat/`:
   multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
 - TLS to an upstream verifies against the Mozilla roots built into the binary, where Caddy
-  takes the system's store (the image has none); `tls_server_name` is a fixed name (Caddy: a
-  request placeholder too).
+  takes the system's store (the image has none). With a placeholder in `tls_server_name` the
+  connections are kept, apart by name; Caddy makes a transport for every such request.
 - HTTP/2 and HTTP/3 to an upstream use one connection per upstream address, and requests past
   the upstream's limit of streams wait; Caddy opens more connections. `h2c://` upstreams with
   TLS in the transport are an error (Caddy speaks HTTP/2 over that TLS).

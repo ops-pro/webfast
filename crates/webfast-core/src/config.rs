@@ -2153,6 +2153,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     }
     // `transport http { tls… }`: any of its options turns TLS to the upstreams on, as in Caddy.
     let mut tls: Option<crate::upstream_tls::Settings> = None;
+    // `tls_server_name` with a placeholder: a name per request (a fixed one is in `tls`).
+    let mut tls_server_name: Option<Template> = None;
     // `transport http { versions … }`; unset: `1.1 2`, or `h2c 2` for `h2c://` upstreams.
     let mut versions: Option<Versions> = None;
     let mut policy = Policy::Random;
@@ -2313,8 +2315,12 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                             if t.tokens.len() != 2 || t.block.is_some() {
                                 bail!(at_err(&t.at, "tls_server_name takes one name"));
                             }
-                            // Caddy also takes a request placeholder here; a fixed name only.
-                            tls.get_or_insert_default().server_name = Some(static_text(&t.tokens[1])?);
+                            // A fixed name, or — as in Caddy — one filled in from each request
+                            // (`{host}`).
+                            let name = template(&t.tokens[1])?;
+                            let settings = tls.get_or_insert_default();
+                            settings.server_name = name.as_static();
+                            tls_server_name = settings.server_name.is_none().then_some(name);
                         }
                         "tls_trusted_ca_certs" => {
                             if t.tokens.len() < 2 || t.block.is_some() {
@@ -2493,6 +2499,7 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         stream_timeout,
         stream_close_delay,
         tls,
+        tls_server_name,
         links,
         client,
     })

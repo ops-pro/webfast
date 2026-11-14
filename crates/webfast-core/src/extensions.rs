@@ -101,6 +101,10 @@ pub struct Sent<'a> {
     pub path_and_query: &'a str,
     pub headers: &'a HeaderMap,
     pub header_down: &'a [RenderedOp],
+    /// The name the request's TLS handshake with the upstream asked for, when it was the
+    /// request's own (`tls_server_name` with a placeholder): a request sent again later (a
+    /// revalidation) asks for the same.
+    pub server_name: Option<&'a str>,
 }
 
 /// Sees a proxied response on its way to the client (the proxy cache keeps it).
@@ -296,6 +300,7 @@ impl<A: ProxyObserver, B: ProxyObserver> ProxyObserver for (A, B) {
             path_and_query: sent.path_and_query,
             headers: sent.headers,
             header_down: sent.header_down,
+            server_name: sent.server_name,
         };
         let body = self.0.observe(pending.0, sent, parts, body);
         self.1.observe(pending.1, again, parts, body)

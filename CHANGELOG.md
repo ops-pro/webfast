@@ -10,8 +10,9 @@ Worth knowing when upgrading:
   the upstream's own `host:port` as the Host it gets.
 - `h2c://` upstreams and `transport http { versions … }` other than `1.1` were errors at start,
   and now load: HTTP/2 without TLS, and HTTP/3 (`versions 3`).
-- For code written against `webfast-core`: `ReverseProxy` has `tls` and `links`, and
-  `config::upstream_authority` reads `https://` and `h2c://` too.
+- For code written against `webfast-core`: `ReverseProxy` has `tls`, `tls_server_name` and
+  `links`; `extensions::Sent` has `server_name`; `config::upstream_authority` reads `https://`
+  and `h2c://` too.
 
 ### Changes
 
@@ -23,8 +24,13 @@ Worth knowing when upgrading:
   (`header_up Host {hostport}` keeps the client's). A handshake that fails is a connection that
   failed: 502, passive health, another upstream when `lb_retries` allows. WebSocket goes through the same TLS
   (`wss` to the upstream). Not read: `tls_curves`, `tls_renegotiation`, trust pools other than
-  `file`, a certificate obtained by a name for `tls_client_auth`, a placeholder in
-  `tls_server_name` (docs/configuration.md, TLS to the upstream).
+  `file`, a certificate obtained by a name for `tls_client_auth` (docs/configuration.md, TLS to
+  the upstream).
+- **`tls_server_name` with a placeholder**, as in Caddy: `tls_server_name {host}` asks an
+  upstream for, and verifies, a name of the request's own — for an upstream that serves many
+  names at one address and chooses its certificate by the name asked for. Each name has its
+  connections apart (1024 names per upstream address are remembered); WebSocket handshakes and
+  the cache's revalidations ask for the same name as the request did.
 - **HTTP/2 and HTTP/3 to the upstream**, as in Caddy: `transport http { versions 1.1 2 h2c 3 }`
   (`1.1 2` unless set) and `h2c://` upstreams. Over TLS a handshake offers HTTP/2 and HTTP/1.1
   and the upstream chooses (`versions 1.1`: HTTP/1.1 alone); `h2c` is HTTP/2 without TLS, from

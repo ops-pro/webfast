@@ -19,6 +19,10 @@
 //! `:authority` of an HTTP/2 request from one URI, and here they differ — a request goes to an
 //! address with the Host of the upstream as written, or of the client.
 //!
+//! `tls_server_name` with a placeholder names the handshake by the request (`{host}`: a tenant's
+//! own name at an upstream that serves many). A connection is made for one name, so each name
+//! has its connections apart at the address (`Link::named`), `NAMES` of them at most.
+//!
 //! `keepalive` (2 minutes unless set) is how long a connection without requests is kept;
 //! `keepalive off` keeps none: every request makes its own.
 
@@ -34,6 +38,7 @@ use http_body::{Body as _, Frame};
 use http_body_util::BodyExt;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,6 +60,10 @@ const H2_PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// than the idle timeout), and is lost when nothing comes from the upstream for `QUIC_IDLE`.
 const QUIC_PING: Duration = Duration::from_secs(10);
 const QUIC_IDLE: Duration = Duration::from_secs(30);
+
+/// The names of requests' own (`tls_server_name` with a placeholder) that one address keeps
+/// connections for, at most: a request with a name past them makes a connection of its own.
+const NAMES: usize = 1024;
 
 /// The HTTP/3 code for a connection closed without error.
 const H3_NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0x100);
@@ -368,9 +377,40 @@ pub struct Link {
     /// The last handshake over TLS chose HTTP/1.1: such connections are one request's each, so
     /// they are made side by side, not one at a time. Every one of them still offers HTTP/2.
     http1: AtomicBool,
+    /// The connections made for a name of the request's own, by that name.
+    names: Mutex<HashMap<Box<str>, Arc<Link>>>,
 }
 
 impl Link {
+    /// The connections of this address made for `name`, a name of the request's own. A name not
+    /// seen before first lets go of the names that keep no connection any more; one past `NAMES`
+    /// (and any, without `keepalive`) gets a link nothing remembers.
+    fn named(&self, name: &str, keepalive: Option<Duration>) -> Arc<Link> {
+        if keepalive.is_none() {
+            return Arc::default();
+        }
+        let mut names = locked(&self.names);
+        if let Some(link) = names.get(name) {
+            return link.clone();
+        }
+        names.retain(|_, link| Arc::strong_count(link) > 1 || link.keeps(keepalive));
+        let link = Arc::<Link>::default();
+        if names.len() < NAMES {
+            names.insert(name.into(), link.clone());
+        }
+        link
+    }
+
+    /// Whether a connection is kept here still; those that have closed, or have waited past
+    /// `keepalive`, are dropped on the way.
+    fn keeps(&self, keepalive: Option<Duration>) -> bool {
+        let now = now_ms();
+        let fresh = |since: u64| keepalive.is_some_and(|keep| now.saturating_sub(since) < keep.as_millis() as u64);
+        let mut idle = locked(&self.idle);
+        idle.retain(|entry| !entry.sender.is_closed() && fresh(entry.since));
+        !idle.is_empty() || self.shared2().is_some() || self.shared3().is_some()
+    }
+
     /// A kept HTTP/1.1 connection that is ready for a request; those that have closed, or have
     /// waited past `keepalive`, are dropped on the way.
     fn idle1(&self, keepalive: Option<Duration>) -> Option<http1::SendRequest<Body>> {
@@ -425,6 +465,15 @@ impl Link {
             *slot = None;
         }
     }
+}
+
+/// Where a request goes: the address, the connections kept for it there (those of its name,
+/// when the name is the request's own), and the name its TLS handshake asks for.
+#[derive(Clone, Copy)]
+struct To<'a> {
+    server: &'a Server,
+    link: &'a Link,
+    name: &'a str,
 }
 
 /// What sending on a connection came to.
@@ -617,13 +666,26 @@ impl Links {
         }
     }
 
-    /// Sends `out` to `server` and waits for the head of its answer.
-    pub async fn exchange(&self, server: &Server, via: Via, out: Outgoing) -> Result<Response<Incoming>, Failed> {
+    /// Sends `out` to `server` and waits for the head of its answer. `name`: the name the TLS
+    /// handshake asks for when it is the request's own (`tls_server_name` with a placeholder).
+    pub async fn exchange(
+        &self,
+        server: &Server,
+        via: Via,
+        out: Outgoing,
+        name: Option<&str>,
+    ) -> Result<Response<Incoming>, Failed> {
+        let named = name.map(|name| server.link.named(name, self.keepalive));
+        let to = To {
+            server,
+            link: named.as_deref().unwrap_or(&server.link),
+            name: name.unwrap_or_else(|| server.name.host()),
+        };
         let mut response = match via {
             Via::Pooled => return Err(Failed::connect("plain HTTP/1.1 goes by the pooled client")),
-            Via::Tls { http2 } => self.over_tcp(server, true, http2, out).await?,
-            Via::H2c => self.over_tcp(server, false, true, out).await?,
-            Via::Http3 => self.over_quic(server, out).await?,
+            Via::Tls { http2 } => self.over_tcp(to, true, http2, out).await?,
+            Via::H2c => self.over_tcp(to, false, true, out).await?,
+            Via::Http3 => self.over_quic(to, out).await?,
         };
         // As an answer of the pooled client: the version is the client's connection's to say.
         *response.version_mut() = Version::HTTP_11;
@@ -632,12 +694,12 @@ impl Links {
 
     async fn over_tcp(
         &self,
-        server: &Server,
+        to: To<'_>,
         tls: bool,
         http2: bool,
         mut out: Outgoing,
     ) -> Result<Response<Incoming>, Failed> {
-        let link = &server.link;
+        let To { server, link, .. } = to;
         let scheme = if tls { Scheme::HTTPS } else { Scheme::HTTP };
         let home = match self.keepalive {
             Some(_) => Arc::downgrade(&link.idle),
@@ -663,7 +725,7 @@ impl Links {
                 }
                 continue;
             }
-            match self.connect(server, tls, http2).await? {
+            match self.connect(to, tls, http2).await? {
                 Made::Http1(sender) => match send1(sender, home.clone(), out).await {
                     Sent::Answered(response) => return Ok(response),
                     Sent::Failed(failed) | Sent::Refused(failed) => return Err(failed),
@@ -680,8 +742,8 @@ impl Links {
 
     /// A new connection over TCP for a request, or the shared one another request made while
     /// this one waited.
-    async fn connect(&self, server: &Server, tls: bool, http2: bool) -> Result<Made, Failed> {
-        let link = &server.link;
+    async fn connect(&self, to: To<'_>, tls: bool, http2: bool) -> Result<Made, Failed> {
+        let link = to.link;
         let sharing = http2 && self.keepalive.is_some();
         let ours = |link: &Link| tls && link.http1.load(Ordering::Relaxed);
         let _turn = if sharing && !ours(link) {
@@ -700,7 +762,7 @@ impl Links {
         } else {
             None
         };
-        let made = self.dial(server, tls, http2).await;
+        let made = self.dial(to, tls, http2).await;
         match &made {
             Err(_) => {
                 link.failures.fetch_add(1, Ordering::Relaxed);
@@ -716,8 +778,8 @@ impl Links {
         made
     }
 
-    async fn dial(&self, server: &Server, tls: bool, http2: bool) -> Result<Made, Failed> {
-        let tcp = match tokio::time::timeout(self.dial_timeout, TcpStream::connect(server.addr)).await {
+    async fn dial(&self, to: To<'_>, tls: bool, http2: bool) -> Result<Made, Failed> {
+        let tcp = match tokio::time::timeout(self.dial_timeout, TcpStream::connect(to.server.addr)).await {
             Ok(Ok(tcp)) => tcp,
             Ok(Err(error)) => return Err(Failed::connect(error)),
             Err(_) => return Err(Failed::connect("connection timed out")),
@@ -730,7 +792,7 @@ impl Links {
         let Some(settings) = &self.tls else {
             return Err(Failed::connect("this proxy has no TLS"));
         };
-        let name = settings.name_for(server.name.host()).map_err(Failed::connect)?;
+        let name = settings.name_for(to.name).map_err(Failed::connect)?;
         let stream = settings
             .handshake(name, tcp, http2)
             .await
@@ -770,8 +832,8 @@ impl Links {
         Ok(Shared2 { sender, usage })
     }
 
-    async fn over_quic(&self, server: &Server, mut out: Outgoing) -> Result<Response<Incoming>, Failed> {
-        let link = &server.link;
+    async fn over_quic(&self, to: To<'_>, mut out: Outgoing) -> Result<Response<Incoming>, Failed> {
+        let To { server, link, .. } = to;
         // A connection — one kept from before, or the shared one another request has just made —
         // may take no more requests (closed, or told to finish), or take this one and refuse it:
         // the request then goes to another, after a refusal only without a body.
@@ -779,7 +841,7 @@ impl Links {
         'exchange: loop {
             let mut shared = match link.shared3() {
                 Some(shared) => shared,
-                None => self.connect_quic(server).await?,
+                None => self.connect_quic(to).await?,
             };
             shared.usage.touch();
             // The last connection tried takes the headers; before it they are kept.
@@ -861,8 +923,8 @@ impl Links {
     }
 
     /// A new HTTP/3 connection, or the one another request made while this one waited.
-    async fn connect_quic(&self, server: &Server) -> Result<Shared3, Failed> {
-        let link = &server.link;
+    async fn connect_quic(&self, to: To<'_>) -> Result<Shared3, Failed> {
+        let link = to.link;
         let sharing = self.keepalive.is_some();
         let _turn = if sharing {
             let seen = link.failures.load(Ordering::Relaxed);
@@ -879,7 +941,7 @@ impl Links {
         } else {
             None
         };
-        let made = self.dial_quic(server).await;
+        let made = self.dial_quic(to).await;
         match &made {
             Err(_) => {
                 link.failures.fetch_add(1, Ordering::Relaxed);
@@ -890,12 +952,13 @@ impl Links {
         made
     }
 
-    async fn dial_quic(&self, server: &Server) -> Result<Shared3, Failed> {
+    async fn dial_quic(&self, to: To<'_>) -> Result<Shared3, Failed> {
+        let To { server, name, .. } = to;
         let (Some(quic), Some(tls)) = (&self.quic, &self.tls) else {
             return Err(Failed::connect("this proxy has no QUIC"));
         };
         let endpoint = quic.endpoint(server.addr.is_ipv6()).map_err(Failed::connect)?;
-        let name = tls.name_for(server.name.host()).map_err(Failed::connect)?;
+        let name = tls.name_for(name).map_err(Failed::connect)?;
         let connecting = endpoint
             .connect_with(quic.config.clone(), server.addr, &name.to_str())
             .map_err(Failed::connect)?;
@@ -1196,6 +1259,33 @@ mod tests {
         assert_eq!(links(true, three, vec![]).unwrap().via(443), Via::Http3);
         let tls = None;
         assert!(Links::new(tls, three, Duration::from_secs(3), None).is_err());
+    }
+
+    #[test]
+    fn a_name_of_the_request_s_own_has_its_connections_apart() {
+        let link = Link::default();
+        let keep = Some(Duration::from_secs(120));
+        let first = link.named("a.test", keep);
+        assert!(Arc::ptr_eq(&first, &link.named("a.test", keep)));
+        assert!(!Arc::ptr_eq(&first, &link.named("b.test", keep)));
+        // A name nobody uses and nothing is kept for is let go of when a new one comes.
+        drop(first);
+        link.named("c.test", keep);
+        assert_eq!(locked(&link.names).len(), 1);
+        // No more than `NAMES` are remembered: one past them gets a link of its own each time.
+        let held: Vec<Arc<Link>> = (0..NAMES).map(|i| link.named(&format!("{i}.test"), keep)).collect();
+        assert_eq!(locked(&link.names).len(), NAMES);
+        let past = link.named("past.test", keep);
+        assert!(!Arc::ptr_eq(&past, &link.named("past.test", keep)));
+        assert!(Arc::ptr_eq(&held[7], &link.named("7.test", keep)));
+        assert_eq!(locked(&link.names).len(), NAMES);
+        // Without `keepalive` no connection is kept, so no name is.
+        let unkept = Link::default();
+        assert!(!Arc::ptr_eq(
+            &unkept.named("a.test", None),
+            &unkept.named("a.test", None)
+        ));
+        assert!(locked(&unkept.names).is_empty());
     }
 
     #[test]

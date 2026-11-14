@@ -29,6 +29,7 @@ use crate::body::{Body, boxed};
 use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, UpstreamHeld};
 use crate::guard::{Full, Place, Reloads, body_fault};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
+use crate::placeholder::Template;
 use crate::tunnel::{Counted, End};
 use crate::upstream_link::{Failed, Incoming, Links, Outgoing, Via, chain};
 use crate::upstream_tls::UpstreamTls;
@@ -86,6 +87,9 @@ pub struct ReverseProxy {
     /// TLS to the upstreams (`https://` upstreams, `transport http { tls… }`); `None`: plain
     /// HTTP.
     pub tls: Option<Arc<UpstreamTls>>,
+    /// `tls_server_name` with a placeholder: the name each request's handshake asks for and
+    /// verifies, filled in from the request (a fixed name is in `tls`).
+    pub tls_server_name: Option<Template>,
     /// The proxy's own connections, for everything but plain HTTP/1.1 (TLS, `versions`); `None`:
     /// `client` is all it needs.
     pub links: Option<Arc<Links>>,
@@ -386,6 +390,7 @@ impl ReverseProxy {
             self.render_down(&ctx)
         };
         let path_and_query = ctx.req.uri.path_and_query().cloned();
+        let server_name = self.server_name(&ctx);
         let method = ctx.req.method.clone();
         let mut body = ctx.body.take();
         // Without a body the request can be retried on another upstream (lb_try_duration).
@@ -423,7 +428,7 @@ impl ReverseProxy {
                 body: request_body,
             };
             let sent_at = timed.then(Instant::now);
-            let sent = self.send(server, out);
+            let sent = self.send(server, out, server_name.as_deref());
             // A failure: did the connection fail, did the response head run out of time, and was
             // the client's body at fault (stalled, or over its limit while it was being sent).
             let failed = |f: Failed| (f.connect, false, f.fault, f.error);
@@ -500,6 +505,7 @@ impl ReverseProxy {
                     path_and_query: path_and_query.as_ref().map_or("/", |pq| pq.as_str()),
                     headers: kept.as_ref().unwrap_or(&none),
                     header_down: &rendered_down,
+                    server_name: server_name.as_deref(),
                 };
                 let body = PROXY.observe(pending, sent, &mut parts, body);
                 ctx.respond_appending(Response::from_parts(parts, body))
@@ -548,7 +554,12 @@ impl ReverseProxy {
     /// A request of the server's own to an upstream (src/cache.rs: revalidations, and the
     /// upstream's own encodings of a response).
     #[cfg(feature = "proxy-cache")]
-    pub(crate) async fn fetch(&self, path_and_query: &str, headers: HeaderMap) -> Result<Response<Incoming>, String> {
+    pub(crate) async fn fetch(
+        &self,
+        path_and_query: &str,
+        headers: HeaderMap,
+        server_name: Option<&str>,
+    ) -> Result<Response<Incoming>, String> {
         let Some(server) = self.servers.any() else {
             return Err("no upstream is available".to_string());
         };
@@ -558,7 +569,7 @@ impl ReverseProxy {
             headers,
             body: crate::body::empty(),
         };
-        let sent = self.send(&server, out);
+        let sent = self.send(&server, out, server_name);
         match self.response_header_timeout {
             Some(limit) => match tokio::time::timeout(limit, sent).await {
                 Ok(result) => result.map_err(|failed| failed.error),
@@ -570,11 +581,16 @@ impl ReverseProxy {
 
     /// One attempt: `out` to `server`, by the pooled client in plain HTTP/1.1 or over one of the
     /// proxy's own connections (TLS, HTTP/2, HTTP/3), up to the head of the answer.
-    async fn send(&self, server: &Server, out: Outgoing) -> Result<Response<Incoming>, Failed> {
+    async fn send(
+        &self,
+        server: &Server,
+        out: Outgoing,
+        server_name: Option<&str>,
+    ) -> Result<Response<Incoming>, Failed> {
         if let Some(links) = &self.links {
             let via = links.via(server.addr.port());
             if via != Via::Pooled {
-                return links.exchange(server, via, out).await;
+                return links.exchange(server, via, out, server_name).await;
             }
         }
         let mut target = http::uri::Parts::default();
@@ -618,6 +634,15 @@ impl ReverseProxy {
         } else {
             Vec::new()
         }
+    }
+
+    /// `tls_server_name` with a placeholder, filled in from the request: the name its handshake
+    /// asks for, and the name its connection is kept by. `None` without a placeholder, and for a
+    /// request that fills it in with nothing (the upstream's own name then, as without the
+    /// setting).
+    fn server_name(&self, ctx: &Ctx) -> Option<String> {
+        let name = self.tls_server_name.as_ref()?.render(ctx).to_ascii_lowercase();
+        (!name.is_empty()).then_some(name)
     }
 
     /// The Host of a request to `server` when this proxy has TLS: the upstream as written
@@ -681,6 +706,7 @@ impl ReverseProxy {
             None => None,
         };
         let rendered_down = self.render_down(&ctx);
+        let server_name = self.server_name(&ctx);
         let target: Uri = ctx
             .req
             .uri
@@ -707,7 +733,10 @@ impl ReverseProxy {
             *request.headers_mut() = headers;
             let sent_at = timed.then(Instant::now);
             let tls = match &self.tls {
-                Some(tls) if tls.applies(server.addr.port()) => Some((tls.as_ref(), server.name.host())),
+                Some(tls) if tls.applies(server.addr.port()) => Some((
+                    tls.as_ref(),
+                    server_name.as_deref().unwrap_or_else(|| server.name.host()),
+                )),
                 _ => None,
             };
             let exchange = shake(self.dial_timeout, server.addr, tls, request);
