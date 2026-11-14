@@ -1,9 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.1.10 — 2026-11-14
 
-Worth knowing when upgrading:
+The upstreams of `reverse_proxy` over TLS and in every version of HTTP Caddy speaks to them —
+HTTP/2, HTTP/2 without TLS (h2c), HTTP/3 — with a TLS server name that may be the request's
+own; and two things agents meet at the edge: the Model Context Protocol's authorization, done
+by the JWT check, and the signed requests of bots told from the rest (docs/configuration.md,
+Upstreams and Request checks).
 
+Worth knowing when upgrading from 0.1.9:
+
+- `encode` now sets `Vary: Accept-Encoding` on every response it could have compressed, also
+  when it goes out as it is, and on every 304, as Caddy 2.11.9 does: a cache or CDN in front
+  keeps such answers apart by `Accept-Encoding` from now on. A 206 is no longer compressed on
+  the fly.
 - A `reverse_proxy` with an `https://` upstream was an error at start, and now loads: TLS to the
   upstream, its certificate verified against the Mozilla roots built in (or
   `tls_trusted_ca_certs`), HTTP/2 inside when the upstream takes it, and — as Caddy since 2.11 —
@@ -16,6 +26,8 @@ Worth knowing when upgrading:
   before the modules'.
 - The log lines of the JWT keys say "signing keys loaded" and "cannot read the signing keys"
   (they are the signed bots' too now), without "JWT".
+- The default build has one more feature, `bot-auth`; it does nothing until
+  `WEB_BOT_AUTH_CONFIG` names its file.
 
 ### Changes
 
