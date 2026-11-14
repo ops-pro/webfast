@@ -69,9 +69,12 @@ struct Key {
     kid: Option<String>,
     /// Its JWK thumbprint (RFC 7638; RFC 8037 for Ed25519), base64url: how HTTP Message
     /// Signatures of bots name a key (src/botauth.rs).
+    #[cfg(feature = "bot-auth")]
     thumbprint: String,
     /// When the key holds, when its JWK says (`nbf`, `exp`: key directories of bots do).
+    #[cfg(feature = "bot-auth")]
     not_before: Option<u64>,
+    #[cfg(feature = "bot-auth")]
     expires: Option<u64>,
     verifiers: Vec<(Alg, ParsedPublicKey)>,
 }
@@ -107,7 +110,9 @@ struct Jwk {
     e: Option<String>,
     x: Option<String>,
     y: Option<String>,
+    #[cfg(feature = "bot-auth")]
     nbf: Option<u64>,
+    #[cfg(feature = "bot-auth")]
     exp: Option<u64>,
 }
 
@@ -143,7 +148,7 @@ impl KeySet {
     }
 
     /// The keys' thumbprints, in the document's order.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "bot-auth"))]
     pub(crate) fn thumbprints(&self) -> Vec<String> {
         self.keys.iter().map(|key| key.thumbprint.clone()).collect()
     }
@@ -204,6 +209,7 @@ impl KeySet {
 }
 
 /// base64url without padding.
+#[cfg(feature = "bot-auth")]
 pub(crate) fn base64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -221,6 +227,7 @@ pub(crate) fn base64url(bytes: &[u8]) -> String {
 
 /// The JWK thumbprint (RFC 7638): SHA-256 of the key's required members, in their order, as
 /// its JWK has them.
+#[cfg(feature = "bot-auth")]
 fn thumbprint(members: &[(&str, &str)]) -> String {
     let mut json = String::from("{");
     for (i, (name, value)) in members.iter().enumerate() {
@@ -231,6 +238,26 @@ fn thumbprint(members: &[(&str, &str)]) -> String {
     }
     json.push('}');
     base64url(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, json.as_bytes()).as_ref())
+}
+
+/// A JWK's thumbprint, by its kind; empty for a kind that has none here (such a key is not
+/// taken anyway).
+#[cfg(feature = "bot-auth")]
+fn thumbprint_of(jwk: &Jwk) -> String {
+    fn member(value: &Option<String>) -> &str {
+        value.as_deref().unwrap_or("")
+    }
+    match (jwk.kty.as_str(), jwk.crv.as_deref()) {
+        ("RSA", _) => thumbprint(&[("e", member(&jwk.e)), ("kty", "RSA"), ("n", member(&jwk.n))]),
+        ("EC", Some(curve)) => thumbprint(&[
+            ("crv", curve),
+            ("kty", "EC"),
+            ("x", member(&jwk.x)),
+            ("y", member(&jwk.y)),
+        ]),
+        ("OKP", Some(curve)) => thumbprint(&[("crv", curve), ("kty", "OKP"), ("x", member(&jwk.x))]),
+        _ => String::new(),
+    }
 }
 
 impl Key {
@@ -246,20 +273,8 @@ impl Key {
             let text = value.as_deref().ok_or_else(|| anyhow!("no {name}"))?;
             super::token::decode(text).ok_or_else(|| anyhow!("{name} is not base64url"))
         };
-        fn member(value: &Option<String>) -> &str {
-            value.as_deref().unwrap_or("")
-        }
-        let print = match (jwk.kty.as_str(), jwk.crv.as_deref()) {
-            ("RSA", _) => thumbprint(&[("e", member(&jwk.e)), ("kty", "RSA"), ("n", member(&jwk.n))]),
-            ("EC", Some(curve)) => thumbprint(&[
-                ("crv", curve),
-                ("kty", "EC"),
-                ("x", member(&jwk.x)),
-                ("y", member(&jwk.y)),
-            ]),
-            ("OKP", Some(curve)) => thumbprint(&[("crv", curve), ("kty", "OKP"), ("x", member(&jwk.x))]),
-            _ => String::new(),
-        };
+        #[cfg(feature = "bot-auth")]
+        let print = thumbprint_of(&jwk);
         let (algs, bytes): (Vec<Alg>, Vec<u8>) = match (jwk.kty.as_str(), jwk.crv.as_deref()) {
             ("RSA", _) => {
                 let n = field(&jwk.n, "n")?;
@@ -299,8 +314,11 @@ impl Key {
         }
         Ok(Key {
             kid: jwk.kid,
+            #[cfg(feature = "bot-auth")]
             thumbprint: print,
+            #[cfg(feature = "bot-auth")]
             not_before: jwk.nbf,
+            #[cfg(feature = "bot-auth")]
             expires: jwk.exp,
             verifiers,
         })

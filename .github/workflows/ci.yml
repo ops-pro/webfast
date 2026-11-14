@@ -42,7 +42,7 @@ jobs:
           cargo clippy --locked -p webfast --all-targets --no-default-features -- -D warnings
       - name: each of the core's extensions alone
         run: |
-          for feature in mimalloc rate-limit proxy-cache jwt api-firewall compress-files acme fetch test-harness; do
+          for feature in mimalloc rate-limit proxy-cache jwt bot-auth api-firewall compress-files acme fetch test-harness; do
             echo "::group::$feature"
             cargo clippy --locked -p webfast-core --all-targets --no-default-features --features "$feature" -- -D warnings
             echo "::endgroup::"
