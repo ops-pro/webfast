@@ -2383,6 +2383,7 @@ dependencies = [
  "brotli",
  "bytes",
  "flate2",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
@@ -2416,6 +2417,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "webpki-roots",
  "zstd",
 ]
 

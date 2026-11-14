@@ -32,7 +32,9 @@ test. Paths below are relative to the crate (`src/` of the core unless said othe
 | `src/cache.rs`                                   | `cache` (cargo feature `proxy-cache`): proxied answers in memory, the worker that stores them       |
 | `src/watch.rs`                                   | changed files picked up: inotify or polling                                                         |
 | `src/encode.rs`                                  | Accept-Encoding and on-the-fly zstd / Brotli / gzip                                                 |
-| `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; the WebSocket handshake                                    |
+| `src/proxy.rs`                                   | `reverse_proxy`: the request to an upstream and its answer; the WebSocket handshake                 |
+| `src/upstream_link.rs`                           | the proxy's own connections to an upstream: over TLS (HTTP/1.1, HTTP/2), h2c, HTTP/3; `versions`    |
+| `src/upstream_tls.rs`                            | TLS to the upstreams: the client configuration, what a handshake offers                             |
 | `src/tunnel.rs`                                  | a tunnel's life: both ways copied and counted, WebSocket frames followed, the Close frame          |
 | `src/server.rs`                                  | listeners, connections, runtimes; one request on any protocol                                       |
 | `src/h3.rs`, `src/h3limit.rs`                    | HTTP/3 over QUIC, and its frame size limit                                                          |
@@ -43,6 +45,7 @@ test. Paths below are relative to the crate (`src/` of the core unless said othe
 | `tests/serve.rs`                                 | end to end, against real HTTP/1.1, HTTP/2 and HTTP/3 clients                                        |
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
 | `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
+| `tests/upstream_tls.rs`                          | `reverse_proxy` to an upstream over TLS, HTTP/2, h2c and HTTP/3, with a CA made by the test         |
 | `tests/errors.rs`                                | `handle_errors` and `error`, as Caddy answers them                                                  |
 | `tests/dictionaries.rs`                          | compression dictionaries: `dcz` deltas to a file or to a replaced version                           |
 | `tests/disk.rs`                                  | files over `WEB_MAX_FILE_IN_MEMORY`, streamed from disk                                             |

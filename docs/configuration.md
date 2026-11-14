@@ -18,7 +18,7 @@ Docker image starts with it.
 | Site           | addresses `:port`, `host`, `host:port`, `http://…`, `https://…` (several per block); `tls <cert> <key>` (repeatable: several certificates, each client gets one it can verify), `tls <email>`, or no `tls` at all: the certificate is obtained (Automatic certificates); `log { output stdout\|stderr\|discard; format json\|console; privacy { … } }` (Log privacy); `handle_errors [<status codes>] { … }`                                                                                                                                |
 | Directives     | `root`, `header` (set, `+`add, `-`delete incl. `-Prefix*`, `?`default, `defer`), `request_header`, `request_body { max_size }`, `redir` (3xx, `permanent`, `temporary`, `html`), `rewrite`, `try_files`, `encode`, `route`, `handle`, `handle_path`, `error`, `respond`, `reverse_proxy`, `file_server`, `rate_limit` (Rate limits), `cache` (Proxy cache)                  |
 | Matchers       | `path`, `path_regexp`, `file` (`root`, `try_files`, `try_policy first_exist`), `not`, `host`, `method`, `header`, `client_ip`, `remote_ip`, `protocol`; inline `*`, `/path`, `@name`                                                                                                                                                           |
-| reverse_proxy  | upstreams by address or name (resolved at start, refreshed at their TTL), `to`, every `lb_policy` (`random`, `random_choose`, `first`, `round_robin`, `weighted_round_robin`, `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`, `cookie`), `lb_retries`, `lb_try_duration`, `lb_try_interval`, passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`), `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }` (Upstreams) |
+| reverse_proxy  | upstreams by address or name (resolved at start, refreshed at their TTL), `to`, every `lb_policy` (`random`, `random_choose`, `first`, `round_robin`, `weighted_round_robin`, `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`, `cookie`), `lb_retries`, `lb_try_duration`, `lb_try_interval`, passive health (`fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`), `flush_interval`, `header_up`, `header_down`, `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions, tls, tls_server_name, tls_trusted_ca_certs, tls_trust_pool file, tls_client_auth, tls_insecure_skip_verify, tls_except_ports, tls_timeout }`, `https://` and `h2c://` upstreams, HTTP/2 and HTTP/3 to them (Upstreams) |
 | file_server    | `root`, `index`, `hide`, `precompressed`, `pass_thru`, `disable_canonical_uris`                                                                                                                                                                                                                                                                |
 | Placeholders   | `{path}`, `{dir}`, `{file}`, `{query}`, `{uri}`, `{host}`, `{hostport}`, `{method}`, `{scheme}`, `{remote_host}`, `{remote_port}`, `{client_ip}`, `{header.*}`, `{re.<name>.<group>}`, `{file_match.*}`, `{env.*}`, `{err.status_code}`, `{err.status_text}`, `{err.message}` and their `http.*` long forms; `{http.rate_limit.exceeded.name}`; `{http.request.id}` (Log privacy) |
 
@@ -369,6 +369,14 @@ reverse_proxy app-1:8080 app-2:8080 app-3:8080 {
 | `unhealthy_request_count <n>`                          | a server with this many requests under way — a WebSocket tunnel is one until it closes — is not chosen (0: no limit; with `fail_duration` set)                                                                                                                                                                |
 | `stream_timeout <d>` | a WebSocket tunnel is closed this long after it opened, with a Close frame (0, the default: never) |
 | `stream_close_delay <d>` | after a reload the tunnels opened under the configuration it replaced are closed with a Close frame, each at a moment of its own within this long, so that their clients come back spread over it (`0`: at once); unset: a reload closes, at once, only the tunnels to an upstream that the port's new configuration no longer names (the instance was taken out), and leaves the others open |
+| `https://host[:port]` upstreams, `transport http { tls }` | TLS to the upstreams (port 443 for `https://` without one). The scheme sets the transport of the whole proxy: `https://`, `http://` and `h2c://` upstreams cannot be mixed, and a port, 443 too, says nothing without a scheme. Any `tls_*` option turns TLS on as well |
+| `transport http { versions <1.1\|2\|h2c\|3 …> }`, `h2c://host:port` upstreams | the versions of HTTP the upstreams are spoken to in (`1.1 2` unless set; `h2c 2` for `h2c://` upstreams): see HTTP/2 and HTTP/3 to the upstream |
+| `transport http { tls_server_name <name> }` | the name asked for in the handshake and verified in the certificate, in place of the upstream's own host |
+| `transport http { tls_trusted_ca_certs <pem…> }`, `tls_trust_pool file <pem…>` | the authorities an upstream's certificate must come from, in place of the built-in roots |
+| `transport http { tls_client_auth <cert> <key> }` | the certificate shown to the upstream (mutual TLS) |
+| `transport http { tls_insecure_skip_verify }` | the upstream's certificate is not verified at all: for a test, not for production |
+| `transport http { tls_except_ports <port…> }` | upstreams on these ports are spoken to in plain HTTP though the proxy has TLS |
+| `transport http { tls_timeout <d> }` | a handshake at most this long (unset: `dial_timeout` bounds the connection, `response_header_timeout` the whole request) |
 | `transport http { resolvers <ip…> }`                   | the nameservers for this proxy's names (unset: `/etc/resolv.conf`)                                                                                                                                                                                                                                            |
 
 The hashes are rendezvous hashes: a key stays on its server while that server is up, and only the
@@ -376,25 +384,92 @@ keys of a server that went down change hands. A down server is passed by; with e
 the request is refused with 503 (`handle_errors` applies). A `reverse_proxy` with one literal
 address and no health settings pays nothing for any of this (docs/performance.md, Upstreams).
 
+#### TLS to the upstream
+
+```caddyfile
+reverse_proxy https://app.internal:8443 {
+	transport http {
+		tls_trusted_ca_certs /etc/webfast/internal-ca.pem
+	}
+}
+```
+
+As in Caddy, an `https://` upstream (or `tls` in the transport) is spoken to over TLS, in
+HTTP/2 when it takes it in the handshake and in HTTP/1.1 otherwise (the next section):
+
+- **Whose certificate.** It must come from an authority of the Mozilla root program, built into
+  the binary (the image has no CA store; Caddy takes the system's), or from one of
+  `tls_trusted_ca_certs` when given — then only from those. It is verified for the upstream's
+  host as written, a name or an address, which is also the name the handshake asks for (SNI; an
+  address asks for none); `tls_server_name` gives another. The files are read when the
+  configuration is loaded, and again at a reload; one that cannot be read stops the start.
+- **The Host the upstream gets** is the upstream as written, `host:port`, as Caddy sets it
+  since 2.11: a server behind TLS nearly always answers under the name its certificate is for.
+  The client's own Host is in `X-Forwarded-Host`; `header_up Host {hostport}` sends it as Host
+  again, and any other `header_up Host …` wins too.
+- **WebSocket** goes through the same TLS (`wss` to the upstream): the handshake's own
+  connection makes the same handshake, with the same settings, offering HTTP/1.1 alone.
+- **A handshake that fails** — a certificate from nobody trusted, for another name, expired — is
+  a connection that failed: 502, the upstream counted by the passive health settings, and
+  another upstream tried when `lb_retries` allows.
+
+#### HTTP/2 and HTTP/3 to the upstream
+
+`transport http { versions … }`, as Caddy reads it: `1.1`, `2`, `h2c`, `3`; unset, `1.1 2`.
+
+| The upstream is reached     | `versions`                    | What is spoken                                                                                                                                             |
+| --------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| without TLS                 | `1.1`, `2` (the default)      | HTTP/1.1: without TLS there is no handshake to agree on HTTP/2 in                                                                                          |
+| without TLS                 | `h2c`, or an `h2c://` upstream | HTTP/2 from the first byte ("prior knowledge"; no upgrade from HTTP/1.1, and no HTTP/1.1)                                                                  |
+| over TLS                    | with `2` (the default) or `h2c` | every handshake offers HTTP/2 and HTTP/1.1 (ALPN), and the upstream chooses. As in Caddy, `2` alone still offers HTTP/1.1 to an upstream that has no HTTP/2 |
+| over TLS                    | `1.1`                         | HTTP/1.1 alone is offered                                                                                                                                  |
+| over TLS (QUIC)             | `3`                           | HTTP/3, and nothing else: `3` goes alone, needs TLS (`https://` upstreams or `tls`), and does not fall back to a version over TCP                           |
+
+```caddyfile
+reverse_proxy h2c://grpc.internal:50051
+
+reverse_proxy https://app.internal {
+	transport http {
+		versions 3
+	}
+}
+```
+
+- **One connection per upstream address** for HTTP/2 and for HTTP/3, shared by the requests to
+  it; the requests past what the upstream lets run side by side on it wait for one to end (Go's
+  transport, so Caddy, opens a second connection there). Over HTTP/1.1 a connection carries one
+  request at a time and is kept for the next. `keepalive` (2 minutes) is how long a connection
+  with no request is kept; `keepalive off` makes a connection for every request.
+- **The host of a request** is its `:authority` over HTTP/2 and HTTP/3: what Host would be over
+  HTTP/1.1 — the upstream as written over TLS, the client's without it, or what `header_up Host`
+  sets.
+- **An upstream that closes a connection** (it restarts, or ends connections after so many
+  requests, as nginx does) is not an error: the request goes on a new one. One the closing
+  connection had already taken and refused unprocessed is sent again when it has no body.
+- **WebSocket** is HTTP/1.1 on a connection of its own whatever the versions (over TCP, with the
+  proxy's TLS), as Go's transport does it for Caddy: an upstream of `versions 3` or `h2c` gets
+  its handshakes there, and must listen for them.
+- The response's version is not passed on: a client gets the answer in the version of its own
+  connection.
+
 #### What `reverse_proxy` reads
 
 Caddy's directive has more. What is read, what is meant to come, and what is not:
 
 | Read                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to` and inline upstreams (`host:port`, `http://host:port`, `:port`, `host`); every `lb_policy`; `fallback` of `query`, `header` and `cookie`; `lb_retries`, `lb_try_duration`, `lb_try_interval`; `fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`; `header_up`, `header_down`; `flush_interval` (always streaming); `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }`; WebSocket (over HTTP/1.1 and HTTP/2), `stream_timeout`, `stream_close_delay`; `request_body` |
+| `to` and inline upstreams (`host:port`, `http://host:port`, `https://host[:port]`, `h2c://host:port`, `:port`, `host`); every `lb_policy`; `fallback` of `query`, `header` and `cookie`; `lb_retries`, `lb_try_duration`, `lb_try_interval`; `fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`; `header_up`, `header_down`; `flush_interval` (always streaming); `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 2 h2c 3, tls, tls_server_name, tls_trusted_ca_certs, tls_trust_pool file, tls_client_auth <cert> <key>, tls_insecure_skip_verify, tls_except_ports, tls_timeout }`; WebSocket (over HTTP/1.1 and HTTP/2), `stream_timeout`, `stream_close_delay`; `request_body` |
 
 | Meant to come                                                                                                                                                                                                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TLS to the upstream: `https://` upstreams, `transport http { tls, tls_server_name, tls_trusted_ca_certs, tls_client_auth, tls_insecure_skip_verify, tls_except_ports }`. With it, WebSocket to the upstream over TLS (`wss`): the handshake does not go through the pooled client but dials a connection of its own (src/proxy.rs `shake`), which has to take the same TLS settings and hand the TLS stream to the tunnel                                                                                                             |
 | `handle_response [<matcher>] { … }` with `status` and `header` response matchers, `replace_status`, `copy_response`, `copy_response_headers`                                                                                                                                       |
 | WebSocket over HTTP/3 (RFC 9220): with a release of the `h3` crate that reads `:protocol: websocket` (0.0.8 refuses the request as malformed; its repository has it). Then: `enable_extended_connect` in src/h3.rs, the request turned into the handshake as for HTTP/2 (src/server.rs `websocket_connect`), the stream handed to src/tunnel.rs, and a QUIC connection with a quiet tunnel kept from idling out |
-| `unix//path` upstreams; `h2c://` upstreams and `versions 2 h2c`; `transport fastcgi` and `php_fastcgi`                                                                                                                                                                              |
+| `unix//path` upstreams; `transport fastcgi` and `php_fastcgi`                                                                                                                                                                                                                       |
 | `dynamic a` / `dynamic srv` (upstreams that come and go by a name's answer); `transport http { proxy_protocol, max_conns_per_host }`; `method`, `rewrite`; active health checks (`health_uri` and the other `health_*`); `lb_retry_match`; a `trusted_proxies` of the proxy's own |
 
 | Not meant to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `request_buffers`, `response_buffers` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_timeout, tls_renegotiation, tls_trust_pool }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
+| `request_buffers`, `response_buffers` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_curves, tls_renegotiation, a tls_trust_pool other than file, tls_client_auth with a name for Caddy to obtain a certificate for, a placeholder in tls_server_name }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
 
 A setting that is not read is an error at start, never ignored.
 
@@ -716,6 +791,12 @@ Those an answer shows are checked by `compat/`:
   modification time (as Caddy's), and answers at most one range: several get the whole file (Caddy:
   multipart/byteranges).
 - Brotli on the fly is built in; Caddy needs the `caddy-brotli` plugin to read `encode … br`.
+- TLS to an upstream verifies against the Mozilla roots built into the binary, where Caddy
+  takes the system's store (the image has none); `tls_server_name` is a fixed name (Caddy: a
+  request placeholder too).
+- HTTP/2 and HTTP/3 to an upstream use one connection per upstream address, and requests past
+  the upstream's limit of streams wait; Caddy opens more connections. `h2c://` upstreams with
+  TLS in the transport are an error (Caddy speaks HTTP/2 over that TLS).
 - As in Caddy 2.11.9, a response that `encode` could have compressed says `Vary:
   Accept-Encoding` also when it goes out as it is (the client asked for no encoding, or a HEAD),
   and so does a 304: a shared cache in front must not give one client's answer to the next

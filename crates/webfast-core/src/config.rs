@@ -25,6 +25,7 @@ use crate::matcher::{FileMatcher, Matcher, MatcherSet, PathPattern, TryFile};
 use crate::placeholder::Template;
 use crate::proxy::{HttpClient, ReverseProxy};
 use crate::static_files::FileServer;
+use crate::upstream_link::Versions;
 use crate::upstreams::{Name, Passive, Policy, Upstreams};
 use anyhow::{Result, anyhow, bail};
 use http::uri::Authority;
@@ -1949,20 +1950,48 @@ fn parse_status_range(t: &Token) -> Result<(u16, u16)> {
     Ok((code, code))
 }
 
-fn parse_upstream(t: &Token) -> Result<Authority> {
+fn parse_upstream(t: &Token) -> Result<(Authority, Option<UpstreamScheme>)> {
     let text = static_text(t)?;
-    upstream_authority(&text).map_err(|e| token_err(t, format!("reverse_proxy: {e}")))
+    upstream_address(&text).map_err(|e| token_err(t, format!("reverse_proxy: {e}")))
 }
 
-/// An upstream as `reverse_proxy` takes it (`host:port`, `http://host:port`, `:port` for
-/// localhost, `host` for port 80), as the authority it is dialled at. The request checks name
-/// upstreams the same way (`upstreams` in src/jwt and src/apifw).
+/// An upstream as `reverse_proxy` takes it (`host:port`, `http://host:port`,
+/// `https://host[:port]`, `h2c://host:port`, `:port` for localhost, `host` for port 80), as the
+/// authority it is dialled at. The request checks name upstreams the same way (`upstreams` in src/jwt and
+/// src/apifw).
 pub fn upstream_authority(text: &str) -> std::result::Result<Authority, String> {
-    let rest = match text.split_once("://") {
-        Some(("http", rest)) => rest,
-        Some((scheme, _)) => return Err(format!("{scheme}:// upstreams are not supported (only plain HTTP)")),
-        None => text,
+    upstream_address(text).map(|(authority, _)| authority)
+}
+
+/// The scheme an upstream is written with: what it says of the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamScheme {
+    /// `http://`: no TLS.
+    Http,
+    /// `https://`: TLS, and port 443 unless one is given.
+    Https,
+    /// `h2c://`: HTTP/2 without TLS.
+    H2c,
+}
+
+/// `upstream_authority`, with the scheme the upstream is written with; `None` without one (as
+/// Caddy: a port, 443 too, says nothing of the transport).
+pub fn upstream_address(text: &str) -> std::result::Result<(Authority, Option<UpstreamScheme>), String> {
+    let (rest, scheme) = match text.split_once("://") {
+        Some(("http", rest)) => (rest, Some(UpstreamScheme::Http)),
+        Some(("https", rest)) => (rest, Some(UpstreamScheme::Https)),
+        Some(("h2c", rest)) => (rest, Some(UpstreamScheme::H2c)),
+        // As Caddy says it.
+        Some(("ws", _)) => return Err("the scheme ws:// is only for browsers: use http://".into()),
+        Some(("wss", _)) => return Err("the scheme wss:// is only for browsers: use https://".into()),
+        Some((scheme, _)) => {
+            return Err(format!(
+                "{scheme}:// upstreams are not supported (http://, https:// and h2c:// are)"
+            ));
+        }
+        None => (text, None),
     };
+    let default_port = if scheme == Some(UpstreamScheme::Https) { 443 } else { 80 };
     if rest.starts_with("unix/") || rest.contains('/') {
         return Err("an upstream is host:port (no unix sockets or paths)".into());
     }
@@ -1975,10 +2004,11 @@ pub fn upstream_authority(text: &str) -> std::result::Result<Authority, String> 
     {
         rest.to_string()
     } else {
-        format!("{rest}:80")
+        format!("{rest}:{default_port}")
     };
     with_port
         .parse::<Authority>()
+        .map(|authority| (authority, scheme))
         .map_err(|_| "invalid upstream address".to_string())
 }
 
@@ -2114,9 +2144,17 @@ fn lb_policy(texts: &[&str], at: &Location, weights: &mut Option<Vec<u32>>) -> R
 
 fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<ReverseProxy> {
     let mut upstreams = Vec::new();
+    // What each upstream's scheme said of the transport (`upstream_address`).
+    let mut schemes: Vec<Option<UpstreamScheme>> = Vec::new();
     for t in &line.tokens[start..] {
-        upstreams.push(parse_upstream(t)?);
+        let (upstream, scheme) = parse_upstream(t)?;
+        upstreams.push(upstream);
+        schemes.push(scheme);
     }
+    // `transport http { tls… }`: any of its options turns TLS to the upstreams on, as in Caddy.
+    let mut tls: Option<crate::upstream_tls::Settings> = None;
+    // `transport http { versions … }`; unset: `1.1 2`, or `h2c 2` for `h2c://` upstreams.
+    let mut versions: Option<Versions> = None;
     let mut policy = Policy::Random;
     let mut fallback = Policy::Random;
     let mut weights: Option<Vec<u32>> = None;
@@ -2148,7 +2186,9 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         match sub.name() {
             "to" => {
                 for t in args {
-                    upstreams.push(parse_upstream(t)?);
+                    let (upstream, scheme) = parse_upstream(t)?;
+                    upstreams.push(upstream);
+                    schemes.push(scheme);
                 }
             }
             "lb_policy" => {
@@ -2244,12 +2284,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                             own_client = true;
                         }
                         "versions" => {
-                            if t.tokens[1..].iter().any(|v| v.text != "1.1") {
-                                bail!(at_err(
-                                    &t.at,
-                                    "reverse_proxy: upstreams are spoken to over HTTP/1.1 only"
-                                ));
-                            }
+                            let words = t.tokens[1..].iter().map(|v| v.text.as_str());
+                            versions = Some(Versions::parse(words).map_err(|e| at_err(&t.at, e))?);
                         }
                         "resolvers" => {
                             let mut list = Vec::new();
@@ -2266,6 +2302,87 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
                                 bail!(at_err(&t.at, "resolvers takes at least one address"));
                             }
                             resolvers = Some(list);
+                        }
+                        "tls" => {
+                            if t.tokens.len() != 1 || t.block.is_some() {
+                                bail!(at_err(&t.at, "tls takes no arguments"));
+                            }
+                            tls.get_or_insert_default();
+                        }
+                        "tls_server_name" => {
+                            if t.tokens.len() != 2 || t.block.is_some() {
+                                bail!(at_err(&t.at, "tls_server_name takes one name"));
+                            }
+                            // Caddy also takes a request placeholder here; a fixed name only.
+                            tls.get_or_insert_default().server_name = Some(static_text(&t.tokens[1])?);
+                        }
+                        "tls_trusted_ca_certs" => {
+                            if t.tokens.len() < 2 || t.block.is_some() {
+                                bail!(at_err(&t.at, "tls_trusted_ca_certs takes PEM files"));
+                            }
+                            for file in &t.tokens[1..] {
+                                tls.get_or_insert_default()
+                                    .trusted_ca
+                                    .push(PathBuf::from(static_text(file)?));
+                            }
+                        }
+                        // `tls_trust_pool file <pem files…>`, or the files as `pem_file` in its
+                        // block; Caddy's other trust pools (inline, pki_root, storage, http, …)
+                        // are not read.
+                        "tls_trust_pool" => {
+                            if t.tokens.get(1).map(|m| m.text.as_str()) != Some("file") {
+                                bail!(at_err(&t.at, "tls_trust_pool: only `file <pem files…>` is supported"));
+                            }
+                            let settings = tls.get_or_insert_default();
+                            let before = settings.trusted_ca.len();
+                            for file in &t.tokens[2..] {
+                                settings.trusted_ca.push(PathBuf::from(static_text(file)?));
+                            }
+                            for inner in t.block.as_deref().unwrap_or(&[]) {
+                                if inner.name() != "pem_file" || inner.tokens.len() < 2 {
+                                    bail!(at_err(&inner.at, "tls_trust_pool file: `pem_file <files…>`"));
+                                }
+                                for file in &inner.tokens[1..] {
+                                    settings.trusted_ca.push(PathBuf::from(static_text(file)?));
+                                }
+                            }
+                            if settings.trusted_ca.len() == before {
+                                bail!(at_err(&t.at, "tls_trust_pool file takes PEM files"));
+                            }
+                        }
+                        "tls_client_auth" => {
+                            if t.tokens.len() != 3 || t.block.is_some() {
+                                bail!(at_err(
+                                    &t.at,
+                                    "tls_client_auth takes a certificate file and its key file (a certificate that Caddy would obtain by a name is not supported)"
+                                ));
+                            }
+                            tls.get_or_insert_default().client_auth = Some((
+                                PathBuf::from(static_text(&t.tokens[1])?),
+                                PathBuf::from(static_text(&t.tokens[2])?),
+                            ));
+                        }
+                        "tls_insecure_skip_verify" => {
+                            if t.tokens.len() != 1 || t.block.is_some() {
+                                bail!(at_err(&t.at, "tls_insecure_skip_verify takes no arguments"));
+                            }
+                            tls.get_or_insert_default().insecure = true;
+                        }
+                        "tls_except_ports" => {
+                            if t.tokens.len() < 2 || t.block.is_some() {
+                                bail!(at_err(&t.at, "tls_except_ports takes ports"));
+                            }
+                            for port in &t.tokens[1..] {
+                                let port = port
+                                    .text
+                                    .parse::<u16>()
+                                    .map_err(|_| token_err(port, "tls_except_ports takes port numbers"))?;
+                                tls.get_or_insert_default().except_ports.push(port);
+                            }
+                        }
+                        "tls_timeout" => {
+                            let value = parse_duration(&one_arg(t)?).map_err(|e| at_err(&t.at, e))?;
+                            tls.get_or_insert_default().timeout = Some(value).filter(|d| !d.is_zero());
                         }
                         other => bail!(at_err(&t.at, format!("transport http: unsupported option {other:?}"))),
                     }
@@ -2302,6 +2419,62 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         unhealthy_request_count,
     });
     let servers = Upstreams::new(names, policy, fallback, passive, resolvers, None);
+    // The scheme of an upstream sets the transport all of them share, so the schemes cannot be
+    // mixed (as Caddy): `https://` turns TLS on, `h2c://` makes the versions `h2c 2`.
+    let written = |scheme| schemes.contains(&Some(scheme));
+    let (http, https, h2c) = (
+        written(UpstreamScheme::Http),
+        written(UpstreamScheme::Https),
+        written(UpstreamScheme::H2c),
+    );
+    if u8::from(http) + u8::from(https) + u8::from(h2c) > 1 {
+        bail!(at_err(
+            &line.at,
+            "reverse_proxy: http://, https:// and h2c:// upstreams cannot be mixed (the scheme sets the transport for all of them; `tls_except_ports` leaves some on plain HTTP)"
+        ));
+    }
+    if https {
+        tls.get_or_insert_default();
+    } else if tls.is_some() && (http || h2c) {
+        bail!(at_err(
+            &line.at,
+            "reverse_proxy: the upstreams are written without TLS (http://, h2c://), and the transport has TLS"
+        ));
+    }
+    let versions = match versions {
+        Some(versions) if h2c && !versions.h2c => bail!(at_err(
+            &line.at,
+            "reverse_proxy: h2c:// upstreams, and `versions` without h2c"
+        )),
+        Some(versions) => versions,
+        None if h2c => Versions::H2C,
+        None => Versions::default(),
+    };
+    if versions.http3 {
+        // As Caddy: HTTP/3 needs TLS to the upstream, said by `https://` or `tls`.
+        match &tls {
+            None => bail!(at_err(
+                &line.at,
+                "reverse_proxy: versions 3 needs TLS to the upstream (https:// upstreams, or `tls` in the transport)"
+            )),
+            Some(settings) if !settings.except_ports.is_empty() => bail!(at_err(
+                &line.at,
+                "reverse_proxy: versions 3 and tls_except_ports cannot be combined (HTTP/3 is always over TLS)"
+            )),
+            Some(_) => {}
+        }
+    }
+    let tls = match &tls {
+        Some(settings) => Some(Arc::new(
+            crate::upstream_tls::UpstreamTls::new(settings)
+                .map_err(|e| at_err(&line.at, format!("reverse_proxy: {e:#}")))?,
+        )),
+        None => None,
+    };
+    // Everything but plain HTTP/1.1 goes by the proxy's own connections.
+    let links = crate::upstream_link::Links::new(tls.clone(), versions, dial_timeout, keepalive)
+        .map_err(|e| at_err(&line.at, format!("reverse_proxy: {e:#}")))?
+        .map(Arc::new);
     let client = if own_client {
         crate::proxy::client(dial_timeout, keepalive)
     } else {
@@ -2319,6 +2492,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         dial_timeout,
         stream_timeout,
         stream_close_delay,
+        tls,
+        links,
         client,
     })
 }
@@ -3146,7 +3321,7 @@ mod tests {
                 ":80 {\n\t@m expression {path} == '/'\n\trespond @m 1\n}\n",
                 "unsupported matcher",
             ),
-            (":80 {\n\treverse_proxy https://x\n}\n", "not supported"),
+            (":80 {\n\treverse_proxy ftp://x\n}\n", "not supported"),
             (":80 {\n\theader X\n}\n", "a value is required"),
             (":80 {\n\trespond {nope}\n}\n", "unknown placeholder"),
             (":80 {\n}\n:80 {\n}\n", "more than once"),

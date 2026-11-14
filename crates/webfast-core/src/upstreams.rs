@@ -67,7 +67,7 @@ impl Name {
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Milliseconds since the process started: what the health marks are kept in.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     START.elapsed().as_millis() as u64
 }
 
@@ -78,6 +78,12 @@ pub struct Server {
     pub addr: SocketAddr,
     /// `ip:port`, what the request's URI gets.
     pub authority: Authority,
+    /// The upstream as written, `host:port`: the Host of a request over TLS, as Caddy's
+    /// `{upstream_hostport}`.
+    pub host: http::HeaderValue,
+    /// The proxy's own connections to this address: over TLS, HTTP/2, HTTP/3
+    /// (src/upstream_link.rs).
+    pub link: crate::upstream_link::Link,
     pub weight: u32,
     /// Requests under way, kept only when the set counts (`Set::counting`).
     pub in_flight: AtomicUsize,
@@ -93,16 +99,20 @@ pub struct Server {
 }
 
 impl Server {
-    fn new(name: &Name, ip: IpAddr) -> Server {
+    pub(crate) fn new(name: &Name, ip: IpAddr) -> Server {
         let addr = SocketAddr::new(ip, name.port);
         let authority = match ip {
             IpAddr::V4(_) => format!("{ip}:{}", name.port),
             IpAddr::V6(_) => format!("[{ip}]:{}", name.port),
         };
+        let authority: Authority = authority.parse().expect("an address and a port are an authority");
         Server {
             name: name.text.clone(),
             addr,
-            authority: authority.parse().expect("an address and a port are an authority"),
+            host: http::HeaderValue::from_str(name.text.as_str())
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+            link: crate::upstream_link::Link::default(),
+            authority,
             weight: name.weight,
             in_flight: AtomicUsize::new(0),
             tunnels: AtomicUsize::new(0),

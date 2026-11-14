@@ -473,8 +473,9 @@ async fn rules_bound_to_an_upstream_are_checked_by_its_proxy() {
     auth.check_upstream(&mut parts, ip(), &app).await.unwrap();
     assert_eq!(parts.headers["x-user"], "u1");
 
-    // Upstreams are written as reverse_proxy takes them: plain HTTP, host and port.
-    let err = JwtAuth::from_yaml(&yaml.replace("http://App:8787", "https://app"), Path::new("."))
+    // Upstreams are written as reverse_proxy takes them: a host and a port, `http://`,
+    // `https://` or `h2c://` before them at most.
+    let err = JwtAuth::from_yaml(&yaml.replace("http://App:8787", "ftp://app"), Path::new("."))
         .err()
         .map(|e| format!("{e:#}"))
         .unwrap_or_default();

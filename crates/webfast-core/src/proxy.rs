@@ -1,5 +1,6 @@
-//! `reverse_proxy` to plain-HTTP upstreams over HTTP/1.1, bodies streamed both ways (SSE reaches
-//! the client event by event). As in Caddy: the client's Host is passed through, X-Forwarded-For /
+//! `reverse_proxy` to upstreams: in plain HTTP/1.1 by a pooled client, and over TLS, HTTP/2 and
+//! HTTP/3 by connections of the proxy's own (src/upstream_link.rs, src/upstream_tls.rs); bodies
+//! streamed both ways (SSE reaches the client event by event). As in Caddy: the client's Host is passed through, X-Forwarded-For /
 //! -Proto / -Host are set (kept and extended only for trusted proxies), hop-by-hop headers are
 //! dropped, a failed connection answers 502 and a response-header timeout 504. Upstream response
 //! headers are added to those an earlier (not deferred) `header` set, as Caddy does.
@@ -29,9 +30,11 @@ use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, Upstrea
 use crate::guard::{Full, Place, Reloads, body_fault};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
 use crate::tunnel::{Counted, End};
-use crate::upstreams::{Loaded, NoServer, Picked, Upstreams};
+use crate::upstream_link::{Failed, Incoming, Links, Outgoing, Via, chain};
+use crate::upstream_tls::UpstreamTls;
+use crate::upstreams::{Loaded, NoServer, Picked, Server, Upstreams};
 use http::header::{CONNECTION, HOST, SET_COOKIE, UPGRADE};
-use http::uri::{Authority, Scheme};
+use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::Client;
@@ -42,11 +45,11 @@ use std::time::{Duration, Instant};
 
 pub type HttpClient = Client<HttpConnector, Body>;
 
+/// The pooled client of a `reverse_proxy`, for its upstreams in plain HTTP/1.1.
 pub fn client(dial_timeout: Duration, keepalive: Option<Duration>) -> HttpClient {
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(dial_timeout));
     connector.set_nodelay(true);
-    connector.enforce_http(true);
     let mut builder = Client::builder(TokioExecutor::new());
     // Host is always in the headers sent (`ReverseProxy::upstream_headers`, and the cache's
     // requests reuse those): the client need not look for it and make one.
@@ -80,6 +83,12 @@ pub struct ReverseProxy {
     /// replaced are closed, each at a moment of its own within this long (zero: at once); `None`:
     /// a reload leaves them open.
     pub stream_close_delay: Option<Duration>,
+    /// TLS to the upstreams (`https://` upstreams, `transport http { tls… }`); `None`: plain
+    /// HTTP.
+    pub tls: Option<Arc<UpstreamTls>>,
+    /// The proxy's own connections, for everything but plain HTTP/1.1 (TLS, `versions`); `None`:
+    /// `client` is all it needs.
+    pub links: Option<Arc<Links>>,
     pub client: HttpClient,
 }
 
@@ -273,14 +282,13 @@ impl std::fmt::Display for Unanswered {
 }
 
 /// Sends a handshake to `address` on a connection of its own (not the pool's: it is handed over
-/// to the tunnel when the upstream switches protocols) and waits for the answer's head.
-///
-/// Plain TCP, as every upstream is for now. When TLS to the upstreams comes (docs/configuration.md,
-/// What `reverse_proxy` reads) this dial has to take it too — the pooled client's connector does
-/// not cover it — and hand the TLS stream to the tunnel: `wss` to the upstream.
+/// to the tunnel when the upstream switches protocols) and waits for the answer's head. `tls`:
+/// the proxy's TLS and the host the upstream is written with, when it is spoken to over TLS —
+/// the tunnel then runs inside it (`wss` to the upstream).
 async fn shake(
     dial_timeout: Duration,
     address: std::net::SocketAddr,
+    tls: Option<(&UpstreamTls, &str)>,
     request: Request<Body>,
 ) -> Result<Response<hyper::body::Incoming>, Unanswered> {
     let tcp = match tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address)).await {
@@ -291,11 +299,33 @@ async fn shake(
     let _ = tcp.set_nodelay(true);
     // A tunnel may be quiet for hours: an upstream that vanished is found by the probes.
     crate::sockets::keep_alive(&tcp);
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
-        .await
-        .map_err(|error| Unanswered::Exchange(error.to_string()))?;
-    // Drives the connection, and hands it over when the upstream switches protocols.
-    tokio::spawn(connection.with_upgrades());
+    // Either way the connection is driven by a task of its own, which hands it over when the
+    // upstream switches protocols.
+    let mut sender = match tls {
+        None => {
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                .await
+                .map_err(|error| Unanswered::Exchange(error.to_string()))?;
+            tokio::spawn(connection.with_upgrades());
+            sender
+        }
+        // A handshake that fails sent nothing of the request: another upstream may take it.
+        Some((tls, host)) => {
+            let name = tls
+                .name_for(host)
+                .map_err(|error| Unanswered::Connect(error.to_string()))?;
+            // HTTP/1.1 alone is offered, whatever the proxy's `versions`: the switch is its.
+            let stream = tls
+                .handshake(name, tcp, false)
+                .await
+                .map_err(|error| Unanswered::Connect(format!("TLS: {error}")))?;
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(|error| Unanswered::Exchange(error.to_string()))?;
+            tokio::spawn(connection.with_upgrades());
+            sender
+        }
+    };
     sender
         .send_request(request)
         .await
@@ -343,7 +373,8 @@ impl ReverseProxy {
         }
         // The headers go with the request, not copied; a retry (after a failed connection) makes
         // them again. Kept only for an observer that looks at them (a cache miss).
-        let mut headers = Some(self.upstream_headers(&ctx));
+        // (Over TLS they name the upstream as their Host, and are made once it is chosen.)
+        let mut headers = self.tls.is_none().then(|| self.upstream_headers(&ctx, None));
         let keep = PROXY.wants_sent(&pending);
         let mut kept: Option<HeaderMap> = None;
         // `header_down` with placeholders is filled in now, from the request; one without is
@@ -374,37 +405,32 @@ impl ReverseProxy {
                 Err(status) => break Err(status),
             };
             let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);
-            let mut parts = Uri::builder().scheme(Scheme::HTTP).authority(server.authority.clone());
-            if let Some(pq) = &path_and_query {
-                parts = parts.path_and_query(pq.clone());
-            }
-            let uri = match parts.build() {
-                Ok(uri) => uri,
-                Err(_) => break Err(StatusCode::BAD_GATEWAY),
-            };
             let request_body = if replayable {
                 crate::body::empty()
             } else {
                 body.take().unwrap_or_else(crate::body::empty)
             };
-            let mut request = Request::new(request_body);
-            *request.method_mut() = method.clone();
-            *request.uri_mut() = uri;
-            *request.version_mut() = http::Version::HTTP_11;
-            let sending = headers.take().unwrap_or_else(|| self.upstream_headers(&ctx));
+            let sending = headers
+                .take()
+                .unwrap_or_else(|| self.upstream_headers(&ctx, self.host_of(server)));
             if keep && kept.is_none() {
                 kept = Some(sending.clone());
             }
-            *request.headers_mut() = sending;
+            let out = Outgoing {
+                method: method.clone(),
+                path_and_query: path_and_query.clone(),
+                headers: sending,
+                body: request_body,
+            };
             let sent_at = timed.then(Instant::now);
-            let sent = self.client.request(request);
+            let sent = self.send(server, out);
             // A failure: did the connection fail, did the response head run out of time, and was
             // the client's body at fault (stalled, or over its limit while it was being sent).
-            let failed = |e: hyper_util::client::legacy::Error| (e.is_connect(), false, body_fault(&e));
+            let failed = |f: Failed| (f.connect, false, f.fault, f.error);
             let result = match self.response_header_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
                     Ok(r) => r.map_err(failed),
-                    Err(_) => Err((false, true, None)),
+                    Err(_) => Err((false, true, None, String::new())),
                 },
                 None => sent.await.map_err(failed),
             };
@@ -420,14 +446,14 @@ impl ReverseProxy {
                     }
                     break Ok((response, lease, set_cookie.then_some(server)));
                 }
-                Err((connect, timed_out, fault)) => {
+                Err((connect, timed_out, fault, error)) => {
                     // The client's body was at fault (it stopped, or went over its `request_body`
                     // limit while it was being sent): the client's failure, not the upstream's.
                     if let Some(status) = fault {
                         tracing::debug!(upstream = %server.name, %status, "the request body failed");
                         break Err(status);
                     }
-                    tracing::warn!(upstream = %server.name, address = %server.addr, connect, timed_out, "upstream request failed");
+                    tracing::warn!(upstream = %server.name, address = %server.addr, connect, timed_out, %error, "upstream request failed");
                     if let Some(passive) = passive {
                         server.failed(passive);
                     }
@@ -522,31 +548,51 @@ impl ReverseProxy {
     /// A request of the server's own to an upstream (src/cache.rs: revalidations, and the
     /// upstream's own encodings of a response).
     #[cfg(feature = "proxy-cache")]
-    pub(crate) async fn fetch(
-        &self,
-        path_and_query: &str,
-        headers: HeaderMap,
-    ) -> Result<Response<hyper::body::Incoming>, String> {
+    pub(crate) async fn fetch(&self, path_and_query: &str, headers: HeaderMap) -> Result<Response<Incoming>, String> {
         let Some(server) = self.servers.any() else {
             return Err("no upstream is available".to_string());
         };
-        let uri = Uri::builder()
-            .scheme(Scheme::HTTP)
-            .authority(server.authority.clone())
-            .path_and_query(path_and_query)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut request = Request::new(crate::body::empty());
-        *request.uri_mut() = uri;
-        *request.version_mut() = http::Version::HTTP_11;
-        *request.headers_mut() = headers;
-        let sent = self.client.request(request);
+        let out = Outgoing {
+            method: http::Method::GET,
+            path_and_query: Some(PathAndQuery::try_from(path_and_query).map_err(|e| e.to_string())?),
+            headers,
+            body: crate::body::empty(),
+        };
+        let sent = self.send(&server, out);
         match self.response_header_timeout {
             Some(limit) => match tokio::time::timeout(limit, sent).await {
-                Ok(result) => result.map_err(|e| e.to_string()),
+                Ok(result) => result.map_err(|failed| failed.error),
                 Err(_) => Err("no answer in time".to_string()),
             },
-            None => sent.await.map_err(|e| e.to_string()),
+            None => sent.await.map_err(|failed| failed.error),
+        }
+    }
+
+    /// One attempt: `out` to `server`, by the pooled client in plain HTTP/1.1 or over one of the
+    /// proxy's own connections (TLS, HTTP/2, HTTP/3), up to the head of the answer.
+    async fn send(&self, server: &Server, out: Outgoing) -> Result<Response<Incoming>, Failed> {
+        if let Some(links) = &self.links {
+            let via = links.via(server.addr.port());
+            if via != Via::Pooled {
+                return links.exchange(server, via, out).await;
+            }
+        }
+        let mut target = http::uri::Parts::default();
+        target.scheme = Some(Scheme::HTTP);
+        target.authority = Some(server.authority.clone());
+        target.path_and_query = Some(out.path_and_query.unwrap_or_else(|| PathAndQuery::from_static("/")));
+        let mut request = Request::new(out.body);
+        *request.method_mut() = out.method;
+        *request.uri_mut() = Uri::from_parts(target).map_err(Failed::connect)?;
+        *request.version_mut() = http::Version::HTTP_11;
+        *request.headers_mut() = out.headers;
+        match self.client.request(request).await {
+            Ok(response) => Ok(response.map(Incoming::Pooled)),
+            Err(error) => Err(Failed {
+                connect: error.is_connect(),
+                fault: body_fault(&error),
+                error: chain(&error),
+            }),
         }
     }
 
@@ -574,13 +620,24 @@ impl ReverseProxy {
         }
     }
 
-    /// The request's headers as the upstream gets them. Host is always among them (the client's,
-    /// else the authority), so the client is built not to set it (`client`).
-    fn upstream_headers(&self, ctx: &Ctx) -> HeaderMap {
+    /// The Host of a request to `server` when this proxy has TLS: the upstream as written
+    /// (`host:port`), as Caddy sets it since 2.11 — a name the certificate is for is nearly
+    /// always the name the upstream serves under. `header_up Host {hostport}` puts the client's
+    /// back.
+    fn host_of<'s>(&self, server: &'s Server) -> Option<&'s HeaderValue> {
+        self.tls.as_ref().map(|_| &server.host)
+    }
+
+    /// The request's headers as the upstream gets them. Host is always among them (`host` when
+    /// given, else the client's, else the authority), so the client is built not to set it
+    /// (`client`); `header_up` comes after and may set another.
+    fn upstream_headers(&self, ctx: &Ctx, host: Option<&HeaderValue>) -> HeaderMap {
         // Room for X-Forwarded-For / -Proto / -Host, Host, and what `header_up` adds.
         let mut headers = forwardable_headers(ctx, 4 + self.header_up.len());
         forwarded_headers(ctx, &mut headers);
-        if !headers.contains_key(HOST)
+        if let Some(host) = host {
+            headers.insert(HOST, host.clone());
+        } else if !headers.contains_key(HOST)
             && let Ok(value) = HeaderValue::from_str(ctx.hostport())
         {
             headers.insert(HOST, value);
@@ -641,7 +698,7 @@ impl ReverseProxy {
                 Err(status) => return ctx.fail(status, None),
             };
             let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);
-            let mut headers = self.upstream_headers(&ctx);
+            let mut headers = self.upstream_headers(&ctx, self.host_of(server));
             headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
             headers.insert(UPGRADE, protocol.clone());
             let mut request = Request::new(crate::body::empty());
@@ -649,7 +706,11 @@ impl ReverseProxy {
             *request.uri_mut() = target.clone();
             *request.headers_mut() = headers;
             let sent_at = timed.then(Instant::now);
-            let exchange = shake(self.dial_timeout, server.addr, request);
+            let tls = match &self.tls {
+                Some(tls) if tls.applies(server.addr.port()) => Some((tls.as_ref(), server.name.host())),
+                _ => None,
+            };
+            let exchange = shake(self.dial_timeout, server.addr, tls, request);
             let answered = match self.response_header_timeout {
                 Some(limit) => tokio::time::timeout(limit, exchange)
                     .await

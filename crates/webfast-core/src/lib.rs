@@ -48,6 +48,8 @@ pub mod static_files;
 pub mod tickets;
 pub mod tls;
 pub mod tunnel;
+pub mod upstream_link;
+pub mod upstream_tls;
 pub mod upstreams;
 #[cfg(feature = "compress-files")]
 pub mod variants;

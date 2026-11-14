@@ -2,8 +2,39 @@
 
 ## Unreleased
 
+Worth knowing when upgrading:
+
+- A `reverse_proxy` with an `https://` upstream was an error at start, and now loads: TLS to the
+  upstream, its certificate verified against the Mozilla roots built in (or
+  `tls_trusted_ca_certs`), HTTP/2 inside when the upstream takes it, and — as Caddy since 2.11 —
+  the upstream's own `host:port` as the Host it gets.
+- `h2c://` upstreams and `transport http { versions … }` other than `1.1` were errors at start,
+  and now load: HTTP/2 without TLS, and HTTP/3 (`versions 3`).
+- For code written against `webfast-core`: `ReverseProxy` has `tls` and `links`, and
+  `config::upstream_authority` reads `https://` and `h2c://` too.
+
 ### Changes
 
+- **TLS to the upstream**, as in Caddy: `https://host[:port]` upstreams and `transport http {
+  tls, tls_server_name, tls_trusted_ca_certs, tls_trust_pool file, tls_client_auth <cert> <key>,
+  tls_insecure_skip_verify, tls_except_ports, tls_timeout }`. The certificate is verified for the
+  upstream's host as written (the name the handshake asks for), against the Mozilla roots built
+  into the binary or the authorities given; the Host sent is the upstream's `host:port`
+  (`header_up Host {hostport}` keeps the client's). A handshake that fails is a connection that
+  failed: 502, passive health, another upstream when `lb_retries` allows. WebSocket goes through the same TLS
+  (`wss` to the upstream). Not read: `tls_curves`, `tls_renegotiation`, trust pools other than
+  `file`, a certificate obtained by a name for `tls_client_auth`, a placeholder in
+  `tls_server_name` (docs/configuration.md, TLS to the upstream).
+- **HTTP/2 and HTTP/3 to the upstream**, as in Caddy: `transport http { versions 1.1 2 h2c 3 }`
+  (`1.1 2` unless set) and `h2c://` upstreams. Over TLS a handshake offers HTTP/2 and HTTP/1.1
+  and the upstream chooses (`versions 1.1`: HTTP/1.1 alone); `h2c` is HTTP/2 without TLS, from
+  the first byte; `3` is HTTP/3 over QUIC, alone and with no fall back. HTTP/2 and HTTP/3 use
+  one connection per upstream address, shared by its requests; a connection the upstream closes
+  is made again, and a request without a body that the closing one refused is sent again.
+  Plain HTTP/1.1 upstreams are reached as before. A WebSocket handshake is HTTP/1.1 on its own
+  connection whatever the versions (docs/configuration.md, HTTP/2 and HTTP/3 to the upstream).
+- A request an upstream did not answer is logged with why (`error`): a certificate nobody
+  trusts, a connection refused, a stream reset.
 - **`Vary: Accept-Encoding` on what `encode` could have compressed**, as Caddy 2.11.9: a response
   that qualifies (its type, its length, no `no-transform`) says it also when it goes out as it is
   — the client asked for no encoding, or a HEAD — and so does every 304 that passes `encode`.
