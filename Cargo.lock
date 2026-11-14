@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "webfast"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "webfast-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ahash",
  "anyhow",
