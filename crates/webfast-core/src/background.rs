@@ -219,16 +219,22 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let ran = Arc::new(AtomicUsize::new(0));
         let ticked = Arc::new(AtomicUsize::new(0));
+        // A job ends when it is let through: the first at once, the rest when the test says so —
+        // how fast the worker's thread gets to run decides nothing here.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
         let worker = {
-            let (ran, ticked) = (ran.clone(), ticked.clone());
+            let (ran, ticked, gate) = (ran.clone(), ticked.clone(), gate.clone());
             Worker::start(
                 "test-worker",
                 2,
                 0,
                 Duration::from_millis(5),
                 move |n: usize| {
-                    let ran = ran.clone();
+                    let (ran, gate) = (ran.clone(), gate.clone());
                     async move {
+                        if let Ok(through) = gate.acquire().await {
+                            through.forget();
+                        }
                         ran.fetch_add(n, Ordering::Relaxed);
                     }
                 },
@@ -237,14 +243,21 @@ mod tests {
                 },
             )
         };
+        let wait_for = |what: &dyn Fn() -> bool| {
+            let started = std::time::Instant::now();
+            while !what() {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         assert!(worker.submit(1).is_ok());
-        let started = std::time::Instant::now();
-        while ran.load(Ordering::Relaxed) < 1 || ticked.load(Ordering::Relaxed) < 2 {
-            assert!(started.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // More than the queue holds at once: the rest come back.
+        wait_for(&|| ran.load(Ordering::Relaxed) == 1 && ticked.load(Ordering::Relaxed) >= 2);
+        // More than the queue holds at once, while the worker is held at one job: the one it
+        // took and the two the queue holds are kept at most, the rest come back.
         let given_back = (0..50).filter(|_| worker.submit(1).is_err()).count();
-        assert!(given_back > 0);
+        assert!((47..=48).contains(&given_back), "{given_back} of 50 came back");
+        // Let through, those it kept are all run.
+        gate.add_permits(50);
+        wait_for(&|| ran.load(Ordering::Relaxed) == 1 + 50 - given_back);
     }
 }

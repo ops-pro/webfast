@@ -43,6 +43,9 @@ Worth knowing when upgrading:
   `sample` and `cache` scenarios of compat/run.sh match Caddy 2.11.9 again.
 - A 206 is no longer compressed on the fly (its `Content-Range` would describe other bytes), as
   in Caddy.
+- Tests that failed now and then on a loaded machine: an upstream "nobody listens at" keeps
+  its port (bound and let go, another test's upstream could be given it, and answer in its
+  place), and the background worker's test no longer depends on how fast its thread gets to run.
 
 ## 0.1.9 — 2026-11-14
 

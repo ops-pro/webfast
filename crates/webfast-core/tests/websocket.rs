@@ -92,6 +92,16 @@ async fn upstream() -> SocketAddr {
     addr
 }
 
+/// An address nothing listens on, for as long as the socket is kept: bound, so that no other
+/// test's listener is given its port (a port bound and let go may be taken at once, and the
+/// "dead" upstream would then answer), and not listening, so a connection to it is refused.
+fn nobody_listens() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 fn load(text: &str) -> webfast_core::config::Config {
     let file = webfast_core::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
     webfast_core::load_parsed(&file, 1 << 24).unwrap()
@@ -226,9 +236,7 @@ async fn an_upstream_that_does_not_switch_is_answered_as_usual() {
     assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
 
     // An upstream that cannot be reached: 502.
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead.local_addr().unwrap();
-    drop(dead);
+    let (_dead, dead_addr) = nobody_listens();
     running.shutdown(Duration::from_secs(1)).await;
     let running = server::start(load(&caddyfile(dead_addr))).await.unwrap();
     let (line, ..) = handshake(running.bound[0].1.port(), "/ws").await;
@@ -329,9 +337,7 @@ async fn rest_of(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_handshake_is_tried_on_another_upstream_when_the_connection_fails() {
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead.local_addr().unwrap();
-    drop(dead);
+    let (_dead, dead_addr) = nobody_listens();
     let live = upstream().await;
     let upstreams = format!("{dead_addr} {live}");
 

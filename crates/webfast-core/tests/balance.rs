@@ -109,6 +109,16 @@ async fn get(port: u16, path: &str, headers: &[(&str, &str)]) -> Answer {
     }
 }
 
+/// An address nothing listens on, for as long as the socket is kept: bound, so that no other
+/// test's listener is given its port (a port bound and let go may be taken at once, and the
+/// "dead" upstream would then answer), and not listening, so a connection to it is refused.
+fn nobody_listens() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 fn load(text: &str) -> webfast_core::config::Config {
     let file = webfast_core::caddyfile::parse_str(text, Path::new("Caddyfile")).unwrap();
     webfast_core::load_parsed(&file, 1 << 27).unwrap()
@@ -152,7 +162,7 @@ async fn round_robin_takes_turns_and_weights_give_shares() {
 async fn a_dead_upstream_is_retried_past_and_then_marked_down() {
     let live = upstream().await;
     // A port nothing listens on: the connection is refused at once.
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let (_dead, dead) = nobody_listens();
     // No retries: `first` sends to the dead one and answers 502.
     let (running, port) = start(&format!(
         ":0 {{\n\treverse_proxy {dead} {} {{\n\t\tlb_policy first\n\t}}\n}}\n",
@@ -404,7 +414,7 @@ async fn a_retried_request_goes_with_all_its_headers() {
             });
         }
     });
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let (_dead, dead) = nobody_listens();
     // The headers are handed to the first attempt; the retry makes them again.
     let (running, port) = start(&format!(
         ":0 {{\n\treverse_proxy {dead} {echo} {{\n\t\tlb_policy first\n\t\tlb_retries 1\n\t\tlb_try_interval 1ms\n\t\theader_up X-Up \"{{method}} {{uri}}\"\n\t}}\n}}\n"
