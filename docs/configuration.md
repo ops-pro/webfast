@@ -33,9 +33,69 @@ explicit `root * <dir>` (the files are loaded from it at startup).
 
 `reverse_proxy` passes WebSocket (any `Connection: upgrade` request over HTTP/1.1) with nothing to
 configure: the handshake goes to the upstream with the same `header_up` and forwarded headers as
-any request, and when the upstream answers 101 the two connections are joined and copied both ways
-until either side closes. Any other answer reaches the client as it is. Browsers open WebSocket
-over HTTP/1.1 (webfast does not offer it over HTTP/2, RFC 8441), so keep `h1` in `protocols`.
+any request — and, as a request without a body, to another upstream when the connection fails
+(`lb_retries`, `lb_try_duration`) — and when the upstream answers 101 the two connections are
+joined and copied both ways until either side closes. Any other answer reaches the client as it
+is; a 101 that switches to another protocol than the one asked for, or names none, is refused
+with 502.
+
+Over HTTP/2 a browser opens a WebSocket as a stream of the connection it already has (RFC 8441;
+Chrome and Firefox do), so a page's sockets cost no connection and no TLS handshake of their
+own. The server turns that request — a CONNECT with `:protocol: websocket` — into the HTTP/1.1
+handshake it stands for (a GET with `Connection: Upgrade`, `Upgrade: websocket` and a key of the
+server's own), so the matchers (`header Upgrade websocket`), the request checks, the modules and
+the upstream see one handshake whichever way it came. The switch is answered 200, as HTTP/2 says
+it; a path that answers 2xx without switching (a file, a `respond`, an upstream that took the
+handshake for a plain GET) is answered 501, as is a CONNECT for another protocol.
+`WEB_H2_WEBSOCKET=off` stops offering it, and every WebSocket comes over HTTP/1.1 again (keep
+`h1` in `protocols` either way: other clients need it). Not over HTTP/3 yet (RFC 9220): the
+`h3` crate as released (0.0.8) refuses a request with `:protocol: websocket` as malformed before
+the server sees it, and no browser opens WebSocket over HTTP/3 so far; a client that could gets
+no offer of it and uses HTTP/2 or HTTP/1.1.
+
+A tunnel is one connection of the limits whichever way it was opened. Over HTTP/1.1 it keeps the
+place of the connection it took; on an HTTP/2 stream it takes a place of its own next to its
+connection's, counted for the same client address, and gives it back when it closes. So
+`WEB_MAX_CONNECTIONS` and `WEB_MAX_CONNECTIONS_PER_IP` bound a client's tunnels the same either
+way: a handshake over HTTP/2 that finds no place is answered 429 (the address's limit) or 503
+(the server's) before any upstream is asked. Per upstream address, `unhealthy_request_count`
+counts a tunnel until it closes, with the requests under way (Upstreams). There is no directive
+for tunnels alone: as with nginx's `limit_conn`, a tunnel is counted by the limit on connections.
+
+A browser opens a WebSocket to a site from any page, and sends the site's cookies with the
+handshake: a page of another site can talk to the application as the visitor (cross-site
+WebSocket hijacking) unless the handshake's `Origin`, which no page can set, is checked — by the
+application, or here, before it:
+
+```caddyfile
+@foreign {
+	header Upgrade *
+	header Origin *
+	not header Origin https://app.example.com https://www.example.com
+}
+respond @foreign 403
+reverse_proxy app:8080
+```
+
+The same matcher holds for a WebSocket opened over HTTP/2. A client that sends no `Origin` is no
+browser on someone else's page and passes; without the `header Origin *` line it is refused too.
+recipes/websocket is this site whole, with `stream_timeout` and `stream_close_delay`.
+
+The server ends a tunnel itself when it stops, when `stream_timeout` runs out, and after a reload
+— every tunnel when `stream_close_delay` is set, otherwise those whose upstream the new
+configuration no longer names (Upstreams). It then says so in WebSocket's own words: a Close
+frame with the status 1001 (going away) to the client and to the upstream, after which a client
+library reconnects at once instead of treating the end as a failure. The frame is written only
+between two frames — the server follows the frame headers for this, and reads nothing of what
+they carry; a side that is in the middle of a frame is just closed. Another protocol than
+WebSocket is only closed.
+
+With `log`, a tunnel leaves two lines in the access log: the handshake's, as any request's, when
+it is answered (101; 200 over HTTP/2, where the method is `CONNECT`), and a second one when the
+tunnel closes — `"msg":"closed tunnel"`, the same `request`, with `duration` the tunnel's whole
+life, `bytes_read` what the client sent, `size` what was sent to it, and `closed_by`: `client` or
+`upstream` (whose Close frame came first, or whose connection ended first), `stop`, `reload`,
+`upstream_removed` or `stream_timeout`. A `console` line ends with ` tunnel closed_by=… bytes_read=…`.
 
 `respond 103` sends Early Hints, as in Caddy: the headers set so far (`header Link …`) go out as
 an interim response and the chain goes on, so a browser starts loading the page's styles and
@@ -298,14 +358,17 @@ reverse_proxy app-1:8080 app-2:8080 app-3:8080 {
 | `lb_policy least_conn`                                 | the fewest requests under way (until the response ends; a WebSocket tunnel until it closes); among equals, at random                                                                                                                                                                                          |
 | `lb_policy ip_hash` / `client_ip_hash`                 | by the peer's address / by the client's (the one a trusted proxy names)                                                                                                                                                                                                                                       |
 | `lb_policy uri_hash`                                   | by the request's path and query                                                                                                                                                                                                                                                                               |
-| `lb_policy query <key>` / `header <name>`              | by that query parameter / header; at random when the request has none                                                                                                                                                                                                                                         |
-| `lb_policy cookie [<name> [<secret>]]`                 | sticky: the response that chose a server sets a cookie (`lb` unless named; `Path=/; HttpOnly`, `Secure` over TLS) naming it, an HMAC of its address with `secret` (one per process unless given)                                                                                                              |
+| `lb_policy query <key>` / `header <name>`              | by that query parameter / header; a request that has none is chosen for by the `fallback`                                                                                                                                                                                                                     |
+| `lb_policy cookie [<name> [<secret>]]`                 | sticky: the response that chose a server sets a cookie (`lb` unless named; `Path=/; HttpOnly`, `Secure` over TLS) naming it, an HMAC of its address with `secret` (one per process unless given); a request without the cookie is chosen for by the `fallback`                                                |
+| `lb_policy query\|header\|cookie … { fallback <policy> }` | what chooses for a request without the key (`random` unless set): any policy that needs none, as `least_conn` to spread new clients — and their WebSocket tunnels — evenly, or `first`. Caddy also takes a keyed policy here, nested; webfast does not |
 | `lb_retries <n>`, `lb_try_duration`, `lb_try_interval` | a request the upstream was not reached by (the connection refused or timed out) that has no body to send again is tried at another, `lb_try_interval` (250ms) apart, while `lb_retries` and `lb_try_duration` allow (one that is 0 does not bound; both 0: no retry); every server tried, from the start again |
 | `fail_duration <d>`                                    | passive health on: a failure is remembered for this long (0, the default: off)                                                                                                                                                                                                                                |
 | `max_fails <n>`                                        | failures within `fail_duration` that mark a server down for `fail_duration` (1)                                                                                                                                                                                                                               |
 | `unhealthy_status <codes…>`                            | responses that count as failures, codes (`502`) or classes (`5xx`), besides a connection that failed                                                                                                                                                                                                          |
 | `unhealthy_latency <d>`                                | a response whose headers took longer counts as a failure                                                                                                                                                                                                                                                      |
-| `unhealthy_request_count <n>`                          | a server with this many requests under way is not chosen (0: no limit)                                                                                                                                                                                                                                        |
+| `unhealthy_request_count <n>`                          | a server with this many requests under way — a WebSocket tunnel is one until it closes — is not chosen (0: no limit; with `fail_duration` set)                                                                                                                                                                |
+| `stream_timeout <d>` | a WebSocket tunnel is closed this long after it opened, with a Close frame (0, the default: never) |
+| `stream_close_delay <d>` | after a reload the tunnels opened under the configuration it replaced are closed with a Close frame, each at a moment of its own within this long, so that their clients come back spread over it (`0`: at once); unset: a reload closes, at once, only the tunnels to an upstream that the port's new configuration no longer names (the instance was taken out), and leaves the others open |
 | `transport http { resolvers <ip…> }`                   | the nameservers for this proxy's names (unset: `/etc/resolv.conf`)                                                                                                                                                                                                                                            |
 
 The hashes are rendezvous hashes: a key stays on its server while that server is up, and only the
@@ -319,18 +382,19 @@ Caddy's directive has more. What is read, what is meant to come, and what is not
 
 | Read                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to` and inline upstreams (`host:port`, `http://host:port`, `:port`, `host`); every `lb_policy`; `lb_retries`, `lb_try_duration`, `lb_try_interval`; `fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`; `header_up`, `header_down`; `flush_interval` (always streaming); `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }`; WebSocket; `request_body` |
+| `to` and inline upstreams (`host:port`, `http://host:port`, `:port`, `host`); every `lb_policy`; `fallback` of `query`, `header` and `cookie`; `lb_retries`, `lb_try_duration`, `lb_try_interval`; `fail_duration`, `max_fails`, `unhealthy_status`, `unhealthy_latency`, `unhealthy_request_count`; `header_up`, `header_down`; `flush_interval` (always streaming); `transport http { dial_timeout, response_header_timeout, keepalive, resolvers, versions 1.1 }`; WebSocket (over HTTP/1.1 and HTTP/2), `stream_timeout`, `stream_close_delay`; `request_body` |
 
 | Meant to come                                                                                                                                                                                                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TLS to the upstream: `https://` upstreams, `transport http { tls, tls_server_name, tls_trusted_ca_certs, tls_client_auth, tls_insecure_skip_verify, tls_except_ports }`                                                                                                             |
+| TLS to the upstream: `https://` upstreams, `transport http { tls, tls_server_name, tls_trusted_ca_certs, tls_client_auth, tls_insecure_skip_verify, tls_except_ports }`. With it, WebSocket to the upstream over TLS (`wss`): the handshake does not go through the pooled client but dials a connection of its own (src/proxy.rs `shake`), which has to take the same TLS settings and hand the TLS stream to the tunnel                                                                                                             |
 | `handle_response [<matcher>] { … }` with `status` and `header` response matchers, `replace_status`, `copy_response`, `copy_response_headers`                                                                                                                                       |
+| WebSocket over HTTP/3 (RFC 9220): with a release of the `h3` crate that reads `:protocol: websocket` (0.0.8 refuses the request as malformed; its repository has it). Then: `enable_extended_connect` in src/h3.rs, the request turned into the handshake as for HTTP/2 (src/server.rs `websocket_connect`), the stream handed to src/tunnel.rs, and a QUIC connection with a quiet tunnel kept from idling out |
 | `unix//path` upstreams; `h2c://` upstreams and `versions 2 h2c`; `transport fastcgi` and `php_fastcgi`                                                                                                                                                                              |
 | `dynamic a` / `dynamic srv` (upstreams that come and go by a name's answer); `transport http { proxy_protocol, max_conns_per_host }`; `method`, `rewrite`; active health checks (`health_uri` and the other `health_*`); `lb_retry_match`; a `trusted_proxies` of the proxy's own |
 
 | Not meant to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `request_buffers`, `response_buffers`, `stream_timeout`, `stream_close_delay` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_timeout, tls_renegotiation, tls_trust_pool }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
+| `request_buffers`, `response_buffers` (responses are always streamed as they arrive); `transport http { read_buffer, write_buffer, max_response_header, dial_fallback_delay, expect_continue_timeout, compression, local_address, network_proxy, forward_proxy_url, keepalive_interval, keepalive_idle_conns, keepalive_idle_conns_per_host, tls_timeout, tls_renegotiation, tls_trust_pool }`; port ranges in `to`; the `{upstream_*}` placeholders; `verbose_logs` |
 
 A setting that is not read is an error at start, never ignored.
 
@@ -641,8 +705,13 @@ Those an answer shows are checked by `compat/`:
   non-overlapping ranges, redirect targets kept on the site, client identity headers
   (`X-Real-IP`, `CF-Connecting-IP`, `Forwarded`, …) dropped from untrusted peers.
 - A WebSocket tunnel keeps the place of the connection it came from, so it counts against the
-  connection limits; it has no idle limit, and closes when the server stops (Caddy's default,
-  `stream_close_delay 0`). `stream_timeout` and `stream_close_delay` are not supported.
+  connection limits; it has no idle limit, and closes when the server stops, with a Close frame
+  to both sides as Caddy's. A reload leaves tunnels open unless `stream_close_delay` is set
+  (Caddy closes them at once without it), but for those to an upstream it took out; and with
+  `stream_close_delay` they close spread over the delay, each at its own moment (Caddy: all
+  together when it ends). A 101 for another protocol than asked for is refused, as in Caddy. `stream_timeout` as in Caddy, with the Close
+  frame too. A handshake whose connection to the upstream fails is tried at another
+  (`lb_retries`), and a tunnel's close has its own line in the access log.
 - A file larger than `WEB_MAX_FILE_IN_MEMORY` is streamed from disk with an ETag from its size and
   modification time (as Caddy's), and answers at most one range: several get the whole file (Caddy:
   multipart/byteranges).
@@ -701,6 +770,7 @@ its own, documented there; a variable of a module the binary was built without s
 | `WEB_RUNTIME`                      | `per-core`  | `per-core`: a thread with its own runtime per listening socket (Unix); `shared`: one multi-threaded runtime for all connections                                                                                                                                    |
 | `WEB_RELOAD`                       | `immediate` | what a reload (SIGHUP) does to open connections: `immediate`, their next request gets the new configuration; `lazy`, they keep theirs until they close; `drain`, as lazy, each closed at a random moment within `WEB_RELOAD_DRAIN` (docs/operations.md, Reloading) |
 | `WEB_RELOAD_DRAIN`                 | `60s`       | with `WEB_RELOAD=drain`, the window over which the connections a reload leaves on the old configuration are closed; `0`: all at once                                                                                                                               |
+| `WEB_H2_WEBSOCKET`                 | `on`        | `off`: WebSocket over HTTP/2 (RFC 8441) is not offered, and browsers open every WebSocket over HTTP/1.1, on a connection of its own |
 | `WEB_RATE_LIMIT_KEYS`              | `1000000`   | the keys a `rate_limit` zone holds at most (some 34 MiB when full); a full zone refuses a new key unless keys at rest can be dropped                                                                                                                               |
 | `WEB_RATE_LIMIT_DRY_RUN`           | `off`       | `on`: `rate_limit` refuses nothing, its zones only count and log what they would refuse                                                                                                                                                                            |
 | `WEB_MAX_UPSTREAM_REQUESTS_PER_IP` | `256`       | a client's requests at the upstreams at once (`reverse_proxy`, until the response ends; behind a trusted proxy, the client it names); more are refused with 429; `0`: no limit (docs/configuration.md, Rate limits)                                                |
@@ -716,8 +786,8 @@ its own, documented there; a variable of a module the binary was built without s
 | `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX` | `5s`, `1h`  | the TTL of an upstream name's answer is kept within these; the name is resolved again at 90% of it (docs/dns.md) |
 | `WEB_DNS_TIMEOUT`                  | `5s`        | one DNS query at most; a name that does not resolve answers 502 until it does |
 | `WEB_DNS_IPV6`                     | `on`        | `off`: upstream names are resolved to IPv4 addresses only |
-| `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together; `0`: no limit                                                                                                                                                                                                             |
-| `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt); `0`: no limit                                                                                                                                                                |
+| `WEB_MAX_CONNECTIONS`              | `16384`     | open connections, TCP and QUIC together, a WebSocket tunnel on an HTTP/2 stream being one more; `0`: no limit                                                                                                                                                      |
+| `WEB_MAX_CONNECTIONS_PER_IP`       | `256`       | open connections per client address (an IPv6 /64 is one; trusted proxies are exempt), a WebSocket tunnel on an HTTP/2 stream being one more; `0`: no limit                                                                                                         |
 | `WEB_STALL_TIMEOUT`                | `30s`       | a response the client stops taking, or a request body it stops sending, for this long ends it                                                                                                                                                                      |
 | `WEB_TCP_CONGESTION`               | `bbr`       | TCP congestion control for the clients' connections; `system`: the kernel's default                                                                                                                                                                                |
 | `WEB_LOG_FLUSH_MS`                 | `10`        | access log lines are written in batches this often by a background thread; a full queue drops lines (counted) instead of slowing requests                                                                                                                          |

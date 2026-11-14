@@ -477,7 +477,11 @@ async fn run(config: config::Config, started: std::time::Instant, reload: Reload
             },
         }
     }
-    tracing::info!(grace_secs = grace.as_secs(), "shutting down");
+    tracing::info!(
+        grace_secs = grace.as_secs(),
+        tunnels = crate::tunnel::open(),
+        "shutting down"
+    );
     running.shutdown(grace).await;
     crate::accesslog::flush_all(Duration::from_secs(2));
     tracing::info!("stopped");
@@ -544,6 +548,8 @@ async fn reload_config(running: &mut server::Running, reload: &Reload) -> anyhow
         files_in_memory_mib = (files.stored as f64 / 1048576.0 * 10.0).round() / 10.0,
         ready_paths = ready.paths,
         ready_answers = ready.answers,
+        // Open now, on the configurations they were opened under (`stream_close_delay`).
+        tunnels = crate::tunnel::open(),
         ms = started.elapsed().as_millis() as u64,
         "configuration reloaded"
     );

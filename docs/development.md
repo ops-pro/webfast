@@ -32,7 +32,8 @@ test. Paths below are relative to the crate (`src/` of the core unless said othe
 | `src/cache.rs`                                   | `cache` (cargo feature `proxy-cache`): proxied answers in memory, the worker that stores them       |
 | `src/watch.rs`                                   | changed files picked up: inotify or polling                                                         |
 | `src/encode.rs`                                  | Accept-Encoding and on-the-fly zstd / Brotli / gzip                                                 |
-| `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; WebSocket tunnels                                          |
+| `src/proxy.rs`                                   | `reverse_proxy` to plain-HTTP upstreams; the WebSocket handshake                                    |
+| `src/tunnel.rs`                                  | a tunnel's life: both ways copied and counted, WebSocket frames followed, the Close frame          |
 | `src/server.rs`                                  | listeners, connections, runtimes; one request on any protocol                                       |
 | `src/h3.rs`, `src/h3limit.rs`                    | HTTP/3 over QUIC, and its frame size limit                                                          |
 | `src/tls.rs`                                     | rustls: certificates from PEM files, re-read on change; tickets, 0-RTT                              |
@@ -101,7 +102,10 @@ connection limits; oversized HTTP/3 header frames; both runtimes and their shutd
 picked up by inotify and by polling. `tests/recipes.rs` loads every `recipes/*/Caddyfile` (a new
 recipe has to be added to its list) and serves the static site and the SPA. `tests/websocket.rs`
 sends handshakes through to an upstream written by hand: the tunnel both ways, what the upstream
-is sent, answers other than 101, the connection limits and the shutdown. `tests/errors.rs` fails
+is sent, answers other than 101, another upstream when the connection fails, the connection
+limits, the Close frame at the shutdown, at `stream_timeout` and after a reload, the access log's
+line at a tunnel's close, the origin check of recipes/websocket, the tunnels an upstream takes,
+and WebSocket over HTTP/2 with the place a tunnel takes there. `tests/errors.rs` fails
 requests in each way a handler can and checks the `handle_errors` answers against what Caddy 2.11
 answers to the same Caddyfile. `tests/reload.rs` reloads a running server: the next request on an
 open connection gets the new sites, kept roots are not read again, the files watched and the

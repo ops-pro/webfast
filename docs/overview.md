@@ -148,8 +148,8 @@ flowchart TD
     bound -- refused --> refused["401 / 403 / 413 / 415 / 503"]
     bound -- pass --> slot{"WEB_MAX_UPSTREAM_REQUESTS_PER_IP"}
     slot -- over --> r429["429"]
-    slot -- within --> ws{"WebSocket upgrade (HTTP/1.1)?"}
-    ws -- yes --> tunnel["handshake to the upstream;<br/>on 101 a tunnel both ways"]
+    slot -- within --> ws{"WebSocket upgrade (HTTP/1.1,<br/>or HTTP/2 CONNECT turned into it)?"}
+    ws -- yes --> tunnel["handshake to an upstream, the next one<br/>when the connection fails;<br/>on 101 a tunnel both ways"]
     ws -- no --> send["headers: hop-by-hop dropped,<br/>X-Forwarded-*, client identity headers<br/>only from trusted proxies, header_up"]
     send --> up["a server by lb_policy, per address, the down<br/>ones passed by; retries; response_header_timeout"]
     up --> resp{"response"}

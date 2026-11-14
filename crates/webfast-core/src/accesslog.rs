@@ -58,6 +58,7 @@ pub struct AccessLog {
 
 /// What is known about a request when it arrives (cheap copies: no strings are built until the
 /// line is written).
+#[derive(Clone)]
 pub struct RequestInfo {
     /// The request's id (src/reqid.rs).
     pub id: Option<crate::reqid::RequestId>,
@@ -266,11 +267,13 @@ impl AccessLog {
         if self.output == Output::Discard {
             return;
         }
-        write_line(self.output, self.line(info, status, size));
+        write_line(self.output, self.line(info, status, size, None));
     }
 
-    /// The log line, newline included.
-    fn line(&self, info: &RequestInfo, status: u16, size: u64) -> String {
+    /// The log line, newline included. With `tunnel` it is the line of a tunnel's close
+    /// (`TunnelLog`): who closed it and the bytes read from the client, `size` being those sent
+    /// to it and the duration the tunnel's whole life.
+    fn line(&self, info: &RequestInfo, status: u16, size: u64, tunnel: Option<(&str, u64)>) -> String {
         let duration = info.started.elapsed();
         let host = info.host.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
         // The policy in place (src/privacy.rs): the secret parameters' values hidden (the JWT
@@ -286,7 +289,13 @@ impl AccessLog {
             Format::Json => {
                 line.push_str(r#"{"level":"info","ts":"#);
                 write_timestamp(&mut line);
-                line.push_str(r#","logger":"http.log.access","msg":"handled request","request":{"#);
+                line.push_str(r#","logger":"http.log.access","msg":""#);
+                line.push_str(if tunnel.is_some() {
+                    "closed tunnel"
+                } else {
+                    "handled request"
+                });
+                line.push_str(r#"","request":{"#);
                 if let Some(id) = &info.id {
                     write_id(&mut line, id);
                 }
@@ -315,6 +324,9 @@ impl AccessLog {
                 json_escape(&mut line, uri);
                 line.push_str(r#""},"duration":"#);
                 write_seconds(&mut line, duration.as_secs(), duration.subsec_nanos(), 9);
+                if let Some((closed_by, bytes_read)) = tunnel {
+                    let _ = write!(line, r#","bytes_read":{bytes_read},"closed_by":"{closed_by}""#);
+                }
                 let _ = writeln!(line, r#","size":{size},"status":{status}}}"#);
             }
             Format::Console => {
@@ -324,10 +336,43 @@ impl AccessLog {
                 let _ = write!(line, " {} {} {host} {uri} {status} {size} ", info.proto, info.method);
                 // Milliseconds to three places, rounded, from the microseconds.
                 let micros = (duration.as_nanos() + 500) / 1000;
-                let _ = writeln!(line, "{}.{:03}ms", micros / 1000, micros % 1000);
+                let _ = write!(line, "{}.{:03}ms", micros / 1000, micros % 1000);
+                if let Some((closed_by, bytes_read)) = tunnel {
+                    let _ = write!(line, " tunnel closed_by={closed_by} bytes_read={bytes_read}");
+                }
+                line.push('\n');
             }
         }
         line
+    }
+}
+
+/// The access log of a request that may become a tunnel (src/server.rs puts it in the request's
+/// extensions when the site logs): the line of the handshake is written as any request's, when
+/// its answer is sent, and the tunnel writes a second one when it closes (src/proxy.rs) — the
+/// same request, with the tunnel's whole life as its duration, the bytes it carried each way and
+/// who closed it.
+#[derive(Clone)]
+pub struct TunnelLog {
+    log: AccessLog,
+    info: RequestInfo,
+}
+
+impl TunnelLog {
+    pub fn new(log: AccessLog, info: RequestInfo) -> TunnelLog {
+        TunnelLog { log, info }
+    }
+
+    /// The tunnel closed. `status`: what the handshake was answered with; `closed_by`: who ended
+    /// it (src/tunnel.rs `End`); `from_client` and `to_client`: the bytes it carried.
+    pub fn closed(&self, status: u16, closed_by: &str, from_client: u64, to_client: u64) {
+        if self.log.output == Output::Discard {
+            return;
+        }
+        let line = self
+            .log
+            .line(&self.info, status, to_client, Some((closed_by, from_client)));
+        write_line(self.log.output, line);
     }
 }
 
@@ -461,7 +506,7 @@ mod tests {
                 format,
                 privacy: Default::default(),
             }
-            .line(&info, 200, 0);
+            .line(&info, 200, 0, None);
             assert!(!line.contains("secret"), "{line}");
             assert!(
                 line.contains("/api/x?a=1&wf_test_token=REDACTED&wf%5Ftest%5Ftoken=REDACTED&b=2"),
@@ -474,7 +519,7 @@ mod tests {
             format: Format::Console,
             privacy: Default::default(),
         }
-        .line(&info, 200, 0);
+        .line(&info, 200, 0, None);
         assert!(line.contains("eyJ.secret.one"), "no JWT check: the URI as sent");
     }
 
@@ -501,7 +546,7 @@ mod tests {
                     ..Overrides::default()
                 },
             }
-            .line(&info, 200, 0)
+            .line(&info, 200, 0, None)
         };
         let json =
             |personal| -> serde_json::Value { serde_json::from_str(line(personal, Format::Json).trim_end()).unwrap() };
@@ -547,19 +592,19 @@ mod tests {
             privacy: Default::default(),
         };
         let own = crate::reqid::RequestId::next(&headers, false);
-        let line = log(Format::Json).line(&info(own.clone()), 200, 0);
+        let line = log(Format::Json).line(&info(own.clone()), 200, 0, None);
         assert!(line.contains(r#""request":{"id":""#), "{line}");
         let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(parsed["request"]["id"], own.text());
         assert!(parsed["request"].get("trace_id").is_none());
         let given = crate::reqid::RequestId::next(&headers, true);
         let parsed: serde_json::Value =
-            serde_json::from_str(log(Format::Json).line(&info(given), 200, 0).trim_end()).unwrap();
+            serde_json::from_str(log(Format::Json).line(&info(given), 200, 0, None).trim_end()).unwrap();
         assert_eq!(parsed["request"]["id"], r#"lb-"7"\x"#);
         assert_eq!(parsed["request"]["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
         assert!(
             log(Format::Console)
-                .line(&info(own), 200, 0)
+                .line(&info(own), 200, 0, None)
                 .starts_with("203.0.113.9 HTTP/1.1 GET example.com / 200 0 ")
         );
     }
@@ -584,7 +629,7 @@ mod tests {
             format: Format::Json,
             privacy: Default::default(),
         };
-        let line = log.line(&info, 200, 1234);
+        let line = log.line(&info, 200, 1234, None);
         assert!(line.ends_with('\n'));
         let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(parsed["logger"], "http.log.access");
@@ -604,7 +649,7 @@ mod tests {
             format: Format::Console,
             privacy: Default::default(),
         };
-        let line = console.line(&info, 200, 1234);
+        let line = console.line(&info, 200, 1234, None);
         let rest = line
             .strip_prefix("203.0.113.9 HTTP/1.1 GET example.com /en/?q=%22x%22 200 1234 ")
             .unwrap();
@@ -615,6 +660,42 @@ mod tests {
             "{ms:?}: milliseconds to three places"
         );
         assert!(ms.parse::<f64>().unwrap() < 1000.0, "{ms}");
+    }
+
+    /// A tunnel's close: the request's line again, with who closed it and the bytes each way.
+    #[test]
+    fn a_tunnel_s_close_is_the_request_s_line_with_its_end() {
+        let info = RequestInfo {
+            id: None,
+            remote: "10.0.0.2:4000".parse().unwrap(),
+            client_ip: "203.0.113.9".parse().unwrap(),
+            proto: "HTTP/2.0",
+            method: Method::CONNECT,
+            host: Some(HeaderValue::from_static("example.com")),
+            uri: Uri::from_static("/ws?room=1"),
+            started: Instant::now(),
+        };
+        let log = |format| AccessLog {
+            output: Output::Discard,
+            format,
+            privacy: Default::default(),
+        };
+        let line = log(Format::Json).line(&info, 200, 1234, Some(("stream_timeout", 56)));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["msg"], "closed tunnel");
+        assert_eq!(parsed["logger"], "http.log.access");
+        assert_eq!(parsed["request"]["method"], "CONNECT");
+        assert_eq!(parsed["request"]["uri"], "/ws?room=1");
+        assert_eq!(parsed["closed_by"], "stream_timeout");
+        assert_eq!(parsed["bytes_read"], 56);
+        assert_eq!(parsed["size"], 1234);
+        assert_eq!(parsed["status"], 200);
+        let line = log(Format::Console).line(&info, 200, 1234, Some(("client", 56)));
+        assert!(
+            line.starts_with("203.0.113.9 HTTP/2.0 CONNECT example.com /ws?room=1 200 1234 "),
+            "{line}"
+        );
+        assert!(line.ends_with("ms tunnel closed_by=client bytes_read=56\n"), "{line}");
     }
 
     #[test]

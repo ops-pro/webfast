@@ -11,19 +11,25 @@
 //! `request_body` limit 413 (at once when its length says so: the upstream is not called); and
 //! `response_header_timeout` has a default (src/config.rs).
 //!
-//! WebSocket (any `Connection: upgrade` over HTTP/1.1): the handshake goes to the upstream on a
-//! connection of its own, and when it answers 101 the client's and the upstream's connections are
-//! joined into a tunnel that copies bytes both ways until either side closes. The tunnel keeps the
-//! client connection's place (src/guard.rs `Place`), so it counts against the connection limits.
+//! WebSocket (any `Connection: upgrade` over HTTP/1.1, and WebSocket over HTTP/2, which
+//! src/server.rs turns into that handshake): the handshake goes to the upstream on a connection of
+//! its own — tried on another upstream when the connection fails, as any request without a body —
+//! and when it answers 101 the client's and the upstream's connections are joined into a tunnel
+//! (src/tunnel.rs) that copies bytes both ways until either side closes, the server stops,
+//! `stream_timeout` runs out, or the configuration is reloaded with `stream_close_delay` set. The
+//! tunnel keeps the client connection's place (src/guard.rs `Place`), so it counts against the
+//! connection limits.
 //!
 //! Request checks bound to an upstream (`upstreams` in src/jwt and src/apifw) run here, on the
 //! request as it goes to that upstream, before anything is sent.
 
+use crate::accesslog::TunnelLog;
 use crate::body::{Body, boxed};
 use crate::extensions::{Held, PROXY, ProxyObserver, Sent, UpstreamCheck, UpstreamHeld};
-use crate::guard::{Place, body_fault};
+use crate::guard::{Full, Place, Reloads, body_fault};
 use crate::handler::{Ctx, HeaderOp, RenderedOp, apply_ops};
-use crate::upstreams::{NoServer, Upstreams};
+use crate::tunnel::{Counted, End};
+use crate::upstreams::{Loaded, NoServer, Picked, Upstreams};
 use http::header::{CONNECTION, HOST, SET_COOKIE, UPGRADE};
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
@@ -68,6 +74,12 @@ pub struct ReverseProxy {
     pub response_header_timeout: Option<Duration>,
     /// For the connections of WebSocket handshakes (the pooled client has its own).
     pub dial_timeout: Duration,
+    /// `stream_timeout`: a tunnel is closed this long after it opened; `None`: never.
+    pub stream_timeout: Option<Duration>,
+    /// `stream_close_delay`: after a reload, the tunnels opened under the configuration it
+    /// replaced are closed, each at a moment of its own within this long (zero: at once); `None`:
+    /// a reload leaves them open.
+    pub stream_close_delay: Option<Duration>,
     pub client: HttpClient,
 }
 
@@ -237,6 +249,59 @@ fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
     }
 }
 
+fn is_websocket(protocol: &HeaderValue) -> bool {
+    protocol.as_bytes().eq_ignore_ascii_case(b"websocket")
+}
+
+/// Why a handshake got no answer from an upstream.
+enum Unanswered {
+    /// No connection: nothing was sent, another upstream may be tried.
+    Connect(String),
+    /// The connection failed after the handshake went out.
+    Exchange(String),
+    /// `response_header_timeout` ran out.
+    Late,
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::Connect(error) | Unanswered::Exchange(error) => f.write_str(error),
+            Unanswered::Late => f.write_str("no answer in time"),
+        }
+    }
+}
+
+/// Sends a handshake to `address` on a connection of its own (not the pool's: it is handed over
+/// to the tunnel when the upstream switches protocols) and waits for the answer's head.
+///
+/// Plain TCP, as every upstream is for now. When TLS to the upstreams comes (docs/configuration.md,
+/// What `reverse_proxy` reads) this dial has to take it too — the pooled client's connector does
+/// not cover it — and hand the TLS stream to the tunnel: `wss` to the upstream.
+async fn shake(
+    dial_timeout: Duration,
+    address: std::net::SocketAddr,
+    request: Request<Body>,
+) -> Result<Response<hyper::body::Incoming>, Unanswered> {
+    let tcp = match tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address)).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(error)) => return Err(Unanswered::Connect(error.to_string())),
+        Err(_) => return Err(Unanswered::Connect("connection timed out".to_string())),
+    };
+    let _ = tcp.set_nodelay(true);
+    // A tunnel may be quiet for hours: an upstream that vanished is found by the probes.
+    crate::sockets::keep_alive(&tcp);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .map_err(|error| Unanswered::Exchange(error.to_string()))?;
+    // Drives the connection, and hands it over when the upstream switches protocols.
+    tokio::spawn(connection.with_upgrades());
+    sender
+        .send_request(request)
+        .await
+        .map_err(|error| Unanswered::Exchange(error.to_string()))
+}
+
 impl ReverseProxy {
     pub async fn serve(self: &Arc<Self>, mut ctx: Ctx) -> Response<Body> {
         // Preparing ready answers (src/memo.rs): never kept from a proxy, so no upstream is called.
@@ -304,27 +369,10 @@ impl ReverseProxy {
         let mut tried: u64 = 0;
         let mut attempt: u32 = 0;
         let outcome = loop {
-            let picked = match loaded.pick(&ctx, tried) {
+            let picked = match self.pick(&loaded, &ctx, &mut tried) {
                 Ok(picked) => picked,
-                // Every server up was tried: from the start again, as Caddy retries.
-                Err(NoServer::AllTried) => {
-                    tried = 0;
-                    match loaded.pick(&ctx, 0) {
-                        Ok(picked) => picked,
-                        Err(_) => break Err(StatusCode::SERVICE_UNAVAILABLE),
-                    }
-                }
-                Err(NoServer::AllDown) => {
-                    tracing::warn!("no upstream is available");
-                    break Err(StatusCode::SERVICE_UNAVAILABLE);
-                }
-                // The name has not resolved (yet): what a failed connection answers.
-                Err(NoServer::NoAddress) => {
-                    tracing::warn!(upstreams = ?self.upstreams, "no upstream address: the name does not resolve");
-                    break Err(StatusCode::BAD_GATEWAY);
-                }
+                Err(status) => break Err(status),
             };
-            tried |= 1 << picked.index;
             let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);
             let mut parts = Uri::builder().scheme(Scheme::HTTP).authority(server.authority.clone());
             if let Some(pq) = &path_and_query {
@@ -387,10 +435,7 @@ impl ReverseProxy {
                         break Err(StatusCode::GATEWAY_TIMEOUT);
                     }
                     attempt += 1;
-                    let allowed = (self.retries > 0 || !self.try_duration.is_zero())
-                        && (self.retries == 0 || attempt <= self.retries)
-                        && started.is_none_or(|at| at.elapsed() + self.try_interval < self.try_duration);
-                    if !(connect && replayable && allowed) {
+                    if !(connect && replayable && self.may_retry(attempt, started)) {
                         break Err(StatusCode::BAD_GATEWAY);
                     }
                     tokio::time::sleep(self.try_interval).await;
@@ -440,6 +485,38 @@ impl ReverseProxy {
                 ctx.fail(status, None)
             }
         }
+    }
+
+    /// The server for a request's next attempt: one it has not tried (`tried`: those it has, by
+    /// bit), or, with every server that is up tried, from the start again, as Caddy retries.
+    /// `Err`: what to answer when there is none.
+    fn pick<'l>(&self, loaded: &'l Loaded<'_>, ctx: &Ctx, tried: &mut u64) -> Result<Picked<'l>, StatusCode> {
+        let picked = match loaded.pick(ctx, *tried) {
+            Ok(picked) => picked,
+            Err(NoServer::AllTried) => {
+                *tried = 0;
+                loaded.pick(ctx, 0).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            }
+            Err(NoServer::AllDown) => {
+                tracing::warn!("no upstream is available");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            // The name has not resolved (yet): what a failed connection answers.
+            Err(NoServer::NoAddress) => {
+                tracing::warn!(upstreams = ?self.upstreams, "no upstream address: the name does not resolve");
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        };
+        *tried |= 1 << picked.index;
+        Ok(picked)
+    }
+
+    /// Whether a request whose connection to an upstream failed may be sent again, after
+    /// `attempt` attempts since `started`: while `lb_retries` and `lb_try_duration` both allow.
+    fn may_retry(&self, attempt: u32, started: Option<Instant>) -> bool {
+        (self.retries > 0 || !self.try_duration.is_zero())
+            && (self.retries == 0 || attempt <= self.retries)
+            && started.is_none_or(|at| at.elapsed() + self.try_interval < self.try_duration)
     }
 
     /// A request of the server's own to an upstream (src/cache.rs: revalidations, and the
@@ -512,9 +589,11 @@ impl ReverseProxy {
         headers
     }
 
-    /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own;
-    /// when it answers 101, the client's connection and that one become a tunnel, copied both ways
-    /// until either side closes. Any other answer is passed on as it is, with no tunnel.
+    /// A protocol switch (WebSocket): the handshake goes to the upstream on a connection of its own
+    /// — to another one when the connection fails, while `lb_retries` and `lb_try_duration` allow,
+    /// as a request without a body is retried. When the upstream answers 101, the client's
+    /// connection and that one become a tunnel (src/tunnel.rs). Any other answer is passed on as
+    /// it is, with no tunnel.
     async fn tunnel(
         &self,
         mut ctx: Ctx,
@@ -522,95 +601,183 @@ impl ReverseProxy {
         client: OnUpgrade,
         held: UpstreamHeld,
     ) -> Response<Body> {
-        let mut headers = self.upstream_headers(&ctx);
-        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-        headers.insert(UPGRADE, protocol);
-        let rendered_down = self.render_down(&ctx);
         let place = ctx.req.extensions.get::<Place>().cloned();
-        let loaded = self.servers.load();
-        let picked = match loaded.pick(&ctx, 0) {
-            Ok(picked) => picked,
-            Err(_) => {
-                tracing::warn!("no upstream is available");
-                return ctx.fail(StatusCode::SERVICE_UNAVAILABLE, None);
-            }
-        };
-        let (server, lease) = (picked.server, picked.lease);
-        let upstream = server.name.clone();
-        let target = ctx.req.uri.path_and_query().map_or("/", |pq| pq.as_str());
-        let mut request = Request::new(crate::body::empty());
-        *request.method_mut() = ctx.req.method.clone();
-        *request.uri_mut() = target.parse().unwrap_or_else(|_| Uri::from_static("/"));
-        *request.headers_mut() = headers;
-        let (dial_timeout, address) = (self.dial_timeout, server.addr);
-        let exchange = async move {
-            let tcp = tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address))
-                .await
-                .map_err(|_| "connection timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            let _ = tcp.set_nodelay(true);
-            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
-                .await
-                .map_err(|e| e.to_string())?;
-            // Drives the connection, and hands it over when the upstream switches protocols.
-            tokio::spawn(connection.with_upgrades());
-            sender.send_request(request).await.map_err(|e| e.to_string())
-        };
-        let answered = match self.response_header_timeout {
-            Some(limit) => match tokio::time::timeout(limit, exchange).await {
-                Ok(result) => result.map_err(|e| (StatusCode::BAD_GATEWAY, e)),
-                Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "no answer in time".to_string())),
-            },
-            None => exchange.await.map_err(|e| (StatusCode::BAD_GATEWAY, e)),
-        };
-        let mut response = match answered {
-            Ok(response) => response,
-            Err((status, error)) => {
-                tracing::warn!(upstream = %upstream, address = %server.addr, %error, "upstream WebSocket handshake failed");
-                if let Some(passive) = self.servers.passive() {
-                    server.failed(passive);
-                }
+        // Over HTTP/2 the tunnel is one stream of a connection that goes on. It takes a place of
+        // its own among the open connections, as a tunnel over HTTP/1.1 has its connection's —
+        // one that finds none is refused before any upstream is asked — and it keeps its
+        // connection busy while open.
+        let over_stream = ctx.req.version == http::Version::HTTP_2;
+        let tunneling = match place
+            .as_ref()
+            .filter(|_| over_stream)
+            .map(|place| place.tunnel(ctx.req.version))
+        {
+            Some(Ok(tunneling)) => Some(tunneling),
+            Some(Err(full)) => {
+                tracing::debug!(client = %ctx.client_ip, limit = ?full, "tunnel refused: too many connections open");
+                let status = match full {
+                    Full::Address => StatusCode::TOO_MANY_REQUESTS,
+                    Full::Server => StatusCode::SERVICE_UNAVAILABLE,
+                };
                 return ctx.fail(status, None);
             }
+            None => None,
+        };
+        let rendered_down = self.render_down(&ctx);
+        let target: Uri = ctx
+            .req
+            .uri
+            .path_and_query()
+            .and_then(|pq| pq.as_str().parse().ok())
+            .unwrap_or_else(|| Uri::from_static("/"));
+        let started = (!self.try_duration.is_zero()).then(Instant::now);
+        let loaded = self.servers.load();
+        let passive = self.servers.passive();
+        let timed = passive.is_some_and(|p| p.unhealthy_latency.is_some());
+        let (mut tried, mut attempt) = (0u64, 0u32);
+        let (mut response, server, lease, set_cookie) = loop {
+            let picked = match self.pick(&loaded, &ctx, &mut tried) {
+                Ok(picked) => picked,
+                Err(status) => return ctx.fail(status, None),
+            };
+            let (server, lease, set_cookie) = (picked.server, picked.lease, picked.set_cookie);
+            let mut headers = self.upstream_headers(&ctx);
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            headers.insert(UPGRADE, protocol.clone());
+            let mut request = Request::new(crate::body::empty());
+            *request.method_mut() = ctx.req.method.clone();
+            *request.uri_mut() = target.clone();
+            *request.headers_mut() = headers;
+            let sent_at = timed.then(Instant::now);
+            let exchange = shake(self.dial_timeout, server.addr, request);
+            let answered = match self.response_header_timeout {
+                Some(limit) => tokio::time::timeout(limit, exchange)
+                    .await
+                    .unwrap_or(Err(Unanswered::Late)),
+                None => exchange.await,
+            };
+            match answered {
+                Ok(response) => {
+                    if let Some(passive) = passive {
+                        let took = sent_at.map_or(Duration::ZERO, |at| at.elapsed());
+                        if passive.faults(response.status().as_u16(), took) {
+                            server.failed(passive);
+                        } else {
+                            server.succeeded();
+                        }
+                    }
+                    break (response, server, lease, set_cookie);
+                }
+                Err(error) => {
+                    tracing::warn!(upstream = %server.name, address = %server.addr, %error, "upstream WebSocket handshake failed");
+                    if let Some(passive) = passive {
+                        server.failed(passive);
+                    }
+                    attempt += 1;
+                    match error {
+                        Unanswered::Late => return ctx.fail(StatusCode::GATEWAY_TIMEOUT, None),
+                        // Nothing reached that upstream: another may take the handshake.
+                        Unanswered::Connect(_) if self.may_retry(attempt, started) => {
+                            tokio::time::sleep(self.try_interval).await;
+                        }
+                        _ => return ctx.fail(StatusCode::BAD_GATEWAY, None),
+                    }
+                }
+            }
+        };
+        // `lb_policy cookie`: the answer that chose a server names it to the client.
+        let cookie = if set_cookie {
+            self.servers.cookie_for(server, ctx.conn.tls)
+        } else {
+            None
         };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             let (mut parts, incoming) = response.into_parts();
             remove_hop_headers(&mut parts.headers);
             self.apply_down(&rendered_down, &mut parts.headers);
+            if let Some(cookie) = cookie {
+                parts.headers.append(SET_COOKIE, cookie);
+            }
             return ctx.respond_appending(Response::from_parts(parts, holding(incoming, (held, lease))));
         }
         // A tunnel counts as the connection it came from (src/guard.rs), not as a request: its
         // slot is given back with this answer.
+        // The switch must be to what was asked for (as Caddy checks): after a 101 for another
+        // protocol, or for none, the two sides would speak different ones through the tunnel.
+        let switched_to = response.headers().get(UPGRADE).cloned();
+        let Some(switched_to) = switched_to.filter(|to| to.as_bytes().eq_ignore_ascii_case(protocol.as_bytes())) else {
+            tracing::warn!(upstream = %server.name, address = %server.addr, asked = ?protocol, "upstream switched to another protocol than the one asked for");
+            return ctx.fail(StatusCode::BAD_GATEWAY, None);
+        };
         let upstream_io = hyper::upgrade::on(&mut response);
         let (mut parts, _) = response.into_parts();
-        let switched_to = parts.headers.get(UPGRADE).cloned();
+        // WebSocket: the tunnel follows its frames, to say goodbye between two.
+        let websocket = is_websocket(&protocol);
         remove_hop_headers(&mut parts.headers);
         parts.headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-        if let Some(protocol) = switched_to {
-            parts.headers.insert(UPGRADE, protocol);
-        }
+        parts.headers.insert(UPGRADE, switched_to);
         self.apply_down(&rendered_down, &mut parts.headers);
+        if let Some(cookie) = cookie {
+            parts.headers.append(SET_COOKIE, cookie);
+        }
+        // As the client is answered: over HTTP/2 the switch is a 200 (src/server.rs
+        // `connect_answer`).
+        let status = if over_stream { 200 } else { 101 };
+        // After a reload: with `stream_close_delay` every tunnel of the configuration it replaced
+        // goes, within the delay; without it only those whose upstream the new one no longer
+        // names, at once (the instance is being taken out).
+        let (retire, gone) = match (ctx.req.extensions.remove::<Reloads>(), self.stream_close_delay) {
+            (Some(reloads), Some(window)) => (Some(reloads.retire(window)), None),
+            (Some(reloads), None) => (None, Some(reloads.removed(server.name.clone()))),
+            (None, _) => (None, None),
+        };
+        let timeout = self.stream_timeout;
+        let log = ctx.req.extensions.remove::<TunnelLog>();
+        let counted = Counted::at(server);
         tokio::spawn(async move {
-            // The tunnel counts at its server until it closes.
-            let _lease = lease;
+            // Until the tunnel closes: it counts at its server, as open, and on its connection;
+            // and the client connection's place is held.
+            let _held = (lease, counted, tunneling, place.clone());
             let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream_io) else {
                 return;
             };
-            let (mut client, mut upstream) = (TokioIo::new(client), TokioIo::new(upstream));
-            let copied = tokio::io::copy_bidirectional(&mut client, &mut upstream);
-            // The client connection's place is held until the tunnel closes: either side closing
-            // it, or the server stopping.
-            match place {
-                Some(place) => {
-                    tokio::select! {
-                        _ = copied => {}
-                        _ = place.clone().stopped() => {}
+            // What ends it from the server's side: its stop, a reload (after `stream_close_delay`,
+            // or one that took its upstream out), its time running out.
+            let ours = async move {
+                let stopped = async {
+                    match place {
+                        Some(place) => place.stopped().await,
+                        None => std::future::pending().await,
                     }
-                    drop(place);
+                };
+                let reloaded = async {
+                    match retire {
+                        Some(retire) => retire.due().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let removed = async {
+                    match gone {
+                        Some(gone) => gone.await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let timed_out = async {
+                    match timeout {
+                        Some(timeout) => tokio::time::sleep(timeout).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    () = stopped => End::Stop,
+                    () = reloaded => End::Reload,
+                    () = removed => End::Removed,
+                    () = timed_out => End::Timeout,
                 }
-                None => {
-                    let _ = copied.await;
-                }
+            };
+            let closed = crate::tunnel::run(TokioIo::new(client), TokioIo::new(upstream), websocket, ours).await;
+            if let Some(log) = log {
+                log.closed(status, closed.end.as_str(), closed.from_client, closed.to_client);
             }
         });
         ctx.respond_appending(Response::from_parts(parts, crate::body::empty()))

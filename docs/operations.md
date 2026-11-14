@@ -12,8 +12,10 @@ webfast --version
 ```
 
 SIGTERM or SIGINT stop it gracefully: no new connections, open ones are asked to finish (HTTP/2
-and HTTP/3: GOAWAY), WebSocket tunnels are closed, and whatever is still open after
-`grace_period` (30 s) is closed.
+and HTTP/3: GOAWAY), WebSocket tunnels are closed with a Close frame (1001, going away: their
+clients come back at once, to the next instance), and whatever is still open after
+`grace_period` (30 s) is closed. The `shutting down` line of the server's log says how many
+tunnels were open (`tunnels`), as the `configuration reloaded` line does.
 
 ## Reloading
 
@@ -58,7 +60,14 @@ with, and no connection is cut by a reload. What the connections already open ge
   60 s are about 170 new connections (and TLS handshakes) a second — rather than all at once, as
   when a server closes every connection on a reload. `WEB_RELOAD_DRAIN=0` closes them all at once.
 - In every mode a TLS connection keeps the certificate it was opened with, and a WebSocket
-  tunnel stays as it is (`drain` does not close tunnels: their clients would all reconnect).
+  tunnel stays as it is (`drain` does not close tunnels: their clients would all reconnect; one
+  that is a stream of an HTTP/2 connection keeps that connection open past its close). It stays
+  on the upstream it was opened to for as long as it lives, unless the port's new configuration
+  no longer names that upstream at all: the instance was taken out, and its tunnels are closed
+  at once, with a Close frame, so that it can be stopped after the reload. `stream_close_delay` in its `reverse_proxy` closes the tunnels a reload left behind,
+  each at its own moment within that delay and with a Close frame, so that their clients come
+  back spread over it; `stream_timeout` bounds a tunnel's life whatever happens
+  (docs/configuration.md, Upstreams).
 - Site roots that stay are taken over as they are, not read again (with `WEB_FILES_WATCH` on they
   are looked at again at once, as at startup); new roots are loaded, and what all of them take
   must fit `WEB_MAX_MEMORY`.
@@ -400,4 +409,4 @@ What keeps one client from holding the server:
 | QUIC handshake floods from spoofed addresses          | with 64 handshakes under way, unproven addresses get a Retry first; at most 4096 handshakes queued, 32 MB of their packets                                        |
 | HTTP/2 Rapid Reset, CONTINUATION flood, MadeYouReset  | h2 0.4.20 or later; 250 streams per connection, headers up to `max_header_size`                                                                                    |
 | A file that one request would make the server unpack  | LZ4 only for files of up to 1 MiB, so `Range: bytes=0-0` decompresses at most that                                                                                |
-| WebSocket tunnels held open                           | a tunnel keeps its connection's place, so the connection limits count it; the idle and stall timeouts end with the handshake (a quiet socket is a live one)       |
+| WebSocket tunnels held open                           | a tunnel keeps its connection's place, so the connection limits count it (on an HTTP/2 stream it takes a place of its own: 429 or 503 when there is none); the idle timeout ends with the handshake (a quiet socket is a live one); keepalive probes find a client or an upstream that vanished after about 90 s; `stream_timeout` bounds its life |

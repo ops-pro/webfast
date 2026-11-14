@@ -268,6 +268,47 @@ async fn a_cookie_keeps_a_client_on_its_server() {
     running.shutdown(Duration::from_secs(1)).await;
 }
 
+/// `fallback`: what chooses for a request without the key of `cookie`, `header` or `query`.
+#[tokio::test]
+async fn a_request_without_the_key_is_chosen_for_by_the_fallback() {
+    let (a, b) = (upstream().await, upstream().await);
+    let (running, port) = start(&format!(
+        ":0 {{\n\treverse_proxy {} {} {{\n\t\tlb_policy cookie sticky s3cret {{\n\t\t\tfallback first\n\t\t}}\n\t}}\n}}\n",
+        a.addr, b.addr
+    ))
+    .await;
+    // No cookie: `first` every time (at random it would not be), and the cookie is set.
+    let mut cookie = String::new();
+    for _ in 0..12 {
+        let answer = get(port, "/", &[]).await;
+        assert_eq!(answer.port(), a.addr.port());
+        cookie = answer.header("set-cookie").expect("Set-Cookie").to_string();
+    }
+    let pair = cookie.split(';').next().unwrap();
+    assert_eq!(get(port, "/", &[("Cookie", pair)]).await.port(), a.addr.port());
+    running.shutdown(Duration::from_secs(1)).await;
+
+    // Read only where it means something: with a keyed policy, and not a keyed one itself.
+    let loads = |options: &str| {
+        let text = format!(":0 {{\n\treverse_proxy 127.0.0.1:1 127.0.0.1:2 {{\n{options}\n\t}}\n}}\n");
+        let file = webfast_core::caddyfile::parse_str(&text, Path::new("Caddyfile")).unwrap();
+        webfast_core::load_parsed(&file, 1 << 27)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    assert!(loads("\t\tlb_policy header X-User {\n\t\t\tfallback least_conn\n\t\t}").is_ok());
+    assert!(loads("\t\tlb_policy query user {\n\t\t\tfallback weighted_round_robin 3 1\n\t\t}").is_ok());
+    let not_keyed = loads("\t\tlb_policy first {\n\t\t\tfallback random\n\t\t}").unwrap_err();
+    assert!(
+        not_keyed.contains("only query, header and cookie take a block"),
+        "{not_keyed}"
+    );
+    let nested = loads("\t\tlb_policy header X-User {\n\t\t\tfallback cookie\n\t\t}").unwrap_err();
+    assert!(nested.contains("needs no key"), "{nested}");
+    let unknown = loads("\t\tlb_policy cookie {\n\t\t\tmax_age 1h\n\t\t}").unwrap_err();
+    assert!(unknown.contains("fallback <policy>"), "{unknown}");
+}
+
 /// A nameserver of the test's own, answering every A query with `ip` while `known` is set, and
 /// SERVFAIL otherwise (a container that is not up yet).
 fn nameserver(ip: [u8; 4], known: Arc<AtomicBool>) -> SocketAddr {

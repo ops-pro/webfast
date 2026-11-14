@@ -2059,12 +2059,66 @@ impl Config {
     }
 }
 
+/// An `lb_policy` (or the `fallback` of one) from its words; `weights`: those of
+/// `weighted_round_robin`, one per upstream.
+fn lb_policy(texts: &[&str], at: &Location, weights: &mut Option<Vec<u32>>) -> Result<Policy> {
+    Ok(match texts {
+        ["random"] => Policy::Random,
+        ["random_choose", n] => match n.parse::<u32>() {
+            Ok(n) if n >= 2 => Policy::RandomChoose(n),
+            _ => bail!(at_err(at, "lb_policy random_choose takes a number of 2 or more")),
+        },
+        ["first"] => Policy::First,
+        ["round_robin"] => Policy::RoundRobin,
+        ["weighted_round_robin", list @ ..] if !list.is_empty() => {
+            let parsed: std::result::Result<Vec<u32>, _> = list.iter().map(|w| w.parse::<u32>()).collect();
+            match parsed {
+                Ok(list) if list.iter().all(|&w| w > 0) => *weights = Some(list),
+                _ => bail!(at_err(
+                    at,
+                    "lb_policy weighted_round_robin takes a weight (1 or more) per upstream"
+                )),
+            }
+            Policy::WeightedRoundRobin
+        }
+        ["least_conn"] => Policy::LeastConn,
+        ["ip_hash"] => Policy::IpHash,
+        ["client_ip_hash"] => Policy::ClientIpHash,
+        ["uri_hash"] => Policy::UriHash,
+        ["query", key] => Policy::Query((*key).to_string()),
+        ["header", name] => Policy::Header(
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| at_err(at, format!("lb_policy header: {name:?} is not a header name")))?,
+        ),
+        ["cookie", rest @ ..] if rest.len() <= 2 => {
+            let name = rest.first().map_or("lb", |n| *n).to_string();
+            let secret: Arc<[u8]> = match rest.get(1) {
+                Some(secret) => secret.as_bytes().into(),
+                None => {
+                    // No secret given: one for this process (the cookies stop
+                    // matching at a restart, and a new server is chosen).
+                    let mut secret = [0u8; 32];
+                    aws_lc_rs::rand::fill(&mut secret)
+                        .map_err(|_| at_err(at, "no random bytes for the cookie secret"))?;
+                    secret.as_slice().into()
+                }
+            };
+            Policy::Cookie { name, secret }
+        }
+        _ => bail!(at_err(
+            at,
+            "lb_policy: random, random_choose <n>, first, round_robin, weighted_round_robin <w…>, least_conn, ip_hash, client_ip_hash, uri_hash, query <key>, header <name>, cookie [<name> [<secret>]]"
+        )),
+    })
+}
+
 fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<ReverseProxy> {
     let mut upstreams = Vec::new();
     for t in &line.tokens[start..] {
         upstreams.push(parse_upstream(t)?);
     }
     let mut policy = Policy::Random;
+    let mut fallback = Policy::Random;
     let mut weights: Option<Vec<u32>> = None;
     let mut retries = 0u32;
     let mut try_duration = Duration::ZERO;
@@ -2080,6 +2134,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
     let mut dial_timeout = Duration::from_secs(3);
     let mut keepalive = Some(Duration::from_secs(120));
     let mut response_header_timeout = Some(DEFAULT_RESPONSE_HEADER_TIMEOUT);
+    let mut stream_timeout: Option<Duration> = None;
+    let mut stream_close_delay: Option<Duration> = None;
     let mut own_client = false;
     let duration = |sub: &Line| parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e));
     let number = |sub: &Line| -> Result<u32> {
@@ -2097,53 +2153,25 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
             }
             "lb_policy" => {
                 let texts: Vec<&str> = args.iter().map(|t| t.text.as_str()).collect();
-                policy = match texts.as_slice() {
-                    ["random"] => Policy::Random,
-                    ["random_choose", n] => match n.parse::<u32>() {
-                        Ok(n) if n >= 2 => Policy::RandomChoose(n),
-                        _ => bail!(at_err(&sub.at, "lb_policy random_choose takes a number of 2 or more")),
-                    },
-                    ["first"] => Policy::First,
-                    ["round_robin"] => Policy::RoundRobin,
-                    ["weighted_round_robin", list @ ..] if !list.is_empty() => {
-                        let parsed: std::result::Result<Vec<u32>, _> = list.iter().map(|w| w.parse::<u32>()).collect();
-                        match parsed {
-                            Ok(list) if list.iter().all(|&w| w > 0) => weights = Some(list),
-                            _ => bail!(at_err(
-                                &sub.at,
-                                "lb_policy weighted_round_robin takes a weight (1 or more) per upstream"
-                            )),
-                        }
-                        Policy::WeightedRoundRobin
+                policy = lb_policy(&texts, &sub.at, &mut weights)?;
+                // `query`, `header` and `cookie` take `{ fallback <policy> }`: what chooses for a
+                // request without the key (Caddy: any policy, nested; here one that needs none).
+                fallback = Policy::Random;
+                for inner in sub.block.as_deref().unwrap_or(&[]) {
+                    if !policy.keyed() || inner.name() != "fallback" {
+                        bail!(at_err(
+                            &inner.at,
+                            "lb_policy: only query, header and cookie take a block, with `fallback <policy>`"
+                        ));
                     }
-                    ["least_conn"] => Policy::LeastConn,
-                    ["ip_hash"] => Policy::IpHash,
-                    ["client_ip_hash"] => Policy::ClientIpHash,
-                    ["uri_hash"] => Policy::UriHash,
-                    ["query", key] => Policy::Query((*key).to_string()),
-                    ["header", name] => Policy::Header(
-                        HeaderName::from_bytes(name.as_bytes())
-                            .map_err(|_| at_err(&sub.at, format!("lb_policy header: {name:?} is not a header name")))?,
-                    ),
-                    ["cookie", rest @ ..] if rest.len() <= 2 => {
-                        let name = rest.first().map_or("lb", |n| *n).to_string();
-                        let secret: Arc<[u8]> = match rest.get(1) {
-                            Some(secret) => secret.as_bytes().into(),
-                            None => {
-                                // No secret given: one for this process (the cookies stop
-                                // matching at a restart, and a new server is chosen).
-                                let mut secret = [0u8; 32];
-                                aws_lc_rs::rand::fill(&mut secret)
-                                    .map_err(|_| at_err(&sub.at, "no random bytes for the cookie secret"))?;
-                                secret.as_slice().into()
-                            }
-                        };
-                        Policy::Cookie { name, secret }
+                    let texts: Vec<&str> = inner.tokens[1..].iter().map(|t| t.text.as_str()).collect();
+                    fallback = lb_policy(&texts, &inner.at, &mut weights)?;
+                    if fallback.keyed() {
+                        bail!(at_err(
+                            &inner.at,
+                            "fallback takes a policy that needs no key of the request: not query, header or cookie"
+                        ));
                     }
-                    _ => bail!(at_err(
-                        &sub.at,
-                        "lb_policy: random, random_choose <n>, first, round_robin, weighted_round_robin <w…>, least_conn, ip_hash, client_ip_hash, uri_hash, query <key>, header <name>, cookie [<name> [<secret>]]"
-                    )),
                 }
             }
             "lb_retries" => retries = number(sub)?,
@@ -2183,6 +2211,12 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
             "flush_interval" => {
                 parse_duration(&one_arg(sub)?).map_err(|e| at_err(&sub.at, e))?;
             }
+            // A tunnel (WebSocket) is closed this long after it opened; 0, as in Caddy: never.
+            "stream_timeout" => stream_timeout = Some(duration(sub)?).filter(|d| !d.is_zero()),
+            // After a reload the tunnels of the configuration it replaced are closed within this
+            // long, each at its own moment (0: at once). Without it they stay open (Caddy closes
+            // them at once, and with it all together when it ends).
+            "stream_close_delay" => stream_close_delay = Some(duration(sub)?),
             "header_up" => header_up.push(parse_header_op(args, &sub.at)?),
             "header_down" => header_down.push(parse_header_op(args, &sub.at)?),
             "transport" => {
@@ -2267,7 +2301,7 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         unhealthy_latency,
         unhealthy_request_count,
     });
-    let servers = Upstreams::new(names, policy, passive, resolvers, None);
+    let servers = Upstreams::new(names, policy, fallback, passive, resolvers, None);
     let client = if own_client {
         crate::proxy::client(dial_timeout, keepalive)
     } else {
@@ -2283,6 +2317,8 @@ fn parse_reverse_proxy(line: &Line, start: usize, cx: &mut Cx) -> Result<Reverse
         header_down,
         response_header_timeout,
         dial_timeout,
+        stream_timeout,
+        stream_close_delay,
         client,
     })
 }

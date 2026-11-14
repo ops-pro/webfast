@@ -39,6 +39,9 @@ pub struct ServerState {
     mode: ReloadMode,
     /// The routing's generation, sent by each reload (to the connections `drain` retires).
     reloads: watch::Sender<u64>,
+    /// The upstreams the routing's proxies name, sent by each reload: a tunnel to one that is no
+    /// longer named closes (src/guard.rs `Reloads::removed`).
+    upstreams: watch::Sender<Arc<[http::uri::Authority]>>,
     /// With `lazy` and `drain`, the routings a reload replaced, while connections still use them:
     /// when files change their ready answers are forgotten too (src/watch.rs), so that those
     /// connections serve the files as they are now.
@@ -278,6 +281,33 @@ impl Routing {
     }
 }
 
+/// Every upstream a `reverse_proxy` of `sites` names (as written), their error routes included.
+fn proxied(sites: &[Site]) -> Arc<[http::uri::Authority]> {
+    fn walk(routes: &[Route], out: &mut Vec<http::uri::Authority>) {
+        for route in routes {
+            match &route.handler {
+                Handler::Proxy(proxy) => {
+                    for upstream in &proxy.upstreams {
+                        if !out.contains(upstream) {
+                            out.push(upstream.clone());
+                        }
+                    }
+                }
+                Handler::Subroute(routes) => walk(routes, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for site in sites {
+        walk(&site.routes, &mut out);
+        if let Some(errors) = &site.errors {
+            walk(errors, &mut out);
+        }
+    }
+    out.into()
+}
+
 /// A `respond 103` among `routes`, subroutes included.
 fn emits_hints(routes: &[Route]) -> bool {
     routes.iter().any(|route| match &route.handler {
@@ -367,6 +397,12 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
             None,
         );
     }
+    // WebSocket over HTTP/2 (RFC 8441) goes on as the HTTP/1.1 handshake it stands for; another
+    // protocol asked for the same way is not spoken here (501, as RFC 9220 has it for HTTP/3).
+    let over_connect = match websocket_connect(&mut parts) {
+        Ok(over_connect) => over_connect,
+        Err(()) => return (refused(&connection.state, version, StatusCode::NOT_IMPLEMENTED), None),
+    };
     // A host that is no name or address, or a Host and an authority that differ: 400 before
     // anything reads it (Caddy 2.11.8 and 2.11.9).
     if !internal && crate::handler::bad_host(&parts) {
@@ -401,15 +437,18 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
                 None => Way::Chain(site.routes.clone(), site.errors.clone()),
             };
             // The log's two enums by value: no count on the site touched.
-            (conn, client_ip, site.log.as_deref().copied(), way)
+            (conn, client_ip, site.log.as_deref().copied(), way, routing.generation)
         })
     };
     let state = &connection.state;
-    let Some((conn, client_ip, log, way)) = picked else {
+    let Some((conn, client_ip, log, way, generation)) = picked else {
         // Like Caddy: a host no site serves gets an empty 200.
         let mut response = Response::new(crate::body::empty());
         if misdirected {
             *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
+        }
+        if over_connect {
+            response = connect_answer(state, version, response);
         }
         common_headers(state, version, &mut response);
         return (response, None);
@@ -426,11 +465,31 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
         remote,
         client_ip,
         proto: proto_name(version),
-        method: parts.method.clone(),
+        // As sent: a WebSocket opened over HTTP/2 is a CONNECT.
+        method: if over_connect {
+            http::Method::CONNECT
+        } else {
+            parts.method.clone()
+        },
         host: parts.headers.get(http::header::HOST).cloned(),
         uri: parts.uri.clone(),
         started,
     });
+    // A request that may become a tunnel (src/proxy.rs) takes with it what the tunnel needs once
+    // the request is over: the reloads of this port, to close after one (`stream_close_delay`),
+    // and the site's log, for the line of its close.
+    if parts.extensions.get::<hyper::upgrade::OnUpgrade>().is_some() {
+        parts.extensions.insert(crate::guard::Reloads {
+            reloads: state.reloads.subscribe(),
+            generation,
+            upstreams: state.upstreams.subscribe(),
+        });
+        if let (Some(log), Some(info)) = (&log, &info) {
+            parts
+                .extensions
+                .insert(crate::accesslog::TunnelLog::new(*log, info.clone()));
+        }
+    }
     // Refused before the routes and ready answers: a Host of another certificate (421), then by
     // the request checks. A refusal that asks for the site's error page (`ErrorPage`) goes
     // through its `handle_errors` routes, as a handler's own failure does; the others go out as
@@ -504,6 +563,9 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
             }
         },
     };
+    if over_connect {
+        response = connect_answer(state, version, response);
+    }
     common_headers(state, version, &mut response);
     let status = response.status().as_u16();
     let log = match (log, info) {
@@ -511,6 +573,76 @@ pub async fn handle_with_log(connection: Arc<ConnState>, request: Request<Body>)
         _ => None,
     };
     (response, log)
+}
+
+/// WebSocket over HTTP/2 (RFC 8441): a CONNECT with `:protocol` = `websocket` is the HTTP/1.1
+/// handshake said another way, and is turned into it here — a GET with `Connection: Upgrade`,
+/// `Upgrade: websocket` and a key of the server's own — so that the routes, the request checks,
+/// the modules and the upstream all see the handshake they know. `Ok(true)`: it was one, and its
+/// answer goes back through `connect_answer`; `Err`: a CONNECT for another protocol.
+fn websocket_connect(parts: &mut http::request::Parts) -> Result<bool, ()> {
+    if parts.version != Version::HTTP_2 || parts.method != http::Method::CONNECT {
+        return Ok(false);
+    }
+    let Some(protocol) = parts.extensions.remove::<hyper::ext::Protocol>() else {
+        return Ok(false);
+    };
+    if !protocol.as_ref().eq_ignore_ascii_case(b"websocket") {
+        return Err(());
+    }
+    parts.method = http::Method::GET;
+    let headers = &mut parts.headers;
+    headers.insert(http::header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(http::header::SEC_WEBSOCKET_KEY, websocket_key());
+    headers
+        .entry(http::header::SEC_WEBSOCKET_VERSION)
+        .or_insert(HeaderValue::from_static("13"));
+    Ok(true)
+}
+
+/// A `Sec-WebSocket-Key`: 16 random bytes in base64 (RFC 6455 §4.1). HTTP/2 has no such field; the
+/// upstream's handshake asks for one, and its answer to it stays between the upstream and here.
+fn websocket_key() -> HeaderValue {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut key = [0u8; 16];
+    // Not a secret (it guards against caches that replay, not against anyone): bytes that differ
+    // will do when the system gives no random ones.
+    if aws_lc_rs::rand::fill(&mut key).is_err() {
+        use std::hash::BuildHasher;
+        let bits = std::hash::RandomState::new().hash_one(Instant::now());
+        key[..8].copy_from_slice(&bits.to_be_bytes());
+    }
+    let mut text = [b'='; 24];
+    for (chunk, out) in key.chunks(3).zip(text.chunks_mut(4)) {
+        let bits = u32::from(chunk[0]) << 16
+            | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        for (i, slot) in out.iter_mut().enumerate().take(chunk.len() + 1) {
+            *slot = ALPHABET[(bits >> (18 - 6 * i)) as usize & 63];
+        }
+    }
+    HeaderValue::from_bytes(&text).expect("base64 is visible ASCII")
+}
+
+/// The answer to a WebSocket handshake that came as an HTTP/2 CONNECT (`websocket_connect`). The
+/// switch (101) is said as HTTP/2 says it: 200, without the fields of the HTTP/1.1 handshake.
+/// Any other 2xx would tell the client its tunnel is open when nothing switched (a path that is
+/// no WebSocket: a file, a `respond`, an upstream that took the handshake for a plain GET): 501
+/// in its place. The rest (a 403, a 502) goes out as it is.
+fn connect_answer(state: &ServerState, version: Version, mut response: Response<Body>) -> Response<Body> {
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        *response.status_mut() = StatusCode::OK;
+        let headers = response.headers_mut();
+        headers.remove(http::header::CONNECTION);
+        headers.remove(http::header::UPGRADE);
+        headers.remove(http::header::SEC_WEBSOCKET_ACCEPT);
+        return response;
+    }
+    if response.status().is_success() {
+        return refused(state, version, StatusCode::NOT_IMPLEMENTED);
+    }
+    response
 }
 
 /// The request with its body under the stall limit: a client that stops sending it for `stall`
@@ -741,6 +873,7 @@ impl Running {
             let port = &self.ports[i];
             let state = &port.state;
             let generation = state.routing.load().generation + 1;
+            let named = proxied(&server.sites);
             let old = state.routing.swap(Arc::new(Routing::new(
                 server.sites,
                 server.trusted_proxies,
@@ -758,6 +891,8 @@ impl Running {
             if let (Some(resolver), Some(certificates)) = (&port.resolver, certificates) {
                 resolver.install(certificates);
             }
+            // The tunnels to an upstream the new routing no longer names close now.
+            state.upstreams.send_replace(named);
             // With drain, the connections on older routings now draw their moment to close.
             state.reloads.send_replace(generation);
         }
@@ -977,6 +1112,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         }
     }
     let state_tls = acceptor.is_some();
+    let named = proxied(&sites);
     let mut state = ServerState {
         routing: ArcSwap::from_pointee(Routing::new(
             sites,
@@ -987,6 +1123,7 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
         )),
         mode: reload,
         reloads: watch::channel(0).0,
+        upstreams: watch::channel(named).0,
         retired: Mutex::new(Vec::new()),
         tls: state_tls,
         alt_svc: None,
@@ -1087,6 +1224,11 @@ async fn start_server(server: ServerConfig, running: &mut Running, hooks: &'stat
     Ok(())
 }
 
+/// Whether WebSocket over HTTP/2 is offered: on unless WEB_H2_WEBSOCKET is `off`.
+fn h2_websocket() -> bool {
+    !std::env::var("WEB_H2_WEBSOCKET").is_ok_and(|value| value.trim().eq_ignore_ascii_case("off"))
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Http1,
@@ -1115,6 +1257,12 @@ impl Builders {
             .max_header_list_size(u32::try_from(limits.max_header).unwrap_or(u32::MAX))
             .max_concurrent_streams(250)
             .keep_alive_interval(Some(Duration::from_secs(60)));
+        // WebSocket over HTTP/2 (RFC 8441): the setting that lets a client open one as a stream
+        // of a connection it already has (`websocket_connect`). WEB_H2_WEBSOCKET=off: not offered,
+        // and clients open WebSocket over HTTP/1.1 as before.
+        if h2_websocket() {
+            builder.http2().enable_connect_protocol();
+        }
         Builders {
             h1: builder.clone().http1_only(),
             h2: builder.clone().http2_only(),
@@ -1173,7 +1321,7 @@ async fn accept_loop(
         let state = state.clone();
         tokio::spawn(async move {
             // The connection's place: its requests carry it, and a WebSocket tunnel keeps it.
-            let place = Place::new(permit, stop.clone());
+            let place = Place::new(permit, stop.clone(), activity.clone());
             // The connection's requests, once what the connection is (its SNI) is known.
             let service = |conn: Arc<ConnState>| {
                 let activity = activity.clone();
@@ -1296,6 +1444,45 @@ async fn serve_connection<I, S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WebSocket opened as an HTTP/2 CONNECT becomes the HTTP/1.1 handshake; a plain CONNECT and
+    /// one over HTTP/1.1 are left alone, another protocol is refused.
+    #[test]
+    fn an_extended_connect_becomes_the_handshake() {
+        let connect = |version, protocol: Option<&'static str>| {
+            let mut request = Request::connect("https://example.test/ws").version(version);
+            if let Some(protocol) = protocol {
+                request = request.extension(hyper::ext::Protocol::from_static(protocol));
+            }
+            request.body(()).unwrap().into_parts().0
+        };
+        let mut parts = connect(Version::HTTP_2, Some("WebSocket"));
+        assert_eq!(websocket_connect(&mut parts), Ok(true));
+        assert_eq!(parts.method, http::Method::GET);
+        assert_eq!(parts.headers["connection"], "Upgrade");
+        assert_eq!(parts.headers["upgrade"], "websocket");
+        assert_eq!(parts.headers["sec-websocket-version"], "13");
+        // The key: 16 bytes in base64, different each time.
+        let key = parts.headers["sec-websocket-key"].to_str().unwrap().to_string();
+        assert_eq!(key.len(), 24, "{key}");
+        assert!(key.ends_with("==") && !key[..22].contains('='), "{key}");
+        assert!(
+            key[..22]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        );
+        assert_ne!(websocket_key().to_str().unwrap(), key);
+
+        let mut plain = connect(Version::HTTP_2, None);
+        assert_eq!(websocket_connect(&mut plain), Ok(false));
+        assert_eq!(plain.method, http::Method::CONNECT);
+        let mut h1 = connect(Version::HTTP_11, Some("websocket"));
+        assert_eq!(websocket_connect(&mut h1), Ok(false));
+        assert_eq!(
+            websocket_connect(&mut connect(Version::HTTP_2, Some("connect-udp"))),
+            Err(())
+        );
+    }
 
     fn routing(strict: bool) -> Routing {
         Routing::new(

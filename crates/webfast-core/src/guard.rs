@@ -72,6 +72,13 @@ impl Admission {
 
     /// A place for a connection from `ip`, or `None` when a limit is reached.
     pub fn admit(self: &Arc<Self>, ip: IpAddr, trusted: bool) -> Option<Permit> {
+        let address = (self.max_per_ip > 0 && !trusted).then(|| address_key(ip));
+        self.take(address).ok()
+    }
+
+    /// A place counted for `address` (its key; `None`: not counted per address), or which limit
+    /// is reached.
+    fn take(self: &Arc<Self>, address: Option<IpAddr>) -> Result<Permit, Full> {
         // Relaxed: the count orders nothing else; `all_closed` reads it with Acquire after the
         // Release of the close that may have made it zero.
         let open = self.open.fetch_add(1, Ordering::Relaxed) + 1;
@@ -80,19 +87,18 @@ impl Admission {
             address: None,
         };
         if self.max > 0 && open > self.max {
-            return None;
+            return Err(Full::Server);
         }
-        if self.max_per_ip > 0 && !trusted {
-            let address = address_key(ip);
+        if let Some(address) = address {
             let mut per_ip = self.shard(address).lock().unwrap_or_else(PoisonError::into_inner);
             let count = per_ip.entry(address).or_insert(0);
             if *count >= self.max_per_ip {
-                return None;
+                return Err(Full::Address);
             }
             *count += 1;
             permit.address = Some(address);
         }
-        Some(permit)
+        Ok(permit)
     }
 
     pub fn open(&self) -> usize {
@@ -132,6 +138,15 @@ pub fn address_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Which limit left no place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Full {
+    /// The server's open connections (WEB_MAX_CONNECTIONS).
+    Server,
+    /// The client address's (WEB_MAX_CONNECTIONS_PER_IP).
+    Address,
+}
+
 /// A connection's place; given back when dropped.
 pub struct Permit {
     admission: Arc<Admission>,
@@ -139,8 +154,9 @@ pub struct Permit {
 }
 
 /// A connection's place, carried by its requests: a WebSocket tunnel (src/proxy.rs) keeps it until
-/// it closes, so tunnels count against the limits as the connections they came from; and the
-/// server's stop, on which a tunnel closes (as Caddy closes them when it stops). One reference
+/// it closes, so tunnels count against the limits as the connections they came from; the
+/// server's stop, on which a tunnel closes (as Caddy closes them when it stops); and the
+/// connection's activity, for a tunnel that takes one stream of it (`tunnel`). One reference
 /// count per connection: cloning it for a request touches nothing that other connections share.
 /// The stop is the listener's own copy of the server's (src/server.rs `accept_loop`), so that a
 /// connection's start and end touch nothing every core shares either.
@@ -150,11 +166,31 @@ pub struct Place(Arc<Held>);
 struct Held {
     _permit: Permit,
     stop: watch::Receiver<bool>,
+    activity: Arc<Activity>,
 }
 
 impl Place {
-    pub fn new(permit: Permit, stop: watch::Receiver<bool>) -> Place {
-        Place(Arc::new(Held { _permit: permit, stop }))
+    pub fn new(permit: Permit, stop: watch::Receiver<bool>, activity: Arc<Activity>) -> Place {
+        Place(Arc::new(Held {
+            _permit: permit,
+            stop,
+            activity,
+        }))
+    }
+
+    /// A tunnel on one of the connection's streams (HTTP/2, RFC 8441). It takes a place of its
+    /// own, counted as its connection's is (for the same address, or for none behind a trusted
+    /// proxy): a tunnel is one connection of the limits whichever way it was opened, as a
+    /// WebSocket over HTTP/1.1 takes its whole connection. `Err`: the limit that leaves it none.
+    /// While what is returned lives, the connection has a request in progress (it is not idle,
+    /// however quiet the tunnel) and a close of the server's own (after a reload with
+    /// WEB_RELOAD=drain) waits for it.
+    pub fn tunnel(&self, version: Version) -> Result<Tunneling, Full> {
+        let held = &self.0._permit;
+        let permit = held.admission.take(held.address)?;
+        let activity = &self.0.activity;
+        activity.tunnels.fetch_add(1, Ordering::AcqRel);
+        Ok(Tunneling(activity.begin(version), permit))
     }
 
     /// Resolves when the server stops.
@@ -190,11 +226,62 @@ impl Drop for Permit {
     }
 }
 
+/// A tunnel open on one of a connection's streams (`Place::tunnel`), with its own place; its end
+/// when dropped.
+pub struct Tunneling(InFlight, #[allow(dead_code)] Permit);
+
+impl Drop for Tunneling {
+    fn drop(&mut self) {
+        let activity = &self.0.0;
+        activity.tunnels.fetch_sub(1, Ordering::AcqRel);
+        // The driver looks again: a close that waited for this tunnel has its deadline back.
+        activity.quiet.notify_waiters();
+    }
+}
+
+/// The port's reloads as a request that may become a tunnel saw them (src/server.rs): the
+/// configuration it was routed with, the channel that tells of a newer one, and the upstreams
+/// the port's proxies name, as each reload leaves them.
+#[derive(Clone)]
+pub struct Reloads {
+    pub reloads: watch::Receiver<u64>,
+    pub generation: u64,
+    pub upstreams: watch::Receiver<Arc<[http::uri::Authority]>>,
+}
+
+impl Reloads {
+    /// When a tunnel made under that configuration closes after a reload: at a moment within
+    /// `window` (`stream_close_delay`).
+    pub fn retire(self, window: Duration) -> Retire {
+        Retire {
+            reloads: self.reloads,
+            generation: self.generation,
+            window,
+        }
+    }
+
+    /// Resolves when a reload puts a configuration in place whose proxies no longer name
+    /// `upstream` (as written in the Caddyfile): the instance was taken out, and what is still
+    /// open to it is to go. Never, while every reload keeps the name.
+    pub async fn removed(mut self, upstream: http::uri::Authority) {
+        loop {
+            if self.upstreams.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            if !self.upstreams.borrow_and_update().contains(&upstream) {
+                return;
+            }
+        }
+    }
+}
+
 /// What a connection is doing, shared by its requests, its I/O and its driver.
 pub struct Activity {
     started: Instant,
     /// Requests whose response has not ended.
     active: AtomicUsize,
+    /// Tunnels open on its streams (HTTP/2), each counted in `active` too.
+    tunnels: AtomicUsize,
     seen_request: AtomicBool,
     /// The connection speaks HTTP/1.x (known with its first request): between requests the next
     /// head is due within `read_header`, as on a new connection; HTTP/2 and HTTP/3 frame their
@@ -217,6 +304,7 @@ impl Activity {
         Arc::new(Activity {
             started: Instant::now(),
             active: AtomicUsize::new(0),
+            tunnels: AtomicUsize::new(0),
             seen_request: AtomicBool::new(false),
             h1: AtomicBool::new(false),
             last: AtomicU64::new(0),
@@ -694,10 +782,16 @@ pub async fn drive<C: Future>(
                 return Poll::Pending;
             }
             // Made anew before the active count is read: an end after that read still wakes us.
-            if quiet.as_mut().poll(cx).is_ready() {
+            // Polled until it waits, so that the next end (a request's, a tunnel's) wakes us too.
+            while quiet.as_mut().poll(cx).is_ready() {
                 quiet.set(activity.quiet_notified());
             }
             let due = match closing {
+                // A tunnel on one of its streams outlives the close, as one that took its whole
+                // connection does: nothing is cut while it is open but a write that stalls.
+                Some(_) if activity.tunnels.load(Ordering::Acquire) > 0 => {
+                    activity.next(limits).filter(|(_, due)| *due == Due::Cut)
+                }
                 Some(since) => Some((since + limits.grace, Due::Cut)),
                 None => activity.next(limits),
             };
@@ -757,6 +851,37 @@ mod tests {
             admission.admit(proxy, true).is_none(),
             "the overall limit binds trusted proxies too"
         );
+    }
+
+    /// A tunnel on a stream of a connection takes a place as its connection does: for the same
+    /// address, or overall only behind a trusted proxy; and gives it back when it ends.
+    #[test]
+    fn a_tunnel_on_a_stream_takes_a_place_of_its_own() {
+        let limits = Limits {
+            max_connections: 3,
+            max_per_ip: 2,
+            ..Limits::default()
+        };
+        let admission = Admission::new(&limits);
+        let stop = watch::channel(false).1;
+        let a: IpAddr = "203.0.113.1".parse().unwrap();
+        let place = Place::new(admission.admit(a, false).unwrap(), stop.clone(), Activity::new());
+        let tunnel = place.tunnel(Version::HTTP_2).unwrap();
+        assert!(
+            admission.admit(a, false).is_none(),
+            "the tunnel holds the address's second place"
+        );
+        assert_eq!(place.tunnel(Version::HTTP_2).err(), Some(Full::Address));
+        assert_eq!(admission.open(), 2, "a place refused is not kept");
+        drop(tunnel);
+        let again = place.tunnel(Version::HTTP_2).unwrap();
+        // Behind a trusted proxy: not counted for the address, as its connection is not.
+        let proxy: IpAddr = "10.0.0.2".parse().unwrap();
+        let through = Place::new(admission.admit(proxy, true).unwrap(), stop, Activity::new());
+        assert_eq!(through.tunnel(Version::HTTP_2).err(), Some(Full::Server));
+        drop(again);
+        let _tunnel = through.tunnel(Version::HTTP_2).unwrap();
+        assert_eq!(admission.open(), 3);
     }
 
     #[tokio::test]

@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+WebSocket through `reverse_proxy` (docs/configuration.md, the start and Upstreams;
+docs/operations.md, Reloading).
+
+Worth knowing when upgrading:
+
+- Browsers that speak RFC 8441 (Chrome, Firefox) now open WebSocket over the HTTP/2 connection
+  they already have, with nothing to configure. A tunnel still counts as one connection:
+  `WEB_MAX_CONNECTIONS` and `WEB_MAX_CONNECTIONS_PER_IP` bound a client's tunnels as before, and
+  a handshake over HTTP/2 past them is answered 429 or 503. `WEB_H2_WEBSOCKET=off` keeps
+  WebSocket on HTTP/1.1.
+- A site with `log` gets a second access log line for each tunnel, when it closes
+  (`"msg":"closed tunnel"`); what counts lines by `handled request` is not affected.
+- A stopping server now writes a WebSocket Close frame (1001) to both sides of a tunnel before
+  it closes the connections.
+- A reload that removes an upstream from a port's `reverse_proxy` now closes the tunnels open to
+  it. Before, they stayed until either side closed.
+
+### Changes
+
+- **WebSocket over HTTP/2** (RFC 8441, extended CONNECT): offered on HTTP/2 connections, turned
+  into the HTTP/1.1 handshake before the routes, the request checks and the modules see it, and
+  sent to the upstream as that handshake; the switch is answered 200, a 2xx that is no switch and
+  a CONNECT for another protocol 501. A connection with a tunnel on it is not idle, and a close
+  of the server's own (`WEB_RELOAD=drain`) waits for the tunnel.
+- **A tunnel is a connection of the limits** over HTTP/2 too: on a stream it takes a place of
+  its own, counted for its client's address as the connection's is, and gives it back when it
+  closes; one that finds none is refused (429 for the address's limit, 503 for the server's)
+  before an upstream is asked. No directive for tunnels alone — nginx and others count them by
+  their limit on connections too; per upstream, `unhealthy_request_count` counts a tunnel until
+  it closes.
+- **recipes/websocket**: an application with WebSocket — a handshake from a page of another
+  site refused by its `Origin` (also over HTTP/2), `stream_timeout`, `stream_close_delay`.
+- **A reload that takes an upstream out closes its tunnels**: without `stream_close_delay`, the
+  tunnels to an upstream that the port's new configuration no longer names are closed at once
+  with a Close frame (`"closed_by":"upstream_removed"`), so the instance can be stopped; the
+  other tunnels stay, as before.
+- **A 101 is checked**: an upstream that switches to another protocol than the one asked for, or
+  names none, is answered 502 instead of being tunnelled (as Caddy does).
+- **`fallback`** of `lb_policy query`, `header` and `cookie`, in Caddy's syntax
+  (`lb_policy cookie { fallback least_conn }`): what chooses for a request without the key;
+  `random` unless set, as it was. A policy that needs no key only (Caddy nests keyed ones).
+- WebSocket over HTTP/3 (RFC 9220) is not offered: the released `h3` crate (0.0.8) refuses
+  `:protocol: websocket`; noted in docs/configuration.md (What `reverse_proxy` reads) and
+  src/h3.rs for its next release.
+- **The handshake is retried**: a WebSocket handshake whose connection to the upstream fails goes
+  to another upstream while `lb_retries` and `lb_try_duration` allow, as a request without a body
+  does (before: 502 at once). Passive health counts its answer (`unhealthy_status`,
+  `unhealthy_latency`), and `lb_policy cookie` sets its cookie on it.
+- **Going away**: when the server ends a tunnel — it stops, `stream_timeout` ran out, a reload
+  with `stream_close_delay` — it writes a Close frame with the status 1001 to the client and
+  (masked) to the upstream, between two frames only, then waits up to 1 s for each side to close.
+- **`stream_timeout`** and **`stream_close_delay`** in `reverse_proxy`: a tunnel's longest life;
+  and the tunnels a reload left on the old configuration closed within the delay, each at a
+  moment of its own. Without `stream_close_delay` a reload leaves tunnels open, as before.
+- **The access log's line at a tunnel's close**: the tunnel's life as `duration`, `bytes_read`,
+  `size`, and `closed_by` (`client`, `upstream`, `stop`, `reload`, `stream_timeout`).
+- **Keepalive to the upstream** on a tunnel's connection (probes after 60 s of silence, and on
+  Linux `TCP_USER_TIMEOUT` 90 s): an upstream that vanished no longer holds the tunnel and the
+  client's place.
+- Open tunnels are counted, in the process (`webfast_core::tunnel::open`, and `tunnels` in the
+  `shutting down` and `configuration reloaded` log lines) and per upstream address
+  (`upstreams::Server::tunnels`), for the metrics endpoint to come.
+
 ## 0.1.8 — 2026-11-13
 
 A build with every module active: the `-full` images (`ghcr.io/ops-pro/webfast:0.1.8-full`,

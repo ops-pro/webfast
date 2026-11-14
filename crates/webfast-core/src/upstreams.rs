@@ -81,6 +81,8 @@ pub struct Server {
     pub weight: u32,
     /// Requests under way, kept only when the set counts (`Set::counting`).
     pub in_flight: AtomicUsize,
+    /// Tunnels open to it now (src/tunnel.rs).
+    pub tunnels: AtomicUsize,
     fails: AtomicU32,
     last_fail: AtomicU64,
     down_until: AtomicU64,
@@ -103,6 +105,7 @@ impl Server {
             authority: authority.parse().expect("an address and a port are an authority"),
             weight: name.weight,
             in_flight: AtomicUsize::new(0),
+            tunnels: AtomicUsize::new(0),
             fails: AtomicU32::new(0),
             last_fail: AtomicU64::new(0),
             down_until: AtomicU64::new(0),
@@ -185,6 +188,12 @@ impl Policy {
     fn counts(&self) -> bool {
         matches!(self, Policy::RandomChoose(_) | Policy::LeastConn)
     }
+
+    /// Whether the policy chooses by a key the request may not have (`query`, `header`,
+    /// `cookie`): those take a `fallback`, and cannot be one.
+    pub fn keyed(&self) -> bool {
+        matches!(self, Policy::Query(_) | Policy::Header(_) | Policy::Cookie { .. })
+    }
 }
 
 /// Passive health settings; `None` when `fail_duration` is not set.
@@ -216,6 +225,9 @@ pub struct Set {
     addresses: Mutex<Vec<Vec<IpAddr>>>,
     servers: ArcSwap<Vec<Arc<Server>>>,
     policy: Policy,
+    /// `fallback` of `query`, `header` and `cookie`: what chooses for a request without the key
+    /// (`random` unless set).
+    fallback: Policy,
     passive: Option<Passive>,
     counter: AtomicUsize,
     /// `transport http { resolvers … }`, or the system's.
@@ -282,10 +294,12 @@ pub enum Upstreams {
 }
 
 impl Upstreams {
-    /// `nameservers`: `None` for the system's.
+    /// `nameservers`: `None` for the system's. `fallback`: for a policy with a key
+    /// (`Policy::keyed`), what chooses when a request has none.
     pub fn new(
         names: Vec<Name>,
         policy: Policy,
+        fallback: Policy,
         passive: Option<Passive>,
         nameservers: Option<Vec<SocketAddr>>,
         refresh: Option<Duration>,
@@ -293,7 +307,9 @@ impl Upstreams {
         if let ([name], None, Some(ip)) = (names.as_slice(), &passive, names.first().and_then(|n| n.literal)) {
             return Upstreams::Fixed(Arc::new(Server::new(name, ip)));
         }
-        let counting = policy.counts() || passive.as_ref().is_some_and(|p| p.unhealthy_request_count > 0);
+        let counting = policy.counts()
+            || (policy.keyed() && fallback.counts())
+            || passive.as_ref().is_some_and(|p| p.unhealthy_request_count > 0);
         let nameservers: Arc<[SocketAddr]> = match nameservers {
             Some(list) => list.into(),
             None => crate::dns::system_nameservers().into(),
@@ -303,6 +319,7 @@ impl Upstreams {
             names,
             servers: ArcSwap::from_pointee(Vec::new()),
             policy,
+            fallback,
             passive,
             counter: AtomicUsize::new(0),
             nameservers,
@@ -586,17 +603,48 @@ fn cookie_of<'h>(ctx: &'h Ctx, name: &str) -> Option<&'h str> {
         .find_map(|pair| pair.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')))
 }
 
-/// The index chosen from `pool` by the policy, and whether the response is to set the cookie.
+/// The index chosen from `pool` by the policy, and whether the response is to set the cookie. A
+/// request without the key of `query`, `header` or `cookie` (or whose cookie names no server that
+/// is up) is chosen for by the set's `fallback`.
 fn choose(set: &Set, servers: &[Arc<Server>], pool: u64, ctx: &Ctx) -> (usize, bool) {
-    let count = pool.count_ones();
-    if count == 1 {
+    if pool.count_ones() == 1 {
         return (
             pool.trailing_zeros() as usize,
             matches!(set.policy, Policy::Cookie { .. }),
         );
     }
+    match &set.policy {
+        Policy::Query(key) => match query_value(ctx, key) {
+            Some(value) => (by_hash(servers, pool, value.as_bytes()), false),
+            None => (keyless(&set.fallback, set, servers, pool, ctx), false),
+        },
+        Policy::Header(name) => match ctx.req.headers.get(name) {
+            Some(value) => (by_hash(servers, pool, value.as_bytes()), false),
+            None => (keyless(&set.fallback, set, servers, pool, ctx), false),
+        },
+        Policy::Cookie { name, secret } => {
+            if let Some(value) = cookie_of(ctx, name) {
+                let mut rest = pool;
+                while rest != 0 {
+                    let i = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    if servers[i].cookie_value(secret) == value {
+                        return (i, false);
+                    }
+                }
+            }
+            (keyless(&set.fallback, set, servers, pool, ctx), true)
+        }
+        policy => (keyless(policy, set, servers, pool, ctx), false),
+    }
+}
+
+/// The index chosen from `pool` (of more than one) by a policy that asks the request for no key
+/// of its own: the policy of a set, or the `fallback` of one that does.
+fn keyless(policy: &Policy, set: &Set, servers: &[Arc<Server>], pool: u64, ctx: &Ctx) -> usize {
+    let count = pool.count_ones();
     let at_random = || nth_set(pool, (random() % u64::from(count)) as u32);
-    let index = match &set.policy {
+    match policy {
         Policy::Random => at_random(),
         Policy::RandomChoose(k) => {
             let mut chosen = 0u64;
@@ -642,29 +690,9 @@ fn choose(set: &Set, servers: &[Arc<Server>], pool: u64, ctx: &Ctx) -> (usize, b
             pool,
             ctx.req.uri.path_and_query().map_or("/", |pq| pq.as_str()).as_bytes(),
         ),
-        Policy::Query(key) => match query_value(ctx, key) {
-            Some(value) => by_hash(servers, pool, value.as_bytes()),
-            None => at_random(),
-        },
-        Policy::Header(name) => match ctx.req.headers.get(name) {
-            Some(value) => by_hash(servers, pool, value.as_bytes()),
-            None => at_random(),
-        },
-        Policy::Cookie { name, secret } => {
-            if let Some(value) = cookie_of(ctx, name) {
-                let mut rest = pool;
-                while rest != 0 {
-                    let i = rest.trailing_zeros() as usize;
-                    rest &= rest - 1;
-                    if servers[i].cookie_value(secret) == value {
-                        return (i, false);
-                    }
-                }
-            }
-            return (at_random(), true);
-        }
-    };
-    (index, false)
+        // No fallback is one of these (src/config.rs): at random, as theirs is unless set.
+        Policy::Query(_) | Policy::Header(_) | Policy::Cookie { .. } => at_random(),
+    }
 }
 
 fn ip_bytes(ip: IpAddr) -> [u8; 16] {
@@ -714,7 +742,14 @@ mod tests {
     }
 
     fn set(names: &[&str], policy: Policy, passive: Option<Passive>) -> Upstreams {
-        Upstreams::new(names.iter().map(|n| name(n, 1)).collect(), policy, passive, None, None)
+        Upstreams::new(
+            names.iter().map(|n| name(n, 1)).collect(),
+            policy,
+            Policy::Random,
+            passive,
+            None,
+            None,
+        )
     }
 
     fn picks(upstreams: &Upstreams, ctx: &Ctx, n: usize) -> Vec<u16> {
@@ -765,6 +800,7 @@ mod tests {
         let weighted = Upstreams::new(
             vec![name("127.0.0.1:1", 3), name("127.0.0.1:2", 1)],
             Policy::WeightedRoundRobin,
+            Policy::Random,
             None,
             None,
             None,
@@ -872,10 +908,57 @@ mod tests {
         assert!(unknown.set_cookie, "a cookie naming no server: chosen anew, set anew");
     }
 
+    /// A request without the key is chosen for by the fallback, and counted when that counts.
+    #[test]
+    fn a_request_without_the_key_takes_the_fallback() {
+        let names: Vec<Name> = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]
+            .iter()
+            .map(|n| name(n, 1))
+            .collect();
+        let none = ctx("10.0.0.2:4000", "/", None);
+        // `first`: always the first, where `random` would spread.
+        let secret: Arc<[u8]> = b"s3cret".as_slice().into();
+        let cookie = Policy::Cookie {
+            name: "lb".into(),
+            secret: secret.clone(),
+        };
+        let sticky = Upstreams::new(names.clone(), cookie, Policy::First, None, None, None);
+        let loaded = sticky.load();
+        for _ in 0..20 {
+            let picked = loaded.pick(&none, 0).unwrap();
+            assert_eq!(picked.server.addr.port(), 1);
+            assert!(picked.set_cookie && picked.lease.is_none());
+        }
+        // The cookie still wins over it.
+        let third = loaded.pick(&none, 0b011).unwrap();
+        assert_eq!(third.server.addr.port(), 3, "the others tried");
+        let value = third.server.cookie_value(&secret).to_string();
+        let again = loaded
+            .pick(&ctx("10.0.0.2:4000", "/", Some(&format!("lb={value}"))), 0)
+            .unwrap();
+        assert_eq!(again.server.addr.port(), 3);
+        // `least_conn`: requests are counted, and the next goes where fewer are under way.
+        let by_header = Upstreams::new(
+            names,
+            Policy::Header(HeaderName::from_static("x-user")),
+            Policy::LeastConn,
+            None,
+            None,
+            None,
+        );
+        let loaded = by_header.load();
+        let held: Vec<_> = (0..3).map(|_| loaded.pick(&none, 0).unwrap()).collect();
+        let mut ports: Vec<u16> = held.iter().map(|p| p.server.addr.port()).collect();
+        ports.sort_unstable();
+        assert_eq!(ports, [1, 2, 3], "each to the one with the fewest under way");
+        assert!(held.iter().all(|p| p.lease.is_some()));
+    }
+
     #[test]
     fn addresses_of_a_name_become_servers_and_keep_their_state() {
         let names = vec![name("app:8080", 2), name("127.0.0.1:9", 1)];
-        let Upstreams::Set(set) = Upstreams::new(names, Policy::RoundRobin, None, Some(vec![]), None) else {
+        let Upstreams::Set(set) = Upstreams::new(names, Policy::RoundRobin, Policy::Random, None, Some(vec![]), None)
+        else {
             panic!("a name is a set");
         };
         assert_eq!(set.servers().len(), 1, "the literal from the start");
@@ -964,27 +1047,47 @@ mod cost {
             unhealthy_latency: None,
             unhealthy_request_count: 0,
         };
-        time("fixed", &Upstreams::new(names(1), Policy::Random, None, None, None));
+        time(
+            "fixed",
+            &Upstreams::new(names(1), Policy::Random, Policy::Random, None, None, None),
+        );
         time(
             "one, fail_duration",
-            &Upstreams::new(names(1), Policy::First, Some(passive.clone()), None, None),
+            &Upstreams::new(
+                names(1),
+                Policy::First,
+                Policy::Random,
+                Some(passive.clone()),
+                None,
+                None,
+            ),
         );
         time(
             "4 round_robin",
-            &Upstreams::new(names(4), Policy::RoundRobin, None, None, None),
+            &Upstreams::new(names(4), Policy::RoundRobin, Policy::Random, None, None, None),
         );
-        time("4 random", &Upstreams::new(names(4), Policy::Random, None, None, None));
+        time(
+            "4 random",
+            &Upstreams::new(names(4), Policy::Random, Policy::Random, None, None, None),
+        );
         time(
             "4 least_conn",
-            &Upstreams::new(names(4), Policy::LeastConn, None, None, None),
+            &Upstreams::new(names(4), Policy::LeastConn, Policy::Random, None, None, None),
         );
         time(
             "4 uri_hash",
-            &Upstreams::new(names(4), Policy::UriHash, None, None, None),
+            &Upstreams::new(names(4), Policy::UriHash, Policy::Random, None, None, None),
         );
         time(
             "4 client_ip_hash, health",
-            &Upstreams::new(names(4), Policy::ClientIpHash, Some(passive), None, None),
+            &Upstreams::new(
+                names(4),
+                Policy::ClientIpHash,
+                Policy::Random,
+                Some(passive),
+                None,
+                None,
+            ),
         );
     }
 }

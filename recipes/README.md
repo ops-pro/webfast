@@ -11,6 +11,7 @@ served and asked a few requests, so they stay valid as webfast changes.
 | [app-behind](app-behind)     | the site in front of an application (`/api`, and whatever is not a file), with docker-compose.yml |
 | [behind-proxy](behind-proxy) | behind nginx, Traefik or a load balancer: trusted proxies, the client's address; nginx.conf       |
 | [tls-http3](tls-http3)       | HTTPS and HTTP/3 served by webfast itself, HTTP redirected                                        |
+| [websocket](websocket)       | an application with WebSocket: sockets from the site's own pages only, tunnels closed in order    |
 | [systemd](systemd)           | webfast as a hardened systemd service, without Docker                                             |
 
 Try one with the image (`docker build -t webfast .` in the project's root) and a built site in

@@ -135,6 +135,12 @@ async fn connection(
     let hints = served.may_hint();
     let quic = conn.clone();
     let activity = Activity::new();
+    // WebSocket over HTTP/3 (RFC 9220) is not offered (`enable_extended_connect` stays off): h3
+    // 0.0.8 knows only `webtransport` and `connect-udp` for `:protocol` and refuses a request
+    // with `websocket` as malformed before it gets here; its repository reads it. With that
+    // release: the offer here, the request as src/server.rs `websocket_connect` makes it for
+    // HTTP/2, the stream handed to src/tunnel.rs, and the idle timeout of a connection whose only
+    // traffic is a quiet tunnel (docs/configuration.md, What `reverse_proxy` reads).
     // Headers past `max_header_size` get 431 from h3; a frame may still hold them encoded.
     let mut h3 = h3::server::builder()
         .max_field_section_size(limits.max_header as u64)

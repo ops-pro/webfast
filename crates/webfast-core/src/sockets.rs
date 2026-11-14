@@ -74,6 +74,22 @@ pub fn tcp_listener(address: SocketAddr, limits: &Limits) -> std::io::Result<(to
     Ok((listener, refused))
 }
 
+/// A connection the server opened itself and may keep for long with nothing sent (a tunnel's
+/// upstream side, src/proxy.rs): keepalive probes as on the clients' sockets, so that a peer that
+/// vanished is found after about 90 s of silence, and (Linux) data it does not acknowledge for
+/// that long ends the connection too. What the system refuses stays as it is.
+pub fn keep_alive(stream: &tokio::net::TcpStream) {
+    let socket = SockRef::from(stream);
+    let _ = socket.set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL)
+            .with_retries(KEEPALIVE_PROBES),
+    );
+    #[cfg(target_os = "linux")]
+    let _ = socket.set_tcp_user_timeout(Some(KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_PROBES));
+}
+
 /// The congestion control a socket uses (Linux), for the startup log.
 pub fn congestion_of(listener: &tokio::net::TcpListener) -> Option<String> {
     #[cfg(target_os = "linux")]

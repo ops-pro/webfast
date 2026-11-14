@@ -66,7 +66,14 @@ fn every_recipe_loads() {
     loaded.sort();
     assert_eq!(
         loaded,
-        ["app-behind", "behind-proxy", "spa", "static-site", "tls-http3"]
+        [
+            "app-behind",
+            "behind-proxy",
+            "spa",
+            "static-site",
+            "tls-http3",
+            "websocket"
+        ]
     );
 }
 

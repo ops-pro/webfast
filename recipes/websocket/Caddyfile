@@ -1,0 +1,50 @@
+# An application with WebSocket at app:3000: only the site's own pages may open a socket, a tunnel
+# has a longest life, and the tunnels a reload leaves behind are closed a few at a time.
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	encode zstd br gzip
+
+	# A WebSocket handshake. Over HTTP/2 it reaches the routes in this same form.
+	@socket header Upgrade *
+
+	# One from a page of another site. A browser opens a socket to this site from any page and
+	# sends this site's cookies with it; the only thing that tells whose page asked is `Origin`,
+	# which no page can set. List every origin the application is served from.
+	#
+	# A client that sends no `Origin` (an application, another server) is no browser on someone
+	# else's page and is let through. Take the `header Origin *` line out to refuse those too.
+	@foreign {
+		header Upgrade *
+		header Origin *
+		not header Origin https://app.example.com https://www.example.com
+	}
+
+	# `route` keeps the handlers in exactly this order.
+	route {
+		respond /healthz "ok" 200
+
+		respond @foreign 403
+
+		reverse_proxy @socket app:3000 {
+			# A tunnel is closed a day after it opened, with a Close frame (1001): the client
+			# reconnects, and no tunnel stays for ever on an instance that should have drained.
+			stream_timeout 24h
+			# After a reload the tunnels opened before it are closed within five minutes, each at
+			# its own moment, so their clients do not all come back at once.
+			stream_close_delay 5m
+			# With several instances: a handshake goes to the next one when one is down.
+			lb_retries 2
+		}
+
+		reverse_proxy app:3000
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
