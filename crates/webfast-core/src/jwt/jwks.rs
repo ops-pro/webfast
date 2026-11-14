@@ -67,6 +67,12 @@ impl Alg {
 /// One key, ready to verify with each algorithm it may sign with.
 struct Key {
     kid: Option<String>,
+    /// Its JWK thumbprint (RFC 7638; RFC 8037 for Ed25519), base64url: how HTTP Message
+    /// Signatures of bots name a key (src/botauth.rs).
+    thumbprint: String,
+    /// When the key holds, when its JWK says (`nbf`, `exp`: key directories of bots do).
+    not_before: Option<u64>,
+    expires: Option<u64>,
     verifiers: Vec<(Alg, ParsedPublicKey)>,
 }
 
@@ -77,7 +83,7 @@ pub struct KeySet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Checked {
+pub(crate) enum Checked {
     Valid,
     /// No key with the token's id (or, without one, none for its algorithm).
     NoKey,
@@ -101,6 +107,8 @@ struct Jwk {
     e: Option<String>,
     x: Option<String>,
     y: Option<String>,
+    nbf: Option<u64>,
+    exp: Option<u64>,
 }
 
 impl KeySet {
@@ -134,6 +142,12 @@ impl KeySet {
         self.keys.is_empty()
     }
 
+    /// The keys' thumbprints, in the document's order.
+    #[cfg(test)]
+    pub(crate) fn thumbprints(&self) -> Vec<String> {
+        self.keys.iter().map(|key| key.thumbprint.clone()).collect()
+    }
+
     /// Verifies `signature` over `input` with the keys that may have made it: the token's key id,
     /// or — without one — every key for its algorithm.
     pub(super) fn verify(&self, kid: Option<&str>, alg: Alg, input: &[u8], signature: &[u8]) -> Checked {
@@ -154,6 +168,69 @@ impl KeySet {
         }
         if tried { Checked::BadSignature } else { Checked::NoKey }
     }
+
+    /// Verifies `signature` over `input` with the key whose thumbprint (or id) is `keyid`, when
+    /// it holds at `now`: with `alg` when the signature names one, else with any the key may
+    /// sign with.
+    #[cfg(feature = "bot-auth")]
+    pub(crate) fn verify_thumbprint(
+        &self,
+        keyid: &str,
+        alg: Option<Alg>,
+        now: u64,
+        input: &[u8],
+        signature: &[u8],
+    ) -> Checked {
+        let mut tried = false;
+        for key in &self.keys {
+            if key.thumbprint != keyid && key.kid.as_deref() != Some(keyid) {
+                continue;
+            }
+            if key.not_before.is_some_and(|at| at > now) || key.expires.is_some_and(|at| at < now) {
+                continue;
+            }
+            for (key_alg, verifier) in &key.verifiers {
+                if alg.is_some_and(|alg| alg != *key_alg) {
+                    continue;
+                }
+                tried = true;
+                if verifier.verify_sig(input, signature).is_ok() {
+                    return Checked::Valid;
+                }
+            }
+        }
+        if tried { Checked::BadSignature } else { Checked::NoKey }
+    }
+}
+
+/// base64url without padding.
+pub(crate) fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut n = 0u32;
+        for (i, &b) in chunk.iter().enumerate() {
+            n |= u32::from(b) << (16 - 8 * i);
+        }
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// The JWK thumbprint (RFC 7638): SHA-256 of the key's required members, in their order, as
+/// its JWK has them.
+fn thumbprint(members: &[(&str, &str)]) -> String {
+    let mut json = String::from("{");
+    for (i, (name, value)) in members.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{name}\":\"{value}\""));
+    }
+    json.push('}');
+    base64url(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, json.as_bytes()).as_ref())
 }
 
 impl Key {
@@ -168,6 +245,20 @@ impl Key {
         let field = |value: &Option<String>, name: &str| -> Result<Vec<u8>> {
             let text = value.as_deref().ok_or_else(|| anyhow!("no {name}"))?;
             super::token::decode(text).ok_or_else(|| anyhow!("{name} is not base64url"))
+        };
+        fn member(value: &Option<String>) -> &str {
+            value.as_deref().unwrap_or("")
+        }
+        let print = match (jwk.kty.as_str(), jwk.crv.as_deref()) {
+            ("RSA", _) => thumbprint(&[("e", member(&jwk.e)), ("kty", "RSA"), ("n", member(&jwk.n))]),
+            ("EC", Some(curve)) => thumbprint(&[
+                ("crv", curve),
+                ("kty", "EC"),
+                ("x", member(&jwk.x)),
+                ("y", member(&jwk.y)),
+            ]),
+            ("OKP", Some(curve)) => thumbprint(&[("crv", curve), ("kty", "OKP"), ("x", member(&jwk.x))]),
+            _ => String::new(),
         };
         let (algs, bytes): (Vec<Alg>, Vec<u8>) = match (jwk.kty.as_str(), jwk.crv.as_deref()) {
             ("RSA", _) => {
@@ -208,6 +299,9 @@ impl Key {
         }
         Ok(Key {
             kid: jwk.kid,
+            thumbprint: print,
+            not_before: jwk.nbf,
+            expires: jwk.exp,
             verifiers,
         })
     }
@@ -248,7 +342,7 @@ fn rsa_public_key_der(n: &[u8], e: &[u8]) -> Vec<u8> {
 }
 
 /// Where an issuer's keys come from.
-pub(super) enum Source {
+pub(crate) enum Source {
     Inline,
     File(PathBuf),
     Uri(http::Uri),
@@ -261,7 +355,7 @@ const MIN_REFETCH: Duration = Duration::from_secs(30);
 const MAX_JWKS: usize = 1 << 20;
 
 /// An issuer's keys, shared by the requests and the task that keeps them current.
-pub(super) struct Keys {
+pub(crate) struct Keys {
     pub name: String,
     pub source: Source,
     set: ArcSwap<KeySet>,
@@ -350,7 +444,7 @@ impl Keys {
                 return Ok(());
             }
             let set = KeySet::parse(&bytes)?;
-            tracing::info!(provider = %self.name, keys = set.len(), "JWT signing keys loaded");
+            tracing::info!(provider = %self.name, keys = set.len(), "signing keys loaded");
             self.set.store(Arc::new(set));
             *self.digest.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = digest;
             self.generation.fetch_add(1, Ordering::AcqRel);
@@ -365,7 +459,7 @@ impl Keys {
 /// Keeps `keys` current: a read every `cache_duration`, after a failure again sooner (1 s,
 /// doubling up to a minute), and early when a request asks. Ends once the keys are gone (a reload
 /// put another JWT file in place and its last request is done).
-pub(super) async fn refresh(keys: std::sync::Weak<Keys>, client: Client) {
+pub(crate) async fn refresh(keys: std::sync::Weak<Keys>, client: Client) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let Some(keys) = keys.upgrade() else { return };
@@ -375,7 +469,7 @@ pub(super) async fn refresh(keys: std::sync::Weak<Keys>, client: Client) {
                 keys.cache_duration
             }
             Err(e) => {
-                tracing::warn!(provider = %keys.name, error = %format!("{e:#}"), retry_secs = backoff.as_secs(), "cannot read the JWT signing keys");
+                tracing::warn!(provider = %keys.name, error = %format!("{e:#}"), retry_secs = backoff.as_secs(), "cannot read the signing keys");
                 let wait = backoff;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 wait
@@ -391,11 +485,15 @@ pub(super) async fn refresh(keys: std::sync::Weak<Keys>, client: Client) {
     }
 }
 
-pub(super) use crate::fetch::{Client, client};
+pub(crate) use crate::fetch::{Client, client};
 
 async fn fetch(client: &Client, uri: &http::Uri, timeout: Duration) -> Result<Bytes> {
     let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
+    // A JWKS, or a key directory of signed bots, which is one (src/botauth.rs).
+    headers.insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static("application/json, application/http-message-signatures-directory+json"),
+    );
     let fetched = crate::fetch::get(client, uri, &headers, MAX_JWKS, timeout).await?;
     if !fetched.status.is_success() {
         bail!("JWKS answered {}", fetched.status);
@@ -410,7 +508,7 @@ fn unix_millis() -> u64 {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::jwt::token::encode;
     use aws_lc_rs::rand::SystemRandom;

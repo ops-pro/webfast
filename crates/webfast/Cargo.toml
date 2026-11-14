@@ -22,10 +22,11 @@ name = "webfast"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme", "ngfw", "challenge"]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "bot-auth", "api-firewall", "compress-files", "acme", "ngfw", "challenge"]
 # The core's features, passed through (crates/webfast-core/Cargo.toml says what each is).
 acme = ["webfast-core/acme"]
 api-firewall = ["webfast-core/api-firewall"]
+bot-auth = ["webfast-core/bot-auth"]
 compress-files = ["webfast-core/compress-files"]
 jwt = ["webfast-core/jwt"]
 proxy-cache = ["webfast-core/proxy-cache"]

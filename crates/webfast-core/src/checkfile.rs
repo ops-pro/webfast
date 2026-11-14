@@ -1,5 +1,5 @@
 //! A request check read from its own file — the JWT check (`WEB_JWT_CONFIG`), the API firewall
-//! (`WEB_API_FIREWALL_CONFIG`) — that a reload (SIGHUP) reads again, as the modules' files are.
+//! (`WEB_API_FIREWALL_CONFIG`), the signatures of bots (`WEB_BOT_AUTH_CONFIG`) — that a reload (SIGHUP) reads again, as the modules' files are.
 //!
 //! The hooks are `&'static` and keep the check (`Reloadable`) for the life of the process; what
 //! it holds is swapped. A reload goes in two steps around the Caddyfile's (src/run.rs

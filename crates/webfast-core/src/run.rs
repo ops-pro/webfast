@@ -21,8 +21,9 @@
 //! WEB_WORKERS (one per CPU; `auto`): the listening sockets per port, so the threads that serve
 //! the connections, and the shared runtime's threads; WEB_FILES_WATCH (`auto`: inotify on local
 //! filesystems, polling elsewhere; `inotify`, `poll`, `off`: as loaded at startup) and
-//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_JWT_CONFIG and
-//! WEB_API_FIREWALL_CONFIG: YAML files of the request checks (src/jwt, src/apifw), and the
+//! WEB_FILES_POLL (30s): how changed site files are picked up (src/watch.rs); WEB_JWT_CONFIG,
+//! WEB_API_FIREWALL_CONFIG and WEB_BOT_AUTH_CONFIG: YAML files of the request checks (src/jwt,
+//! src/apifw, src/botauth.rs), and the
 //! modules' own (`Module::configure_from_env`, `Module::load`; the request filter's
 //! WEB_NGFW_CONFIG of webfast-modules, say); WEB_TLS_STRICT_SNI
 //! (`off`; `on`: a TLS handshake without SNI or for a name no site names gets no certificate and

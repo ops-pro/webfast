@@ -176,6 +176,14 @@ pub fn check_kind(refused: bool) -> (&'static EventKind, Level) {
     }
 }
 
+/// A signature of a bot that was not taken (src/botauth.rs): `reason`. The request goes on as
+/// any other; nothing is refused.
+pub static SIGNATURE_NOT_TAKEN: EventKind = EventKind {
+    msg: "signature not taken",
+    request: &[],
+    fields: &[Field::public("reason")],
+};
+
 const CHECK_FIELDS: &[Field] = &[
     Field::public("reason"),
     Field::public("detail"),

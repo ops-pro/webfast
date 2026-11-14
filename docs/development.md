@@ -35,6 +35,7 @@ test. Paths below are relative to the crate (`src/` of the core unless said othe
 | `src/proxy.rs`                                   | `reverse_proxy`: the request to an upstream and its answer; the WebSocket handshake                 |
 | `src/upstream_link.rs`                           | the proxy's own connections to an upstream: over TLS (HTTP/1.1, HTTP/2), h2c, HTTP/3; `versions`    |
 | `src/upstream_tls.rs`                            | TLS to the upstreams: the client configuration, what a handshake offers                             |
+| `src/botauth.rs`                                 | Web Bot Auth: the HTTP message signatures of bots verified (RFC 9421), with the JWT check's keys    |
 | `src/tunnel.rs`                                  | a tunnel's life: both ways copied and counted, WebSocket frames followed, the Close frame          |
 | `src/server.rs`                                  | listeners, connections, runtimes; one request on any protocol                                       |
 | `src/h3.rs`, `src/h3limit.rs`                    | HTTP/3 over QUIC, and its frame size limit                                                          |
@@ -46,6 +47,7 @@ test. Paths below are relative to the crate (`src/` of the core unless said othe
 | `tests/recipes.rs`                               | every recipe loads; the static site and the SPA answer as they say                                  |
 | `tests/websocket.rs`                             | WebSocket through `reverse_proxy`, against an upstream written by hand                              |
 | `tests/upstream_tls.rs`                          | `reverse_proxy` to an upstream over TLS, HTTP/2, h2c and HTTP/3, with a CA made by the test         |
+| `tests/agents.rs`                                | a protected resource (RFC 9728, MCP) guarded by the JWT check; signed bots told from the rest       |
 | `tests/errors.rs`                                | `handle_errors` and `error`, as Caddy answers them                                                  |
 | `tests/dictionaries.rs`                          | compression dictionaries: `dcz` deltas to a file or to a replaced version                           |
 | `tests/disk.rs`                                  | files over `WEB_MAX_FILE_IN_MEMORY`, streamed from disk                                             |
@@ -89,7 +91,8 @@ and on tags, each on a runner of its architecture.
 Cargo features, all on by default (docs/extensions.md): `mimalloc` (the allocator of the binary and of
 `examples/bench.rs`), `proxy-cache` (`cache` and `WEB_PROXY_CACHE_MEMORY`, src/cache.rs),
 `rate-limit` (`rate_limit` and `WEB_MAX_UPSTREAM_REQUESTS_PER_IP`, src/ratelimit.rs), `jwt`
-(`WEB_JWT_CONFIG`, src/jwt), `api-firewall` (`WEB_API_FIREWALL_CONFIG`, src/apifw),
+(`WEB_JWT_CONFIG`, src/jwt), `bot-auth` (`WEB_BOT_AUTH_CONFIG`, src/botauth.rs; it needs `jwt`),
+`api-firewall` (`WEB_API_FIREWALL_CONFIG`, src/apifw),
 `compress-files` (`WEB_COMPRESSED_FILES_MEMORY`, src/variants.rs) and `acme` (certificates
 obtained for the sites without `tls` files, `WEB_ACME_DIR`, src/acme;
 without a feature its directive and variables stop the startup with an error that

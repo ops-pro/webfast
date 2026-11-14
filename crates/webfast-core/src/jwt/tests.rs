@@ -481,3 +481,195 @@ async fn rules_bound_to_an_upstream_are_checked_by_its_proxy() {
         .unwrap_or_default();
     assert!(err.contains("rule 1: upstream"), "{err}");
 }
+
+/// A provider `main` (issuer https://id.test) with `signer`'s key, the protected resource `mcp`
+/// (https://mcp.test/mcp) and a rule that guards it, asking for the scope `mcp:tools`.
+fn protected(signer: &Signer, provider_extra: &str) -> JwtAuth {
+    let yaml = format!(
+        "providers:\n  main:\n    issuer: https://id.test\n{provider_extra}    jwks: '{}'\nresources:\n  mcp:\n    resource: https://mcp.test/mcp\n    scopes_supported: [\"mcp:tools\", \"mcp:admin\"]\n    resource_name: Test tools\nrules:\n  - match: {{paths: [\"/mcp\", \"/mcp/*\"]}}\n    providers: [main]\n    resource: mcp\n    scopes: [\"mcp:tools\"]\n",
+        jwks(&[(signer, "k1")])
+    );
+    JwtAuth::from_yaml(&yaml, Path::new(".")).unwrap()
+}
+
+fn asked(method: &str, host: &str, uri: &str, token: Option<&str>) -> http::request::Parts {
+    let mut builder = http::Request::builder().method(method).uri(uri).header("host", host);
+    if let Some(token) = token {
+        builder = builder.header("authorization", bearer(token));
+    }
+    builder.body(()).unwrap().into_parts().0
+}
+
+/// What a request is answered with when the check does not let it through: the status, the
+/// `WWW-Authenticate` field, the body.
+async fn answered(auth: &JwtAuth, mut parts: http::request::Parts) -> Option<(u16, String, String)> {
+    let response = auth.check(&mut parts, ip()).await.err()?;
+    let status = response.status().as_u16();
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .map_or(String::new(), |v| v.to_str().unwrap().to_string());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    Some((status, challenge, String::from_utf8_lossy(&body).into_owned()))
+}
+
+const METADATA: &str = "https://mcp.test/.well-known/oauth-protected-resource/mcp";
+
+#[tokio::test]
+async fn a_protected_resource_publishes_its_metadata() {
+    let auth = protected(&Signer::ec(), "");
+    // RFC 9728 §3.1: the well-known address is on the resource's host, the resource's path after
+    // it; no token is asked for it.
+    let mut parts = asked("GET", "mcp.test", "/.well-known/oauth-protected-resource/mcp", None);
+    let response = auth.check(&mut parts, ip()).await.expect_err("answered here");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let document: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        document,
+        json!({
+            "resource": "https://mcp.test/mcp",
+            // The issuers of the providers of the rules that guard it.
+            "authorization_servers": ["https://id.test"],
+            "scopes_supported": ["mcp:tools", "mcp:admin"],
+            "bearer_methods_supported": ["header"],
+            "resource_name": "Test tools",
+        })
+    );
+    let head = asked(
+        "HEAD",
+        "MCP.test:443",
+        "/.well-known/oauth-protected-resource/mcp",
+        None,
+    );
+    assert!(answered(&auth, head).await.is_some_and(|(status, ..)| status == 200));
+    // Not another host's, not another path's, not to a POST: those go on to the routes.
+    for (method, host, path) in [
+        ("GET", "other.test", "/.well-known/oauth-protected-resource/mcp"),
+        ("GET", "mcp.test", "/.well-known/oauth-protected-resource"),
+        ("GET", "mcp.test", "/.well-known/oauth-protected-resource/mcp/x"),
+        ("POST", "mcp.test", "/.well-known/oauth-protected-resource/mcp"),
+    ] {
+        let other = asked(method, host, path, None);
+        assert!(answered(&auth, other).await.is_none(), "{method} {host}{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_says_where_the_metadata_is_and_what_to_ask_for() {
+    let signer = Signer::ec();
+    let auth = protected(&signer, "");
+    let token = |extra: Value| signer.token("k1", &claims(extra));
+    let post = |token: Option<&str>| asked("POST", "mcp.test", "/mcp", token);
+    let mine = json!({"aud": "https://mcp.test/mcp", "scope": "mcp:tools profile"});
+
+    // No token: 401, with the address of the metadata and the scopes to ask for.
+    let (status, challenge, _) = answered(&auth, post(None)).await.unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge,
+        format!("Bearer scope=\"mcp:tools\", resource_metadata=\"{METADATA}\"")
+    );
+
+    // A token issued for this resource, with the scope: through, and again from the cache.
+    for _ in 0..2 {
+        assert!(answered(&auth, post(Some(&token(mine.clone())))).await.is_none());
+    }
+    // `aud` as a list, with a slash at the end, the scopes as `scp`.
+    let listed = json!({"aud": ["https://api.test", "https://mcp.test/mcp/"], "scp": ["mcp:tools"]});
+    assert!(answered(&auth, post(Some(&token(listed)))).await.is_none());
+
+    // A token for another resource, or for none: not valid here, 401 (403 is for scopes).
+    for aud in [json!("https://other.test/mcp"), json!("api"), Value::Null] {
+        let other = json!({"aud": aud, "scope": "mcp:tools"});
+        let (status, challenge, body) = answered(&auth, post(Some(&token(other)))).await.unwrap();
+        assert_eq!((status, body.as_str()), (401, "Jwt is not for this resource"));
+        assert_eq!(
+            challenge,
+            format!("Bearer error=\"invalid_token\", scope=\"mcp:tools\", resource_metadata=\"{METADATA}\"")
+        );
+    }
+    // The right resource without the scope: 403, and what to come back with.
+    for scope in [json!("mcp:admin profile"), json!("mcp:toolsx"), Value::Null] {
+        let narrow = json!({"aud": "https://mcp.test/mcp", "scope": scope});
+        let (status, challenge, _) = answered(&auth, post(Some(&token(narrow)))).await.unwrap();
+        assert_eq!(status, 403);
+        assert_eq!(
+            challenge,
+            format!("Bearer error=\"insufficient_scope\", scope=\"mcp:tools\", resource_metadata=\"{METADATA}\"")
+        );
+    }
+    // An expired one: 401 as ever, with the metadata's address.
+    let old = json!({"aud": "https://mcp.test/mcp", "scope": "mcp:tools", "exp": now() - 120});
+    let (status, challenge, _) = answered(&auth, post(Some(&token(old)))).await.unwrap();
+    assert_eq!(status, 401);
+    assert!(
+        challenge.starts_with("Bearer error=\"invalid_token\"") && challenge.contains(METADATA),
+        "{challenge}"
+    );
+
+    // A provider that says what its tokens' `aud` is (an issuer that names the API its own way):
+    // that is what is asked of them, and a miss is still 401 for a protected resource.
+    let named = protected(&signer, "    audiences: [tools-api]\n");
+    let fits = json!({"aud": "tools-api", "scope": "mcp:tools"});
+    assert!(answered(&named, post(Some(&token(fits)))).await.is_none());
+    let (status, ..) = answered(&named, post(Some(&token(mine)))).await.unwrap();
+    assert_eq!(status, 401);
+}
+
+#[test]
+fn what_the_file_may_say_of_a_protected_resource() {
+    let load = |resources: &str, rule: &str| {
+        let yaml = format!(
+            "providers:\n  main:\n    issuer: https://id.test\n    jwks: '{}'\nresources:\n{resources}rules:\n  - match: {{paths: [\"/mcp\"]}}\n{rule}",
+            jwks(&[(&Signer::ec(), "k1")])
+        );
+        JwtAuth::from_yaml(&yaml, Path::new("."))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    };
+    let mcp = "  mcp:\n    resource: https://mcp.test/mcp\n";
+    let guarded = "    providers: [main]\n    resource: mcp\n";
+    load(mcp, guarded).unwrap();
+    // Its own authorization servers, a resource at the root of its host.
+    load(
+        "  mcp:\n    resource: https://mcp.test\n    authorization_servers: [https://login.test]\n",
+        guarded,
+    )
+    .unwrap();
+    for (resources, rule, says) in [
+        (
+            mcp,
+            "    providers: [main]\n    resource: tools\n",
+            "no resource \"tools\"",
+        ),
+        (mcp, "    providers: [main]\n", "no rule guards it"),
+        (mcp, "    resource: mcp\n", "have no providers"),
+        (
+            "  mcp:\n    resource: https://mcp.test/mcp\n    authorization_servers: [https://login.test]\n",
+            "    resource: mcp\n",
+            "needs providers",
+        ),
+        ("  mcp:\n    resource: mcp.test/mcp\n", guarded, "an http(s) URL"),
+        (
+            "  mcp:\n    resource: https://mcp.test/mcp?x=1\n",
+            guarded,
+            "without a query",
+        ),
+        (
+            "  mcp:\n    resource: https://mcp.test/mcp#top\n",
+            guarded,
+            "without a query",
+        ),
+        (
+            mcp,
+            "    providers: [main]\n    resource: mcp\n    scopes: [\"two words\"]\n",
+            "is not a scope",
+        ),
+    ] {
+        let error = load(resources, rule).unwrap_err();
+        assert!(error.contains(says), "{rule}: {error}");
+    }
+}

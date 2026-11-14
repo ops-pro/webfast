@@ -75,8 +75,8 @@ with, and no connection is cut by a reload. What the connections already open ge
   `timeouts`, `strict_sni_host`, and the `WEB_*` variables, `WEB_RELOAD` among them (read at
   startup: the files they name are read again, the names are not). The `debug` option takes
   effect on a restart.
-- The request checks' files — the JWT check's (`WEB_JWT_CONFIG`) and the API firewall's
-  (`WEB_API_FIREWALL_CONFIG`) — are read again with the Caddyfile and taken with it, or not at
+- The request checks' files — the JWT check's (`WEB_JWT_CONFIG`), the API firewall's
+  (`WEB_API_FIREWALL_CONFIG`) and the signed bots' (`WEB_BOT_AUTH_CONFIG`) — are read again with the Caddyfile and taken with it, or not at
   all: one that does not load refuses the reload, the new Caddyfile is checked against the new
   files' bindings (a check bound to an upstream no `reverse_proxy` sends to is refused, as at
   startup), and the next request is checked by the new files once the reload went through. A

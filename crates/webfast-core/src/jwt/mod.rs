@@ -21,6 +21,12 @@
 //! 401 / 403; with `mode: log_only` (for all rules, or a rule's own) the request goes on instead,
 //! as it came and without claim headers.
 //!
+//! A rule may guard a *protected resource* of OAuth 2.0 (`resource: <name>`, RFC 9728) — what
+//! an MCP server is to its clients (the Model Context Protocol's authorization). Then the server
+//! publishes the resource's metadata at its well-known address, a 401 says where it is
+//! (`WWW-Authenticate: Bearer resource_metadata="…"`), a token must have been issued for that
+//! resource (its `aud`, RFC 8707) and carry the rule's `scopes` (403 `insufficient_scope`).
+//!
 //! ```yaml
 //! mode: block                              # block | log_only; a rule may set its own
 //! log: {output: /var/log/web/jwt.log}      # or stdout / stderr / discard; none: the server's log
@@ -39,7 +45,7 @@
 //! ```
 
 mod cache;
-mod jwks;
+pub(crate) mod jwks;
 mod token;
 
 pub use jwks::{Alg, KeySet};
@@ -65,6 +71,9 @@ const MAX_TOKEN: usize = 16 * 1024;
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     providers: BTreeMap<String, ProviderConfig>,
+    /// OAuth 2.0 protected resources (RFC 9728) that rules guard.
+    #[serde(default)]
+    resources: BTreeMap<String, ResourceConfig>,
     #[serde(default)]
     rules: Vec<RuleConfig>,
     #[serde(default)]
@@ -118,6 +127,21 @@ fn yes() -> bool {
     true
 }
 
+/// A protected resource as RFC 9728 describes one: what its metadata document says.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceConfig {
+    /// The resource identifier: the URL its clients reach it at (`https://mcp.example.com/mcp`).
+    resource: String,
+    /// The issuers its tokens come from; unset: those of the providers of the rules that guard it.
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    resource_name: Option<String>,
+    resource_documentation: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HeaderSource {
@@ -143,6 +167,11 @@ struct RuleConfig {
     #[serde(default)]
     allow_missing: bool,
     mode: Option<Mode>,
+    /// The protected resource (of `resources`) the rule guards.
+    resource: Option<String>,
+    /// Scopes a token must carry, all of them (`scope` or `scp`): 403 `insufficient_scope`.
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -208,6 +237,27 @@ struct Rule {
     providers: Vec<usize>,
     allow_missing: bool,
     mode: Mode,
+    /// Index into `resources`: the protected resource the rule guards.
+    resource: Option<usize>,
+    scopes: Vec<String>,
+    /// `WWW-Authenticate` of its refusals: no token, a token that does not hold, one without
+    /// the scopes. With a resource they say where its metadata is, and the scopes to ask for.
+    challenges: [HeaderValue; 3],
+}
+
+/// The well-known address of a protected resource's metadata (RFC 9728 §3): on the resource's
+/// host, with the resource's path after it.
+const RESOURCE_METADATA: &str = "/.well-known/oauth-protected-resource";
+
+/// A protected resource of OAuth 2.0 (RFC 9728).
+struct Resource {
+    /// Its identifier: what a token's `aud` must name.
+    id: String,
+    /// Where its metadata is served: the host (no port), and the path.
+    host: String,
+    path: String,
+    /// The document, JSON.
+    metadata: bytes::Bytes,
 }
 
 /// A token found valid, and what it adds to the request.
@@ -218,6 +268,10 @@ struct Verified {
     exp: Option<u64>,
     nbf: Option<u64>,
     headers: Vec<(HeaderName, HeaderValue)>,
+    /// What it was issued for (`aud`) and what it allows (`scope`, `scp`): what a rule for a
+    /// protected resource asks of it.
+    audiences: Vec<Box<str>>,
+    scopes: Vec<Box<str>>,
 }
 
 /// Why a request was refused.
@@ -234,6 +288,10 @@ pub enum Failure {
     NotYetValid,
     LifetimeTooLong,
     Audience,
+    /// Issued for another resource than the one the rule guards.
+    Resource,
+    /// Without a scope the rule asks for.
+    Scope,
 }
 
 impl Failure {
@@ -251,12 +309,21 @@ impl Failure {
             Failure::NotYetValid => "not-yet-valid",
             Failure::LifetimeTooLong => "lifetime-too-long",
             Failure::Audience => "audience",
+            Failure::Resource => "resource",
+            Failure::Scope => "insufficient-scope",
         }
     }
 
-    /// Status and message as Envoy's jwt_authn gives them.
-    fn answer(self) -> (StatusCode, &'static str) {
+    /// Status and message as Envoy's jwt_authn gives them. For a rule that guards a protected
+    /// resource (`protected`) a token for another audience is an invalid token, 401, as OAuth
+    /// has it (RFC 6750 §3.1; 403 is for scopes).
+    fn answer(self, protected: bool) -> (StatusCode, &'static str) {
         match self {
+            Failure::Audience | Failure::Resource if protected => {
+                (StatusCode::UNAUTHORIZED, "Jwt is not for this resource")
+            }
+            Failure::Resource => (StatusCode::FORBIDDEN, "Audiences in Jwt are not allowed"),
+            Failure::Scope => (StatusCode::FORBIDDEN, "Jwt does not have the required scope"),
             Failure::Missing => (StatusCode::UNAUTHORIZED, "Jwt is missing"),
             Failure::Expired => (StatusCode::UNAUTHORIZED, "Jwt is expired"),
             Failure::NotYetValid => (StatusCode::UNAUTHORIZED, "Jwt not yet valid"),
@@ -270,6 +337,7 @@ impl Failure {
 /// The configured providers and rules, and the verified-token cache.
 pub struct JwtAuth {
     providers: Vec<Provider>,
+    resources: Vec<Resource>,
     rules: Vec<Rule>,
     /// Request headers that only a verified token may set.
     reserved: Vec<HeaderName>,
@@ -300,6 +368,37 @@ impl JwtAuth {
         for (name, config) in &file.providers {
             providers.push(provider(name, config, base).with_context(|| format!("provider {name}"))?);
         }
+        let resource_names: Vec<&String> = file.resources.keys().collect();
+        // What names what, before anything is made of it: a rule its resource, a resource a rule.
+        for (i, rule) in file.rules.iter().enumerate() {
+            if let Some(name) = &rule.resource
+                && !file.resources.contains_key(name)
+            {
+                bail!("rule {}: no resource {name:?}", i + 1);
+            }
+        }
+        for name in file.resources.keys() {
+            if !file.rules.iter().any(|rule| rule.resource.as_ref() == Some(name)) {
+                bail!("resource {name}: no rule guards it (`resource: {name}` in a rule)");
+            }
+        }
+        let mut resources = Vec::new();
+        for (name, config) in &file.resources {
+            // The issuers of the providers of the rules that guard it, unless it names its own.
+            let mut servers = config.authorization_servers.clone();
+            if servers.is_empty() {
+                for rule in file.rules.iter().filter(|r| r.resource.as_ref() == Some(name)) {
+                    for provider in &rule.providers {
+                        if let Some(config) = file.providers.get(provider)
+                            && !servers.contains(&config.issuer)
+                        {
+                            servers.push(config.issuer.clone());
+                        }
+                    }
+                }
+            }
+            resources.push(resource(config, servers).with_context(|| format!("resource {name}"))?);
+        }
         let mut rules = Vec::new();
         for (i, rule) in file.rules.iter().enumerate() {
             let mut indexes = Vec::new();
@@ -324,6 +423,16 @@ impl JwtAuth {
                         .map_err(|e| anyhow!("rule {}: upstream {upstream:?}: {e}", i + 1))?,
                 );
             }
+            let guarded = rule
+                .resource
+                .as_ref()
+                .and_then(|name| resource_names.iter().position(|n| *n == name));
+            if guarded.is_some() && indexes.is_empty() {
+                bail!("rule {}: a rule for a resource needs providers", i + 1);
+            }
+            if let Some(scope) = rule.scopes.iter().find(|s| !is_scope(s)) {
+                bail!("rule {}: {scope:?} is not a scope", i + 1);
+            }
             rules.push(Rule {
                 paths: rule.matcher.paths.iter().map(|p| PathPattern::new(p)).collect(),
                 methods,
@@ -332,6 +441,10 @@ impl JwtAuth {
                 providers: indexes,
                 allow_missing: rule.allow_missing,
                 mode: rule.mode.unwrap_or(file.mode),
+                challenges: challenges(guarded.map(|i| &resources[i]), &rule.scopes)
+                    .with_context(|| format!("rule {}", i + 1))?,
+                resource: guarded,
+                scopes: rule.scopes.clone(),
             });
         }
         let mut reserved: Vec<HeaderName> = Vec::new();
@@ -351,6 +464,7 @@ impl JwtAuth {
         hidden_params.dedup();
         Ok(JwtAuth {
             providers,
+            resources,
             rules,
             reserved,
             hidden_params: Arc::from(hidden_params),
@@ -404,6 +518,9 @@ impl JwtAuth {
         }
         // `X_User` and `X.User` too: a CGI-style upstream reads them as `X-User`.
         crate::proxy::remove_lookalikes(&mut parts.headers, &self.reserved);
+        if let Some(resource) = self.metadata_of(parts) {
+            return Err(metadata(resource));
+        }
         match self.rule_for(parts, None) {
             Some(rule) => self.apply(rule, parts, client_ip).await,
             None => Ok(()),
@@ -440,6 +557,8 @@ impl JwtAuth {
             None if rule.allow_missing => return Ok(()),
             None => Failure::Missing,
             Some((token, header)) => match self.verified(&token, rule).await {
+                Ok(verified) if !self.for_resource(&verified, rule) => Failure::Resource,
+                Ok(verified) if !has_scopes(&verified, rule) => Failure::Scope,
                 Ok(verified) => {
                     parts.extensions.insert(crate::handler::Credentialed);
                     if !self.providers[verified.provider].forward
@@ -460,9 +579,41 @@ impl JwtAuth {
         self.log.event(kind, level, parts, client_ip, |e| {
             e.str("reason", failure.code());
             e.str("detail", "");
-            e.u64("status", u64::from(failure.answer().0.as_u16()));
+            e.u64("status", u64::from(failure.answer(rule.resource.is_some()).0.as_u16()));
         });
-        if refused { Err(refusal(failure)) } else { Ok(()) }
+        if refused { Err(refusal(failure, rule)) } else { Ok(()) }
+    }
+
+    /// The protected resource whose metadata a request asks for (RFC 9728 §3.1): a GET or HEAD
+    /// of its well-known address, on its host.
+    fn metadata_of(&self, parts: &http::request::Parts) -> Option<&Resource> {
+        if self.resources.is_empty()
+            || !parts.uri.path().starts_with(RESOURCE_METADATA)
+            || !matches!(parts.method, Method::GET | Method::HEAD)
+        {
+            return None;
+        }
+        let host = strip_port(hostport_of(parts));
+        self.resources
+            .iter()
+            .find(|r| r.path == parts.uri.path() && r.host.eq_ignore_ascii_case(host))
+    }
+
+    /// Whether the token was issued for the resource the rule guards (RFC 8707): its `aud` names
+    /// the resource. A provider with `audiences` has said what its tokens for this server carry
+    /// instead, and that was checked when the token was.
+    fn for_resource(&self, verified: &Verified, rule: &Rule) -> bool {
+        let Some(resource) = rule.resource.map(|i| &self.resources[i]) else {
+            return true;
+        };
+        if !self.providers[verified.provider].audiences.is_empty() {
+            return true;
+        }
+        let id = resource.id.trim_end_matches('/');
+        verified
+            .audiences
+            .iter()
+            .any(|aud| aud.trim_end_matches('/').eq_ignore_ascii_case(id))
     }
 
     /// The token verified: from the cache when it was seen and still holds, else checked now.
@@ -609,17 +760,14 @@ impl JwtAuth {
                 return Err(Failure::LifetimeTooLong);
             }
         }
-        if !provider.audiences.is_empty() {
-            let fits = |aud: &Value| aud.as_str().is_some_and(|a| provider.audiences.iter().any(|w| w == a));
-            let ok = match claims.get("aud") {
-                Some(Value::Array(list)) => list.iter().any(fits),
-                Some(aud) => fits(aud),
-                None => false,
-            };
-            if !ok {
-                return Err(Failure::Audience);
-            }
+        let audiences = strings(claims.get("aud"), false);
+        if !provider.audiences.is_empty() && !audiences.iter().any(|a| provider.audiences.iter().any(|w| **a == **w)) {
+            return Err(Failure::Audience);
         }
+        // `scope` as OAuth writes it (RFC 9068: one string, space-separated), or `scp` (a list,
+        // or such a string).
+        let mut scopes = strings(claims.get("scope"), true);
+        scopes.extend(strings(claims.get("scp"), true));
         let mut headers =
             Vec::with_capacity(provider.claim_headers.len() + usize::from(provider.payload_header.is_some()));
         if let Some(name) = &provider.payload_header
@@ -640,8 +788,138 @@ impl JwtAuth {
             exp,
             nbf,
             headers,
+            audiences,
+            scopes,
         })
     }
+}
+
+/// A claim that is a string or a list of strings, as a list; `split`: a string is a
+/// space-separated list itself (`scope`).
+fn strings(claim: Option<&Value>, split: bool) -> Vec<Box<str>> {
+    let one = |text: &str, out: &mut Vec<Box<str>>| {
+        if split {
+            out.extend(text.split_ascii_whitespace().map(Into::into));
+        } else {
+            out.push(text.into());
+        }
+    };
+    let mut out = Vec::new();
+    match claim {
+        Some(Value::String(text)) => one(text, &mut out),
+        Some(Value::Array(list)) => {
+            for text in list.iter().filter_map(Value::as_str) {
+                one(text, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Whether the token carries every scope the rule asks for.
+fn has_scopes(verified: &Verified, rule: &Rule) -> bool {
+    rule.scopes
+        .iter()
+        .all(|wanted| verified.scopes.iter().any(|has| **has == **wanted))
+}
+
+/// A scope token (RFC 6749 §3.3): printable ASCII without space, `"` and `\`.
+fn is_scope(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+}
+
+/// A protected resource from its configuration; `servers`: the issuers its tokens come from.
+fn resource(config: &ResourceConfig, servers: Vec<String>) -> Result<Resource> {
+    let id = config.resource.trim();
+    // RFC 9728 §1.2: no fragment; a query is allowed there but has no place in a well-known
+    // address, so it is not taken.
+    if id.contains(['#', '?']) {
+        bail!("resource: a URL without a query or a fragment");
+    }
+    let uri = id
+        .parse::<http::Uri>()
+        .ok()
+        .filter(|uri| matches!(uri.scheme_str(), Some("https" | "http")) && uri.host().is_some_and(|h| !h.is_empty()))
+        .ok_or_else(|| anyhow!("resource: an http(s) URL, as its clients reach it (https://mcp.example.com/mcp)"))?;
+    let host = uri.host().unwrap_or("");
+    if servers.is_empty() {
+        bail!("authorization_servers: none given, and the rules that guard it have no providers");
+    }
+    let mut document = Map::new();
+    document.insert("resource".into(), Value::from(id));
+    document.insert("authorization_servers".into(), Value::from(servers));
+    if !config.scopes_supported.is_empty() {
+        if let Some(scope) = config.scopes_supported.iter().find(|s| !is_scope(s)) {
+            bail!("scopes_supported: {scope:?} is not a scope");
+        }
+        document.insert("scopes_supported".into(), Value::from(config.scopes_supported.clone()));
+    }
+    document.insert("bearer_methods_supported".into(), Value::from(vec!["header"]));
+    for (name, value) in [
+        ("resource_name", &config.resource_name),
+        ("resource_documentation", &config.resource_documentation),
+    ] {
+        if let Some(value) = value {
+            document.insert(name.into(), Value::from(value.as_str()));
+        }
+    }
+    let path = uri.path().trim_end_matches('/');
+    Ok(Resource {
+        id: id.to_string(),
+        host: host.to_ascii_lowercase(),
+        path: format!("{RESOURCE_METADATA}{path}"),
+        metadata: serde_json::to_vec(&Value::Object(document))?.into(),
+    })
+}
+
+impl Resource {
+    /// Where its metadata is: what a refusal's `resource_metadata` says.
+    fn metadata_url(&self) -> String {
+        let uri: http::Uri = self.id.parse().unwrap_or_default();
+        format!(
+            "{}://{}{}",
+            uri.scheme_str().unwrap_or("https"),
+            uri.authority().map_or("", |a| a.as_str()),
+            self.path
+        )
+    }
+}
+
+/// `WWW-Authenticate` of a rule's refusals: no token, a token that does not hold, a token
+/// without the scopes (RFC 6750 §3; with a protected resource, RFC 9728 §5.1 and the scopes to
+/// ask for, as the Model Context Protocol has its servers answer).
+fn challenges(resource: Option<&Resource>, scopes: &[String]) -> Result<[HeaderValue; 3]> {
+    let mut more = String::new();
+    if !scopes.is_empty() {
+        more.push_str(&format!(", scope=\"{}\"", scopes.join(" ")));
+    }
+    if let Some(resource) = resource {
+        more.push_str(&format!(", resource_metadata=\"{}\"", resource.metadata_url()));
+    }
+    let value = |text: String| HeaderValue::from_str(&text).map_err(|_| anyhow!("not a header value: {text:?}"));
+    Ok([
+        value(match more.strip_prefix(", ") {
+            Some(parameters) => format!("Bearer {parameters}"),
+            None => "Bearer".to_string(),
+        })?,
+        value(format!("Bearer error=\"invalid_token\"{more}"))?,
+        value(format!("Bearer error=\"insufficient_scope\"{more}"))?,
+    ])
+}
+
+/// The metadata of a protected resource, as its well-known address answers (RFC 9728 §3.2).
+/// Any origin may read it: a client in a browser asks from its own.
+fn metadata(resource: &Resource) -> Response<Body> {
+    let mut response = Response::new(full(resource.metadata.clone()));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    headers.insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    response
 }
 
 fn provider(name: &str, config: &ProviderConfig, base: &Path) -> Result<Provider> {
@@ -792,19 +1070,26 @@ fn cookie(parts: &http::request::Parts, name: &str) -> Option<String> {
         })
 }
 
-fn refusal(failure: Failure) -> Response<Body> {
-    let (status, message) = failure.answer();
-    let challenge = if failure == Failure::Missing {
-        "Bearer"
-    } else {
-        "Bearer error=\"invalid_token\""
+fn refusal(failure: Failure, rule: &Rule) -> Response<Body> {
+    let (status, message) = failure.answer(rule.resource.is_some());
+    let challenge = match failure {
+        Failure::Missing => &rule.challenges[0],
+        Failure::Scope => &rule.challenges[2],
+        _ => &rule.challenges[1],
     };
     let mut response = Response::new(full(message));
     *response.status_mut() = status;
     let headers = response.headers_mut();
-    headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+    headers.insert(WWW_AUTHENTICATE, challenge.clone());
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
     response
+}
+
+/// base64url without padding, decoded (for the other check that reads keys and signatures:
+/// src/botauth.rs).
+#[cfg(feature = "bot-auth")]
+pub(crate) fn decode_base64url(text: &str) -> Option<Vec<u8>> {
+    token::decode(text)
 }
 
 fn unix_now() -> u64 {

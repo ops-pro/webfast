@@ -16,7 +16,7 @@ name = "webfast_core"
 path = "src/lib.rs"
 
 [features]
-default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "api-firewall", "compress-files", "acme"]
+default = ["mimalloc", "rate-limit", "proxy-cache", "jwt", "bot-auth", "api-firewall", "compress-files", "acme"]
 # Automatic certificates from an ACME CA for the sites that have no `tls` files (src/acme,
 # docs/acme.md); without the feature such a site is an error at start.
 acme = ["dep:instant-acme", "dep:rcgen", "dep:hyper-rustls"]
@@ -36,6 +36,9 @@ fetch = ["dep:hyper-rustls"]
 # JWT validation at the edge (src/jwt), on when WEB_JWT_CONFIG names its file; without the feature
 # none of its code or dependencies is built.
 jwt = ["fetch"]
+# Web Bot Auth (src/botauth.rs): the HTTP message signatures of crawlers and agents verified, on
+# when WEB_BOT_AUTH_CONFIG names its file. It reads keys as the JWT check does (src/jwt/jwks.rs).
+bot-auth = ["jwt"]
 # OpenAPI request validation at the edge (src/apifw), on when WEB_API_FIREWALL_CONFIG names its
 # file; without the feature none of its code or dependencies is built.
 api-firewall = ["fetch", "dep:jsonschema"]

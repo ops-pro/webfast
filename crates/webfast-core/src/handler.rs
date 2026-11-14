@@ -40,6 +40,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Copy)]
 pub struct Credentialed;
 
+/// On a request whose HTTP message signature a named agent's key made (src/botauth.rs, Web Bot
+/// Auth): the agent's name, as its file has it. For what comes after — a module's check, a
+/// handler — to act on; the same name is in the request header the file names.
+#[derive(Debug, Clone)]
+pub struct VerifiedBot(pub std::sync::Arc<str>);
+
 /// What the connection tells about a request.
 #[derive(Debug)]
 pub struct ConnInfo {

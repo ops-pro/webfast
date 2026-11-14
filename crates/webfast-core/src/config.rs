@@ -61,6 +61,10 @@ pub struct Config {
     /// again by a reload (src/checkfile.rs).
     #[cfg(feature = "jwt")]
     pub jwt: Option<Arc<crate::checkfile::Reloadable<crate::jwt::JwtAuth>>>,
+    /// Signed bots told from the rest (WEB_BOT_AUTH_CONFIG, src/botauth.rs), before every other
+    /// check. Read again by a reload.
+    #[cfg(feature = "bot-auth")]
+    pub bot_auth: Option<Arc<crate::checkfile::Reloadable<crate::botauth::BotAuth>>>,
     /// OpenAPI request validation (WEB_API_FIREWALL_CONFIG, src/apifw), after the JWT check. Read
     /// again by a reload.
     #[cfg(feature = "api-firewall")]
@@ -736,6 +740,8 @@ pub fn compile(file: &Caddyfile, loader: &mut Loader, client: HttpClient) -> Res
         log_policy: globals.log_policy.clone(),
         #[cfg(feature = "jwt")]
         jwt: None,
+        #[cfg(feature = "bot-auth")]
+        bot_auth: None,
         #[cfg(feature = "api-firewall")]
         api_firewall: None,
     })

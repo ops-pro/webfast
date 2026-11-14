@@ -159,7 +159,7 @@ let body = state.hooks.request.check(&mut parts, body, client).await?;
 Startup goes through the same file. `extensions::configure_from_env()` reads each built
 extension's `WEB_*` variables and stops the start on a variable of one that is not built (so
 `WEB_PROXY_CACHE_MEMORY` on a build without `proxy-cache` is an error, as a misspelt variable
-would be). `extensions::load_checks(&mut config)` loads the files `WEB_JWT_CONFIG` and
+would be). `extensions::load_checks(&mut config)` loads the files `WEB_BOT_AUTH_CONFIG`, `WEB_JWT_CONFIG` and
 `WEB_API_FIREWALL_CONFIG` name, then each composed module's own (`Module::load`), and gives back
 one line per extension for the startup log and `validate`. `extensions::Started` does what runs
 once the server does: `begin` before the servers take the configuration (the JWT keys start being

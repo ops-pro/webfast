@@ -469,6 +469,11 @@ type Jwt = Option<Arc<crate::checkfile::Reloadable<crate::jwt::JwtAuth>>>;
 #[cfg(not(feature = "jwt"))]
 type Jwt = ();
 
+#[cfg(feature = "bot-auth")]
+type BotAuth = Option<Arc<crate::checkfile::Reloadable<crate::botauth::BotAuth>>>;
+#[cfg(not(feature = "bot-auth"))]
+type BotAuth = ();
+
 #[cfg(feature = "api-firewall")]
 type ApiFirewall = Option<Arc<crate::checkfile::Reloadable<crate::apifw::ApiFirewall>>>;
 #[cfg(not(feature = "api-firewall"))]
@@ -495,10 +500,12 @@ type Acme = Option<crate::acme::Http01>;
 type Acme = ();
 
 /// The checks before the routes, in order: the ACME challenge answer first (nothing may stand
-/// before it: not a redirect, not a credential), then the modules' (the browser challenge's answer
-/// endpoint, the request filter: the mass of noise goes no further), then the JWT (the API
-/// firewall sees the claim headers it set, and the query parameters it hides from the event log).
-pub type RequestChecks = (Acme, (Modules, (Jwt, (ApiFirewall, ()))));
+/// before it: not a redirect, not a credential), then the signatures of bots (it refuses
+/// nothing, and what it finds is for all that follow), then the modules' (the browser
+/// challenge's answer endpoint, the request filter: the mass of noise goes no further), then the
+/// JWT (the API firewall sees the claim headers it set, and the query parameters it hides from
+/// the event log).
+pub type RequestChecks = (Acme, (BotAuth, (Modules, (Jwt, (ApiFirewall, ())))));
 /// The checks at a proxy, in the same order, then the client's slot at the upstreams (taken only
 /// for a request the checks let through).
 pub type UpstreamChecks = (Jwt, (ApiFirewall, (UpstreamLimit, ())));
@@ -554,6 +561,10 @@ impl Hooks {
         {
             ids |= config.jwt.is_some();
         }
+        #[cfg(feature = "bot-auth")]
+        {
+            ids |= config.bot_auth.is_some();
+        }
         #[cfg(feature = "api-firewall")]
         {
             ids |= config.api_firewall.is_some();
@@ -581,8 +592,21 @@ impl Hooks {
 
     fn stage_each(&self, lines: &mut Vec<String>) -> Result<()> {
         let _ = &lines;
+        #[cfg(feature = "bot-auth")]
+        if let Some(bots) = &self.request.1.0
+            && let Some(staged) = bots.stage(crate::botauth::BotAuth::load)?
+        {
+            let path = bots.path().map(|p| p.display().to_string()).unwrap_or_default();
+            lines.push(format!("bot authentication: {path}, {} agent(s)", staged.count()));
+            if staged.header() != bots.current().header() {
+                lines.push(format!(
+                    "warning: bot authentication: the header changed to {}: what reads it (matchers, the upstream) must follow",
+                    staged.header()
+                ));
+            }
+        }
         #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.request.1.1.0
+        if let Some(jwt) = &self.request.1.1.1.0
             && let Some(staged) = jwt.stage(crate::jwt::JwtAuth::load)?
         {
             let (providers, rules) = staged.counts();
@@ -599,7 +623,7 @@ impl Hooks {
             }
         }
         #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.request.1.1.1.0
+        if let Some(firewall) = &self.request.1.1.1.1.0
             && let Some(staged) = firewall.stage(crate::apifw::ApiFirewall::load)?
         {
             let (apis, operations, later) = staged.counts();
@@ -623,8 +647,14 @@ impl Hooks {
     pub fn commit_checks(&self) -> Vec<String> {
         #[allow(unused_mut)]
         let mut lines = Vec::new();
+        #[cfg(feature = "bot-auth")]
+        if let Some(bots) = &self.request.1.0
+            && let Err(e) = bots.commit()
+        {
+            lines.push(format!("warning: bot authentication: {e:#}"));
+        }
         #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.request.1.1.0 {
+        if let Some(jwt) = &self.request.1.1.1.0 {
             match jwt.commit() {
                 // Every log's URIs follow the new file's token parameters.
                 Ok(true) => crate::eventlog::set_token_params(jwt.current().hidden_params()),
@@ -636,7 +666,7 @@ impl Hooks {
             }
         }
         #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.request.1.1.1.0
+        if let Some(firewall) = &self.request.1.1.1.1.0
             && let Err(e) = firewall.commit()
         {
             lines.push(format!("warning: API firewall: {e:#}"));
@@ -646,12 +676,16 @@ impl Hooks {
 
     /// The reload failed: the staged checks dropped, the running ones stay.
     pub fn discard_checks(&self) {
+        #[cfg(feature = "bot-auth")]
+        if let Some(bots) = &self.request.1.0 {
+            bots.discard();
+        }
         #[cfg(feature = "jwt")]
-        if let Some(jwt) = &self.request.1.1.0 {
+        if let Some(jwt) = &self.request.1.1.1.0 {
             jwt.discard();
         }
         #[cfg(feature = "api-firewall")]
-        if let Some(firewall) = &self.request.1.1.1.0 {
+        if let Some(firewall) = &self.request.1.1.1.1.0 {
             firewall.discard();
         }
     }
@@ -708,18 +742,24 @@ fn compose_request(config: &Config, modules: ModuleHooks) -> RequestChecks {
         #[cfg(not(feature = "acme"))]
         (),
         (
-            Modules(modules.checks),
+            #[cfg(feature = "bot-auth")]
+            config.bot_auth.clone(),
+            #[cfg(not(feature = "bot-auth"))]
+            (),
             (
-                #[cfg(feature = "jwt")]
-                config.jwt.clone(),
-                #[cfg(not(feature = "jwt"))]
-                (),
+                Modules(modules.checks),
                 (
-                    #[cfg(feature = "api-firewall")]
-                    config.api_firewall.clone(),
-                    #[cfg(not(feature = "api-firewall"))]
+                    #[cfg(feature = "jwt")]
+                    config.jwt.clone(),
+                    #[cfg(not(feature = "jwt"))]
                     (),
-                    (),
+                    (
+                        #[cfg(feature = "api-firewall")]
+                        config.api_firewall.clone(),
+                        #[cfg(not(feature = "api-firewall"))]
+                        (),
+                        (),
+                    ),
                 ),
             ),
         ),
@@ -794,6 +834,8 @@ pub fn configure_from_env() -> std::result::Result<(), String> {
     )?;
     #[cfg(not(feature = "jwt"))]
     crate::module::unbuilt("JWT validation", "jwt", &["WEB_JWT_CONFIG"])?;
+    #[cfg(not(feature = "bot-auth"))]
+    crate::module::unbuilt("bot authentication", "bot-auth", &["WEB_BOT_AUTH_CONFIG"])?;
     #[cfg(not(feature = "api-firewall"))]
     crate::module::unbuilt("the API firewall", "api-firewall", &["WEB_API_FIREWALL_CONFIG"])?;
     for module in crate::module::registry().modules() {
@@ -818,6 +860,19 @@ pub fn load_checks(config: &mut Config) -> std::result::Result<Vec<String>, Stri
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
+    #[cfg(feature = "bot-auth")]
+    if let Some(path) = file("WEB_BOT_AUTH_CONFIG") {
+        let bots = crate::botauth::BotAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
+        loaded.push(format!(
+            "bot authentication: {path}, {} agent(s), verified ones named in {}",
+            bots.count(),
+            bots.header()
+        ));
+        config.bot_auth = Some(Arc::new(crate::checkfile::Reloadable::from_file(
+            std::path::Path::new(&path),
+            bots,
+        )));
+    }
     #[cfg(feature = "jwt")]
     if let Some(path) = file("WEB_JWT_CONFIG") {
         let jwt = crate::jwt::JwtAuth::load(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))?;
@@ -910,6 +965,11 @@ impl Started {
         #[cfg(feature = "jwt")]
         if let Some(jwt) = &config.jwt {
             jwt.start_with(&jwt.current(), |check| check.start())?;
+        }
+        // The same of the signed bots' keys.
+        #[cfg(feature = "bot-auth")]
+        if let Some(bots) = &config.bot_auth {
+            bots.start_with(&bots.current(), |check| check.start())?;
         }
         Ok(Started {
             #[cfg(feature = "jwt")]

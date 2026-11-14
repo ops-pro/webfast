@@ -580,8 +580,9 @@ values in their hits (`matched`) keep the module's own hiding until then.
 
 
 Two modules check requests: their JWT ([`src/jwt`](../src/jwt)), then the OpenAPI spec of the API
-they are for ([`src/apifw`](../src/apifw)). Each is a Cargo feature (`jwt`, `api-firewall`, both in
-the default build; without one, none of its code or dependencies is built) and is used only when
+they are for ([`src/apifw`](../src/apifw)); a third, before them, refuses nothing and tells the
+signed requests of bots from the rest ([`src/botauth.rs`](../src/botauth.rs)). Each is a Cargo
+feature (`jwt`, `api-firewall`, `bot-auth`, all in the default build; without one, none of its code or dependencies is built) and is used only when
 its YAML file is named — the Caddyfile stays Caddy's. A file that does not load stops the server
 at startup with the reason; `webfast validate` loads them too and says what it found. A
 refused request is answered, and logged in the site's access log, like any other. Each module
@@ -645,6 +646,51 @@ rules: # the first that matches decides; none: the request is not looked at
 cache: { tokens: 10000 }
 ```
 
+A rule may guard a **protected resource** of OAuth 2.0 (RFC 9728) — which is what an MCP server
+is to its clients: the Model Context Protocol's authorization asks exactly this of it. The
+server then does the resource server's part at the edge, and the MCP server behind it gets
+requests that are already authorized:
+
+```yaml
+providers:
+  keycloak:
+    issuer: https://id.example.com/realms/main
+    jwks_uri: https://id.example.com/realms/main/protocol/openid-connect/certs
+    output_claim_to_headers: [{ header: X-User, claim: sub }]
+resources:
+  tools:
+    resource: https://mcp.example.com/mcp # the URL its clients reach it at: what a token's aud names
+    scopes_supported: ['mcp:tools'] # optional, as resource_name and resource_documentation
+    # authorization_servers: [...]         unset: the issuers of the providers of its rules
+rules:
+  - match: { hosts: [mcp.example.com], paths: ['/mcp', '/mcp/*'] }
+    providers: [keycloak]
+    resource: tools
+    scopes: ['mcp:tools'] # every one must be in the token's scope (or scp)
+```
+
+- **The metadata** is served at the resource's well-known address, on its host, to anyone and
+  before the routes: `https://mcp.example.com/.well-known/oauth-protected-resource/mcp` for the
+  resource above (the resource's path after the well-known one; a resource at the root of its
+  host has it at `/.well-known/oauth-protected-resource`). It names the resource, its
+  authorization servers, `scopes_supported` and `bearer_methods_supported: ["header"]`.
+- **A request without a token** is answered 401 with
+  `WWW-Authenticate: Bearer scope="mcp:tools", resource_metadata="https://…/oauth-protected-resource/mcp"`:
+  where a client that knows nothing yet finds the metadata, and what to ask the authorization
+  server for.
+- **A token must have been issued for this resource** (RFC 8707): its `aud` names the resource's
+  URL. A provider with `audiences` says what its tokens for this server carry instead (an issuer
+  that names an API its own way), and that is what is asked. A token for another audience is
+  not valid here: 401 with `error="invalid_token"` — for a rule with a resource, not the 403 the
+  other rules answer, which OAuth keeps for scopes.
+- **A token without one of the rule's `scopes`** is answered 403 with
+  `error="insufficient_scope"`, the scopes and the metadata's address, so a client can come back
+  with a token that has them.
+- The token is taken off before the upstream, as ever (`forward_original_token: false`): an MCP
+  server must not be handed a token to pass on. Give it who asks in claim headers.
+- Not done here: the authorization server's own part (its metadata, client registration, the
+  flow itself) — that is the issuer's.
+
 - Paths match as the `path` matcher does (decoded, cleaned, case-insensitive). Missing token: 401
   `Jwt is missing`; bad signature, wrong issuer, expired, not yet valid: 401; audience: 403
   (Envoy's answers, with `WWW-Authenticate: Bearer`).
@@ -663,6 +709,60 @@ cache: { tokens: 10000 }
   and Rack read as the same `HTTP_X_USER`.
 - Verified tokens are kept (by their BLAKE3 hash; 16 shards, two generations): a token seen again
   costs 0.6–0.85 µs, a new one 20 µs (RS256), 43 µs (EdDSA) or 68 µs (ES256) — release build.
+
+**Signed bots** (`WEB_BOT_AUTH_CONFIG`, the `bot-auth` feature), Web Bot Auth: crawlers and
+agents that sign their requests (HTTP Message Signatures, RFC 9421, tag `web-bot-auth`; the
+IETF webbotauth group's drafts) are told from those that only say who they are in `User-Agent`.
+
+```yaml
+header: X-Verified-Bot # the request header a verified agent's name goes in (this is the default)
+log: { output: /var/log/web/bot-auth.log } # signatures not taken; none: the server's log
+# clock_skew: 60s   max_validity: 24h
+agents: # the agents trusted, and where their keys are
+  chatgpt:
+    directory: https://chatgpt.com # its key directory, at the well-known path of this host;
+    # a URL with a path is taken as the directory's own. cache_duration: 1h   fetch_timeout: 5s
+  our-monitor:
+    jwks_file: monitor-keys.json # or jwks: the keys themselves (a JWKS)
+```
+
+- This check **refuses nothing**. It runs before every other check, takes the header off every
+  request (a client cannot send it, nor `X_Verified_Bot`), and sets it to the agent's name on a
+  request whose signature holds. What comes after acts on it: a matcher, the request filter,
+  the upstream.
+
+  ```caddyfile
+  @bots header X-Verified-Bot *
+  rate_limit @bots { … }          # a zone of their own
+  challenge {
+  	except {
+  		header X-Verified-Bot *   # a signed agent is not asked to prove it is a browser
+  	}
+  }
+  ```
+
+- **Who is trusted is in the file.** A signature by a key that is in no named agent's keys is
+  not looked at further, and nothing is fetched because a request says so (`Signature-Agent`
+  only tells whose directory to read again when a named agent has a new key, at most every
+  30 s).
+- **What a signature must say**: `created`, `expires`, `keyid` (the key's JWK thumbprint) and
+  `tag="web-bot-auth"`; it must cover `@authority` or `@target-uri`, so it is for this host and
+  no other, and `Signature-Agent` when the request has one. It must not be expired, nor valid
+  for longer than `max_validity`. Algorithms: `ed25519`, `rsa-pss-sha512`, `rsa-v1_5-sha256`,
+  `ecdsa-p256-sha256`, `ecdsa-p384-sha384`. Covered components that are filled in: `@authority`,
+  `@target-uri`, `@method`, `@scheme`, `@path`, `@query`, `@request-target`, and request fields
+  as they are (`"signature-agent";key="…"` too); a signature that covers anything else is not
+  taken.
+- **Only over TLS**, or from a trusted proxy that ended it (`trusted_proxies`; its
+  `X-Forwarded-Proto` is the scheme): elsewhere a signature could be read on the way and used.
+- A signature that is not taken is a line in the event log (`"logger": "bot-auth"`,
+  `"msg": "signature not taken"`, `reason`: `malformed`, `incomplete`, `uncovered`,
+  `unsupported-component`, `expired`, `not-yet-valid`, `validity-too-long`, `unknown-key`,
+  `bad-signature`, `insecure`), and the request goes on as any other.
+- Not done: a store of the nonces seen. Within its validity a signed request can be sent again
+  to the host it was made for — by whoever could read it, which TLS leaves to the two ends.
+- The drafts are not final (the working group took them up in 2026): the field names and the
+  tag are as its draft and the agents in the field have them now.
 
 **OpenAPI** (`WEB_API_FIREWALL_CONFIG`), after Wallarm API Firewall:
 
@@ -890,6 +990,7 @@ its own, documented there; a variable of a module the binary was built without s
 | `WEB_TLS_TICKET_SEED_FILE`         | unset       | A file holding that secret (a mounted secret), in place of `WEB_TLS_TICKET_SEED`; not both |
 | `WEB_LOG_HASH_KEY`                 | unset       | The key of `hash` in the logs (Log privacy), at least 16 bytes. Unset: derived from `WEB_TLS_TICKET_SEED`, else a key of the process alone |
 | `WEB_JWT_CONFIG`                   |             | the JWT module's YAML file; unset: no JWT checks (Request checks) |
+| `WEB_BOT_AUTH_CONFIG`              |             | the signed bots' YAML file; unset: signatures are not looked at (Request checks) |
 | `WEB_API_FIREWALL_CONFIG`          |             | the API firewall's YAML file; unset: no OpenAPI checks (Request checks) |
 | `WEB_ACME_DIR`                     | `/data/acme` | where the obtained certificates, their keys and the ACME account are kept (Automatic certificates) |
 | `WEB_DNS_TTL_MIN`, `WEB_DNS_TTL_MAX` | `5s`, `1h`  | the TTL of an upstream name's answer is kept within these; the name is resolved again at 90% of it (docs/dns.md) |

@@ -12,10 +12,28 @@ Worth knowing when upgrading:
   and now load: HTTP/2 without TLS, and HTTP/3 (`versions 3`).
 - For code written against `webfast-core`: `ReverseProxy` has `tls`, `tls_server_name` and
   `links`; `extensions::Sent` has `server_name`; `config::upstream_authority` reads `https://`
-  and `h2c://` too.
+  and `h2c://` too; `Config` has `bot_auth`, and `extensions::RequestChecks` a slot for it
+  before the modules'.
+- The log lines of the JWT keys say "signing keys loaded" and "cannot read the signing keys"
+  (they are the signed bots' too now), without "JWT".
 
 ### Changes
 
+- **MCP authorization at the edge**: a JWT rule may guard a protected resource of OAuth 2.0
+  (RFC 9728), which is what the Model Context Protocol asks of an MCP server. `resources:` in
+  the JWT file, `resource:` and `scopes:` in a rule: the resource's metadata is served at its
+  well-known address, a 401 says where it is and which scopes to ask for
+  (`WWW-Authenticate: Bearer scope="…", resource_metadata="…"`), a token must have been issued
+  for the resource (`aud`, RFC 8707; 401 otherwise) and carry the rule's scopes (`scope` or
+  `scp`; 403 `insufficient_scope`). Rules without a resource answer as before
+  (docs/configuration.md, Request checks).
+- **Signed bots told from the rest** (Web Bot Auth; `WEB_BOT_AUTH_CONFIG`, the `bot-auth`
+  feature, in the default build): a request whose HTTP message signature (RFC 9421, tag
+  `web-bot-auth`) a named agent's key made gets the request header `X-Verified-Bot` with the
+  agent's name, before every other check, for matchers, the request filter and the upstream to
+  act on; the header is taken off every other request. The agents and their key directories
+  are named in the file; nothing is refused, and a signature not taken is a line in the event
+  log (docs/configuration.md, Request checks).
 - **TLS to the upstream**, as in Caddy: `https://host[:port]` upstreams and `transport http {
   tls, tls_server_name, tls_trusted_ca_certs, tls_trust_pool file, tls_client_auth <cert> <key>,
   tls_insecure_skip_verify, tls_except_ports, tls_timeout }`. The certificate is verified for the

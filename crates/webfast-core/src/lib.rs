@@ -10,6 +10,8 @@ pub mod acme;
 pub mod apifw;
 pub mod background;
 pub mod body;
+#[cfg(feature = "bot-auth")]
+pub mod botauth;
 #[cfg(feature = "proxy-cache")]
 pub mod cache;
 pub mod caddyfile;
